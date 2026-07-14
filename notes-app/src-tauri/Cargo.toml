@@ -1,0 +1,58 @@
+[package]
+name = "notes-app"
+version = "0.1.0"
+description = "Local-first work notes and tasks with AI rewriting"
+edition = "2021"
+
+# The lib name must match the call in src/main.rs (notes_app_lib::run()).
+[lib]
+name = "notes_app_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+# Opens external URLs (JIRA chip) in the default browser via the OS.
+tauri-plugin-opener = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Data layer. Runtime query API only (no compile-time query macros), so the
+# build never needs a live DATABASE_URL and a Postgres impl can own its own SQL.
+sqlx = { version = "0.8", default-features = false, features = [
+    "runtime-tokio",
+    "sqlite",
+    "macros",
+    "derive",
+    "migrate",
+    "json",
+] }
+
+# AI providers over plain HTTPS. rustls avoids any OpenSSL system dependency.
+reqwest = { version = "0.12", default-features = false, features = [
+    "json",
+    "rustls-tls",
+] }
+
+# API keys live in the OS credential store (Windows Credential Manager on
+# Windows), never in a config file and never in the WebView.
+keyring = { version = "3", features = [
+    "windows-native",
+    "apple-native",
+    "linux-native",
+] }
+
+async-trait = "0.1"
+thiserror = "2"
+uuid = { version = "1", features = ["v4"] }
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+
+[dev-dependencies]
+# For the integration tests in tests/ — run with `cargo test` from src-tauri.
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+
+[profile.release]
+lto = true
+codegen-units = 1

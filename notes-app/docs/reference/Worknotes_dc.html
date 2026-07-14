@@ -1,0 +1,619 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<style>
+  :root {
+    --frame:#dcdad4; --border:#ccc9c1;
+    --bg:#F1F0EC; --surface:#FBFAF8; --ink:#23272A; --muted:#6E7378; --hair:#E3E1DB;
+  }
+  [data-theme="dark"] {
+    --frame:#131211; --border:#3a3833;
+    --bg:#1d1c1a; --surface:#272623; --ink:#eceae4; --muted:#a0a09a; --hair:#3a3833;
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
+  body { background: var(--frame); font-family: "Segoe UI Variable Text", "Segoe UI Variable", "Segoe UI", system-ui, sans-serif; color: var(--ink); }
+  a { color: #6B5C0E; text-decoration: none; }
+  a:hover { color: #4d420a; }
+  input::placeholder, textarea::placeholder { color: #9AA0A6; }
+  .wn-list::-webkit-scrollbar { width: 10px; }
+  .wn-list::-webkit-scrollbar-thumb { background: #d8d6cf; border-radius: 6px; border: 2px solid var(--surface); }
+  .wn-body::-webkit-scrollbar { width: 10px; }
+  .wn-body::-webkit-scrollbar-thumb { background: #d8d6cf; border-radius: 6px; }
+</style>
+</helmet>
+<div style="width:1200px;height:760px;margin:0 auto;background:var(--bg);display:flex;flex-direction:column;overflow:hidden;border:1px solid var(--border);position:relative;font-size:14px;line-height:1.45;">
+
+  <!-- Top bar -->
+  <div style="height:46px;flex:0 0 46px;background:var(--surface);border-bottom:1px solid var(--hair);display:flex;align-items:center;justify-content:space-between;padding:0 18px;">
+    <div style="font-family:'Cascadia Mono','Cascadia Code',Consolas,ui-monospace,monospace;font-size:13px;letter-spacing:0.14em;color:var(--ink);">worknotes</div>
+    <div style="display:flex;align-items:center;gap:8px;">
+      <button onClick="{{ toggleTheme }}" style="font-family:'Cascadia Mono',Consolas,ui-monospace,monospace;font-size:11px;letter-spacing:0.06em;color:var(--muted);background:transparent;border:1px solid var(--hair);border-radius:6px;padding:6px 12px;cursor:pointer;">{{ themeLabel }}</button>
+      <button onClick="{{ openProjects }}" style="font-family:'Cascadia Mono',Consolas,ui-monospace,monospace;font-size:11px;letter-spacing:0.06em;color:var(--muted);background:transparent;border:1px solid var(--hair);border-radius:6px;padding:6px 12px;cursor:pointer;">Manage projects</button>
+      <button onClick="{{ openDialog }}" style="font-family:'Cascadia Mono',Consolas,ui-monospace,monospace;font-size:11px;letter-spacing:0.06em;color:var(--muted);background:transparent;border:1px solid var(--hair);border-radius:6px;padding:6px 12px;cursor:pointer;">API keys</button>
+    </div>
+  </div>
+
+  <!-- Two panes -->
+  <div style="flex:1;display:flex;min-height:0;">
+
+    <!-- Left rail -->
+    <div style="width:300px;flex:0 0 300px;background:var(--surface);border-right:1px solid var(--hair);display:flex;flex-direction:column;min-height:0;">
+
+      <div style="padding:14px 14px 12px;display:flex;flex-direction:column;gap:10px;border-bottom:1px solid var(--hair);">
+        <div style="display:flex;gap:8px;">
+          <button style="flex:1;background:var(--ink);color:var(--surface);border:none;border-radius:6px;padding:9px 0;font-size:14px;cursor:pointer;">New note</button>
+          <button style="flex:1;background:var(--ink);color:var(--surface);border:none;border-radius:6px;padding:9px 0;font-size:14px;cursor:pointer;">New task</button>
+        </div>
+        <input placeholder="Search title and body" style="width:100%;background:var(--bg);border:1px solid var(--hair);border-radius:6px;padding:8px 10px;font-size:14px;color:var(--ink);font-family:inherit;" />
+        <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;position:relative;">
+          <span style="font-family:'Cascadia Mono',Consolas,ui-monospace,monospace;font-size:10px;letter-spacing:0.08em;color:var(--muted);margin-right:2px;">FILTER BY TAG</span>
+          <sc-for list="{{ filterBadges }}" as="tag" hint-placeholder-count="0">
+            <span style="display:inline-flex;align-items:center;gap:5px;background:#FBF3C9;border:1px solid #F6E05E;border-radius:6px;padding:3px 4px 3px 8px;font-family:'Cascadia Mono',Consolas,ui-monospace,monospace;font-size:11px;letter-spacing:0.02em;color:#6B5C0E;">
+              #{{ tag.name }}
+              <button onClick="{{ tag.remove }}" style="border:none;background:transparent;color:#6B5C0E;cursor:pointer;font-size:13px;line-height:1;padding:0 2px;font-family:inherit;">×</button>
+            </span>
+          </sc-for>
+          <button onClick="{{ toggleFilterPopup }}" style="border:1px dashed #cdcabf;background:transparent;border-radius:6px;padding:4px 9px;font-family:'Cascadia Mono',Consolas,ui-monospace,monospace;font-size:11px;letter-spacing:0.04em;color:var(--muted);cursor:pointer;">+ tag</button>
+
+          <sc-if value="{{ filterPopupOpen }}" hint-placeholder-val="{{ false }}">
+            <div style="position:absolute;top:calc(100% + 6px);left:0;z-index:20;width:220px;background:var(--surface);border:1px solid var(--hair);border-radius:8px;padding:10px;">
+              <div style="font-family:'Cascadia Mono',Consolas,ui-monospace,monospace;font-size:10px;letter-spacing:0.08em;color:var(--muted);margin-bottom:8px;">TAGS</div>
+              <sc-if value="{{ hasFilterSuggestions }}" hint-placeholder-val="{{ true }}">
+                <div style="display:flex;flex-wrap:wrap;gap:6px;">
+                  <sc-for list="{{ filterSuggestions }}" as="sug" hint-placeholder-count="3">
+                    <button onClick="{{ sug.add }}" style="border:1px solid var(--hair);background:var(--bg);border-radius:6px;padding:3px 9px;font-family:'Cascadia Mono',Consolas,ui-monospace,monospace;font-size:11px;color:var(--ink);cursor:pointer;">#{{ sug.name }}</button>
+                  </sc-for>
+                </div>
+              </sc-if>
+              <sc-if value="{{ noFilterSuggestions }}" hint-placeholder-val="{{ false }}">
+                <div style="font-size:12px;color:var(--muted);">All tags selected.</div>
+              </sc-if>
+            </div>
+          </sc-if>
+        </div>
+        <div style="display:flex;gap:8px;">
+          <button onClick="{{ setAll }}" style="{{ chipAll }}">All</button>
+          <button onClick="{{ setNotes }}" style="{{ chipNotes }}">Notes</button>
+          <button onClick="{{ setTasks }}" style="{{ chipTasks }}">Tasks</button>
+        </div>
+        <select value="{{ projectFilter }}" onChange="{{ onProjectFilter }}" style="width:100%;border:1px solid var(--hair);border-radius:6px;background:var(--bg);padding:8px 10px;font-size:13px;color:var(--ink);font-family:inherit;cursor:pointer;">
+          <sc-for list="{{ projectFilterOptions }}" as="opt" hint-placeholder-count="4">
+            <option value="{{ opt.value }}">{{ opt.label }}</option>
+          </sc-for>
+        </select>
+        <div style="display:flex;gap:8px;">
+          <select value="{{ statusFilter }}" onChange="{{ onStatusFilter }}" style="flex:1;min-width:0;border:1px solid var(--hair);border-radius:6px;background:var(--bg);padding:8px 10px;font-size:13px;color:var(--ink);font-family:inherit;cursor:pointer;">
+            <option value="All">All statuses</option>
+            <option value="todo">todo</option>
+            <option value="doing">doing</option>
+            <option value="done">done</option>
+          </select>
+          <select value="{{ sortBy }}" onChange="{{ onSortBy }}" style="flex:1;min-width:0;border:1px solid var(--hair);border-radius:6px;background:var(--bg);padding:8px 10px;font-size:13px;color:var(--ink);font-family:inherit;cursor:pointer;">
+            <option value="updated">Sort: updated</option>
+            <option value="created">Sort: created</option>
+            <option value="priority">Sort: priority</option>
+            <option value="status">Sort: status</option>
+          </select>
+        </div>
+      </div>
+
+      <!-- Item list -->
+      <div class="wn-list" style="flex:1;overflow-y:auto;min-height:0;">
+        <sc-for list="{{ rows }}" as="row" hint-placeholder-count="5">
+          <div onClick="{{ row.onClick }}" style="{{ row.rowStyle }}">
+            <div style="display:flex;align-items:center;gap:8px;">
+              <sc-if value="{{ row.showPin }}" hint-placeholder-val="{{ false }}">
+                <span style="width:8px;height:8px;flex:0 0 8px;background:#F6E05E;border:1px solid #6B5C0E;transform:rotate(45deg);display:inline-block;"></span>
+              </sc-if>
+              <sc-if value="{{ row.showDot }}" hint-placeholder-val="{{ false }}">
+                <span style="{{ row.dotStyle }}"></span>
+              </sc-if>
+              <span style="{{ row.titleStyle }}">{{ row.title }}</span>
+              <sc-if value="{{ row.showPriority }}" hint-placeholder-val="{{ false }}">
+                <span style="{{ row.priorityStyle }}">{{ row.priorityText }}</span>
+              </sc-if>
+              <span style="margin-left:auto;font-family:'Cascadia Mono',Consolas,ui-monospace,monospace;font-size:11px;color:var(--muted);flex:0 0 auto;">{{ row.ts }}</span>
+            </div>
+            <sc-if value="{{ row.hasPreview }}" hint-placeholder-val="{{ false }}">
+              <div style="color:var(--muted);font-size:13px;margin-top:4px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">{{ row.preview }}</div>
+            </sc-if>
+            <sc-if value="{{ row.hasTags }}" hint-placeholder-val="{{ false }}">
+              <div style="font-family:'Cascadia Mono',Consolas,ui-monospace,monospace;font-size:11px;color:var(--muted);margin-top:5px;letter-spacing:0.03em;">{{ row.tagsStr }}</div>
+            </sc-if>
+          </div>
+        </sc-for>
+        <sc-if value="{{ isEmpty }}" hint-placeholder-val="{{ false }}">
+          <div style="padding:40px 20px;text-align:center;color:var(--muted);font-size:13px;">Nothing here yet — create your first note.</div>
+        </sc-if>
+      </div>
+    </div>
+
+    <!-- Main editor pane -->
+    <div style="flex:1;min-width:0;display:flex;flex-direction:column;padding:20px 22px;overflow:hidden;">
+
+      <!-- Header -->
+      <div style="display:flex;align-items:flex-start;gap:16px;">
+        <input value="{{ editTitle }}" onChange="{{ onTitle }}" style="flex:1;min-width:0;border:none;outline:none;background:transparent;font-size:22px;font-weight:650;color:var(--ink);font-family:inherit;padding:0;" />
+        <button onClick="{{ duplicateMetadata }}" style="border:1px solid var(--hair);background:var(--surface);border-radius:6px;padding:8px 14px;font-size:13px;color:var(--muted);cursor:pointer;white-space:nowrap;">Duplicate metadata</button>
+      </div>
+
+      <!-- Meta row -->
+      <div style="display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-top:14px;">
+        <span style="font-family:'Cascadia Mono',Consolas,ui-monospace,monospace;font-size:11px;letter-spacing:0.08em;color:var(--muted);">{{ kindLabel }}</span>
+        <sc-if value="{{ isTask }}" hint-placeholder-val="{{ true }}">
+          <select value="{{ editStatus }}" onChange="{{ onStatus }}" style="border:1px solid var(--hair);border-radius:6px;background:var(--surface);padding:5px 8px;font-size:13px;color:var(--ink);font-family:inherit;cursor:pointer;">
+            <option value="todo">todo</option>
+            <option value="doing">doing</option>
+            <option value="done">done</option>
+          </select>
+        </sc-if>
+        <sc-if value="{{ isTask }}" hint-placeholder-val="{{ true }}">
+          <select value="{{ editPriority }}" onChange="{{ onPriority }}" style="border:1px solid var(--hair);border-radius:6px;background:var(--surface);padding:5px 8px;font-size:13px;color:var(--ink);font-family:inherit;cursor:pointer;">
+            <option value="low">low priority</option>
+            <option value="normal">normal priority</option>
+            <option value="high">high priority</option>
+          </select>
+        </sc-if>
+        <select value="{{ editProject }}" onChange="{{ onProject }}" style="border:1px solid var(--hair);border-radius:6px;background:var(--surface);padding:5px 8px;font-size:13px;color:var(--ink);font-family:inherit;cursor:pointer;">
+          <sc-for list="{{ projectOptions }}" as="p" hint-placeholder-count="3">
+            <option value="{{ p }}">{{ p }}</option>
+          </sc-for>
+        </select>
+        <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;position:relative;">
+          <sc-for list="{{ tagBadges }}" as="tag" hint-placeholder-count="1">
+            <span style="display:inline-flex;align-items:center;gap:5px;background:var(--bg);border:1px solid var(--hair);border-radius:6px;padding:3px 4px 3px 8px;font-family:'Cascadia Mono',Consolas,ui-monospace,monospace;font-size:11px;letter-spacing:0.02em;color:var(--ink);">
+              #{{ tag.name }}
+              <button onClick="{{ tag.remove }}" style="border:none;background:transparent;color:#9AA0A6;cursor:pointer;font-size:13px;line-height:1;padding:0 2px;font-family:inherit;">×</button>
+            </span>
+          </sc-for>
+          <button onClick="{{ toggleTagPopup }}" style="border:1px dashed #cdcabf;background:transparent;border-radius:6px;padding:4px 9px;font-family:'Cascadia Mono',Consolas,ui-monospace,monospace;font-size:11px;letter-spacing:0.04em;color:var(--muted);cursor:pointer;">+ tag</button>
+
+          <sc-if value="{{ tagPopupOpen }}" hint-placeholder-val="{{ false }}">
+            <div style="position:absolute;top:calc(100% + 6px);left:0;z-index:20;width:220px;background:var(--surface);border:1px solid var(--hair);border-radius:8px;padding:10px;box-shadow:none;">
+              <div style="font-family:'Cascadia Mono',Consolas,ui-monospace,monospace;font-size:10px;letter-spacing:0.08em;color:var(--muted);margin-bottom:8px;">EXISTING TAGS</div>
+              <sc-if value="{{ hasSuggestions }}" hint-placeholder-val="{{ true }}">
+                <div style="display:flex;flex-wrap:wrap;gap:6px;">
+                  <sc-for list="{{ tagSuggestions }}" as="sug" hint-placeholder-count="3">
+                    <button onClick="{{ sug.add }}" style="border:1px solid var(--hair);background:var(--bg);border-radius:6px;padding:3px 9px;font-family:'Cascadia Mono',Consolas,ui-monospace,monospace;font-size:11px;color:var(--ink);cursor:pointer;">#{{ sug.name }}</button>
+                  </sc-for>
+                </div>
+              </sc-if>
+              <sc-if value="{{ noSuggestions }}" hint-placeholder-val="{{ false }}">
+                <div style="font-size:12px;color:var(--muted);">All tags added.</div>
+              </sc-if>
+              <div style="display:flex;gap:6px;margin-top:10px;padding-top:10px;border-top:1px solid var(--hair);">
+                <input value="{{ newTag }}" onChange="{{ onNewTag }}" onKeyDown="{{ onNewTagKey }}" placeholder="new tag" style="flex:1;min-width:0;border:1px solid var(--hair);border-radius:6px;background:var(--bg);padding:5px 8px;font-family:'Cascadia Mono',Consolas,ui-monospace,monospace;font-size:11px;color:var(--ink);" />
+                <button onClick="{{ addNewTag }}" style="border:none;background:var(--ink);color:var(--surface);border-radius:6px;padding:5px 10px;font-size:12px;cursor:pointer;font-family:inherit;">Add</button>
+              </div>
+            </div>
+          </sc-if>
+        </div>
+        <span style="flex:1;"></span>
+        <button onClick="{{ togglePin }}" style="{{ pinStyle }}">{{ pinLabel }}</button>
+        <button style="border:1px solid var(--hair);background:var(--surface);border-radius:6px;padding:6px 12px;font-size:13px;color:var(--muted);cursor:pointer;">Archive</button>
+        <button style="border:1px solid #B4533A;background:var(--surface);border-radius:6px;padding:6px 12px;font-size:13px;color:#B4533A;cursor:pointer;">Delete</button>
+      </div>
+
+      <!-- Signature: AI review card -->
+      <sc-if value="{{ showReview }}" hint-placeholder-val="{{ true }}">
+        <div style="margin-top:16px;background:#FBF3C9;border:1px solid #F6E05E;border-radius:8px;padding:14px 16px;">
+          <div style="display:flex;align-items:center;gap:12px;">
+            <span style="background:#F6E05E;color:#6B5C0E;font-family:'Cascadia Mono',Consolas,ui-monospace,monospace;font-size:11px;letter-spacing:0.08em;padding:3px 8px;border-radius:5px;">PROPOSED REWRITE</span>
+            <span style="flex:1;"></span>
+            <button onClick="{{ replaceText }}" style="background:var(--ink);color:var(--surface);border:none;border-radius:6px;padding:6px 12px;font-size:13px;cursor:pointer;">Replace text</button>
+            <button onClick="{{ discard }}" style="background:transparent;border:1px solid #e6d68a;border-radius:6px;padding:6px 12px;font-size:13px;color:#6B5C0E;cursor:pointer;">Discard</button>
+          </div>
+          <div style="color:#6B5C0E;font-size:14px;line-height:1.6;margin-top:12px;">{{ proposedText }}</div>
+        </div>
+      </sc-if>
+
+      <!-- Body -->
+      <textarea class="wn-body" value="{{ editBody }}" onChange="{{ onBody }}" style="flex:1;min-height:0;margin-top:16px;background:var(--surface);border:1px solid var(--hair);border-radius:8px;padding:14px 16px;font-size:15px;line-height:1.6;color:var(--ink);font-family:inherit;resize:none;outline:none;"></textarea>
+
+      <!-- Bottom AI bar -->
+      <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-top:14px;">
+        <span style="font-family:'Cascadia Mono',Consolas,ui-monospace,monospace;font-size:11px;letter-spacing:0.08em;color:var(--muted);">REWORK WITH</span>
+        <select style="border:1px solid var(--hair);border-radius:6px;background:var(--surface);padding:5px 8px;font-size:13px;color:var(--ink);font-family:inherit;cursor:pointer;">
+          <option>Claude</option>
+          <option>GPT</option>
+        </select>
+        <button onClick="{{ presetTighten }}" style="{{ presetStyle }}">Tighten this up</button>
+        <button onClick="{{ presetGrammar }}" style="{{ presetStyle }}">Fix grammar and spelling</button>
+        <button onClick="{{ presetPro }}" style="{{ presetStyle }}">Make it more professional</button>
+        <button onClick="{{ presetBullets }}" style="{{ presetStyle }}">Turn into bullet points</button>
+        <input value="{{ instruction }}" onChange="{{ onInstruction }}" placeholder="Or type your own instruction…" style="flex:1;min-width:160px;border:1px solid var(--hair);border-radius:6px;background:var(--surface);padding:7px 10px;font-size:13px;color:var(--ink);font-family:inherit;" />
+        <button onClick="{{ rework }}" style="background:var(--ink);color:var(--surface);border:none;border-radius:6px;padding:8px 16px;font-size:13px;cursor:pointer;">Rework</button>
+        <button onClick="{{ saveNote }}" disabled="{{ saved }}" style="{{ saveStyle }}">{{ saveLabel }}</button>
+      </div>
+
+    </div>
+  </div>
+
+  <!-- Manage projects dialog -->
+  <sc-if value="{{ projectsDialogOpen }}" hint-placeholder-val="{{ false }}">
+    <div style="position:absolute;inset:0;background:rgba(35,39,42,0.35);display:flex;align-items:center;justify-content:center;">
+      <div style="width:480px;background:var(--surface);border:1px solid var(--hair);border-radius:8px;padding:22px 24px;">
+        <div style="font-size:20px;font-weight:650;color:var(--ink);">Manage projects</div>
+        <div style="color:var(--muted);font-size:13px;line-height:1.55;margin-top:8px;">Rename a project inline, or remove it — items on a removed project keep no project.</div>
+
+        <div style="margin-top:18px;display:flex;flex-direction:column;gap:8px;">
+          <sc-for list="{{ projectRows }}" as="proj" hint-placeholder-count="3">
+            <div style="display:flex;align-items:center;gap:8px;">
+              <input value="{{ proj.name }}" onChange="{{ proj.rename }}" style="flex:1;border:1px solid var(--hair);border-radius:6px;background:var(--bg);padding:8px 10px;font-size:14px;color:var(--ink);font-family:inherit;" />
+              <span style="font-family:'Cascadia Mono',Consolas,ui-monospace,monospace;font-size:10px;letter-spacing:0.06em;color:var(--muted);white-space:nowrap;">{{ proj.count }}</span>
+              <button onClick="{{ proj.remove }}" style="border:1px solid #B4533A;background:var(--surface);border-radius:6px;padding:7px 12px;font-size:13px;color:#B4533A;cursor:pointer;">Remove</button>
+            </div>
+          </sc-for>
+          <sc-if value="{{ noProjects }}" hint-placeholder-val="{{ false }}">
+            <div style="font-size:13px;color:var(--muted);padding:4px 2px;">No projects yet.</div>
+          </sc-if>
+        </div>
+
+        <div style="display:flex;gap:8px;margin-top:14px;padding-top:14px;border-top:1px solid var(--hair);">
+          <input value="{{ newProject }}" onChange="{{ onNewProject }}" onKeyDown="{{ onNewProjectKey }}" placeholder="New project name" style="flex:1;border:1px solid var(--hair);border-radius:6px;background:var(--bg);padding:8px 10px;font-size:14px;color:var(--ink);font-family:inherit;" />
+          <button onClick="{{ addProject }}" style="background:var(--ink);color:var(--surface);border:none;border-radius:6px;padding:8px 16px;font-size:14px;cursor:pointer;white-space:nowrap;">Add project</button>
+        </div>
+
+        <div style="display:flex;justify-content:flex-end;margin-top:24px;">
+          <button onClick="{{ closeProjects }}" style="background:var(--ink);color:var(--surface);border:none;border-radius:6px;padding:8px 18px;font-size:14px;cursor:pointer;">Done</button>
+        </div>
+      </div>
+    </div>
+  </sc-if>
+
+  <!-- API keys dialog -->
+  <sc-if value="{{ dialogOpen }}" hint-placeholder-val="{{ false }}">
+    <div style="position:absolute;inset:0;background:rgba(35,39,42,0.35);display:flex;align-items:center;justify-content:center;">
+      <div style="width:520px;background:var(--surface);border:1px solid var(--hair);border-radius:8px;padding:22px 24px;">
+        <div style="font-size:20px;font-weight:650;color:var(--ink);">API keys</div>
+        <div style="color:var(--muted);font-size:13px;line-height:1.55;margin-top:8px;">Keys are stored in the Windows credential manager on this machine. They are used for rework requests and are never shown again here.</div>
+
+        <div style="margin-top:20px;display:flex;flex-direction:column;gap:16px;">
+          <div>
+            <div style="display:flex;align-items:center;gap:10px;margin-bottom:8px;">
+              <span style="font-size:14px;color:var(--ink);">Anthropic (Claude)</span>
+              <span style="font-family:'Cascadia Mono',Consolas,ui-monospace,monospace;font-size:10px;letter-spacing:0.06em;color:#4C8A64;border:1px solid #4C8A64;border-radius:20px;padding:2px 9px;">key saved</span>
+            </div>
+            <div style="display:flex;gap:8px;">
+              <input type="password" placeholder="Paste key from console.anthropic.com (empty removes)" style="flex:1;border:1px solid var(--hair);border-radius:6px;background:var(--bg);padding:8px 10px;font-size:13px;color:var(--ink);font-family:inherit;" />
+              <button style="background:var(--ink);color:var(--surface);border:none;border-radius:6px;padding:8px 14px;font-size:13px;cursor:pointer;white-space:nowrap;">Save key</button>
+            </div>
+          </div>
+          <div>
+            <div style="display:flex;align-items:center;gap:10px;margin-bottom:8px;">
+              <span style="font-size:14px;color:var(--ink);">OpenAI (GPT)</span>
+              <span style="font-family:'Cascadia Mono',Consolas,ui-monospace,monospace;font-size:10px;letter-spacing:0.06em;color:var(--muted);border:1px solid var(--hair);border-radius:20px;padding:2px 9px;">no key</span>
+            </div>
+            <div style="display:flex;gap:8px;">
+              <input type="password" placeholder="Paste key from console.anthropic.com (empty removes)" style="flex:1;border:1px solid var(--hair);border-radius:6px;background:var(--bg);padding:8px 10px;font-size:13px;color:var(--ink);font-family:inherit;" />
+              <button style="background:var(--ink);color:var(--surface);border:none;border-radius:6px;padding:8px 14px;font-size:13px;cursor:pointer;white-space:nowrap;">Save key</button>
+            </div>
+          </div>
+        </div>
+
+        <div style="display:flex;justify-content:flex-end;margin-top:24px;">
+          <button onClick="{{ closeDialog }}" style="background:var(--ink);color:var(--surface);border:none;border-radius:6px;padding:8px 18px;font-size:14px;cursor:pointer;">Done</button>
+        </div>
+      </div>
+    </div>
+  </sc-if>
+
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props="{&quot;$preview&quot;:{&quot;width&quot;:1200,&quot;height&quot;:760}}">
+class Component extends DCLogic {
+  items = [
+    { id: 1, kind: 'note', pinned: true, title: 'Platform migration notes', project: 'Platform Migration',
+      preview: 'Cutover checklist and open questions for the…', tags: ['platform', 'migration'], ts: '14:32', created: '2026-07-01T09:00', updated: '2026-07-13T14:32',
+      body: 'Cutover checklist and open questions for the platform migration. Confirm DNS TTLs, rehearse rollback, and get sign-off from data eng before the window.' },
+    { id: 2, kind: 'task', status: 'doing', priority: 'high', title: 'Send follow-up email to platform team', project: 'Platform Migration',
+      preview: 'Summarize the decisions from Tuesday and…', tags: ['platform'], ts: '11:05', created: '2026-07-09T15:20', updated: '2026-07-13T11:05',
+      body: "hey — following up from tuesday. we decided to freeze schema changes til cutover is done. i'll send the rollback checklist by thursday. lmk if anything is blocking before then.",
+      proposed: "Hi team — following up on Tuesday's discussion. We agreed to freeze schema changes until the cutover completes, and I'll circulate the rollback checklist by Thursday. Please flag any blocking migrations before then." },
+    { id: 3, kind: 'task', status: 'todo', priority: 'normal', title: 'Book room for Q3 review', project: 'Q3 Planning',
+      preview: '', tags: ['planning'], ts: 'Jul 11', created: '2026-07-11T10:00', updated: '2026-07-11T10:00', body: '' },
+    { id: 4, kind: 'note', title: 'Quarterly planning meeting', project: 'Q3 Planning',
+      preview: 'Discussed roadmap, hiring plan and budget…', tags: ['work', 'planning'], ts: 'Jul 10', created: '2026-07-05T13:30', updated: '2026-07-10T16:45',
+      body: 'Discussed roadmap, hiring plan and budget for the next two quarters. Action items assigned; follow up in two weeks.' },
+    { id: 5, kind: 'task', status: 'done', priority: 'normal', title: 'File expense report', project: 'Admin',
+      preview: '', tags: [], ts: 'Jul 8', created: '2026-07-02T08:15', updated: '2026-07-08T09:30', body: '' },
+  ];
+
+  state = {
+    selectedId: 2, filter: 'All', dialogOpen: false, dirty: true, showReview: true,
+    editTitle: '', editStatus: 'todo', editPriority: 'normal', editTagsArr: [], editBody: '',
+    pinned: false, proposed: null, instruction: '',
+    tagPopupOpen: false, newTag: '',
+    filterTags: [], filterPopupOpen: false,
+    editProject: 'Platform Migration', projectFilter: 'All',
+    statusFilter: 'All', sortBy: 'updated',
+    projects: ['Platform Migration', 'Q3 Planning', 'Admin'],
+    projectsDialogOpen: false, newProject: '',
+    dark: false,
+  };
+
+  applyTheme() { document.body.setAttribute('data-theme', this.state.dark ? 'dark' : 'light'); }
+  componentDidUpdate() { this.applyTheme(); }
+
+  allProjects() { return this.state.projects; }
+
+  renameProject(index, newVal) {
+    const old = this.state.projects[index];
+    const projects = this.state.projects.slice();
+    projects[index] = newVal;
+    this.items.forEach(it => { if (it.project === old) it.project = newVal; });
+    this.setState(st => ({
+      projects,
+      editProject: st.editProject === old ? newVal : st.editProject,
+      projectFilter: st.projectFilter === old ? newVal : st.projectFilter,
+    }));
+  }
+
+  removeProject(index) {
+    const name = this.state.projects[index];
+    const projects = this.state.projects.filter((_, i) => i !== index);
+    this.items.forEach(it => { if (it.project === name) it.project = null; });
+    this.setState(st => ({
+      projects,
+      editProject: st.editProject === name ? '' : st.editProject,
+      projectFilter: st.projectFilter === name ? 'All' : st.projectFilter,
+    }));
+  }
+
+  addProject() {
+    const name = (this.state.newProject || '').trim();
+    if (!name || this.state.projects.includes(name)) { this.setState({ newProject: '' }); return; }
+    this.setState(st => ({ projects: st.projects.concat(name), newProject: '' }));
+  }
+
+  componentDidMount() { this.loadItem(2, true); this.applyTheme(); }
+
+  loadItem(id, keepDirty) {
+    const it = this.items.find(i => i.id === id);
+    if (!it) return;
+    this.setState({
+      selectedId: id,
+      editTitle: it.title,
+      editStatus: it.status || 'todo',
+      editPriority: it.priority || 'normal',
+      editProject: it.project || (this.allProjects()[0] || ''),
+      editTagsArr: (it.tags || []).slice(),
+      editBody: it.body || '',
+      pinned: !!it.pinned,
+      proposed: it.proposed || null,
+      showReview: !!it.proposed,
+      dirty: keepDirty ? true : false,
+      tagPopupOpen: false, newTag: '',
+    });
+  }
+
+  dotColor(status) { return status === 'doing' ? '#D9A441' : status === 'done' ? '#4C8A64' : '#9AA0A6'; }
+
+  duplicateMetadata() {
+    const cur = this.items.find(i => i.id === this.state.selectedId) || {};
+    const id = Math.max(0, ...this.items.map(i => i.id)) + 1;
+    const item = {
+      id,
+      kind: cur.kind || 'note',
+      status: cur.status,
+      priority: cur.priority,
+      project: this.state.editProject || cur.project || null,
+      tags: this.state.editTagsArr.slice(),
+      pinned: false,
+      title: '',
+      preview: '',
+      ts: 'now',
+      body: '',
+    };
+    this.items.unshift(item);
+    this.loadItem(id, true);
+  }
+
+  addTag() {
+    const t = (this.state.newTag || '').trim().replace(/^#/, '').toLowerCase();
+    if (!t) return;
+    this.setState(st => ({
+      editTagsArr: st.editTagsArr.includes(t) ? st.editTagsArr : st.editTagsArr.concat(t),
+      newTag: '', dirty: true,
+    }));
+  }
+
+  allTags() {
+    const set = [];
+    this.items.forEach(it => (it.tags || []).forEach(t => { if (!set.includes(t)) set.push(t); }));
+    return set;
+  }
+
+  renderVals() {
+    const s = this.state;
+    const chipBase = "border-radius:20px;padding:6px 14px;font-size:13px;cursor:pointer;font-family:inherit;";
+    const chipOff = chipBase + "background:transparent;border:1px solid var(--hair);color:var(--muted);";
+    const chipOn = chipBase + "background:var(--ink);border:1px solid var(--ink);color:var(--surface);";
+
+    const filtered = this.items.filter(it => {
+      const kindOk = s.filter === 'All' ? true : s.filter === 'Notes' ? it.kind === 'note' : it.kind === 'task';
+      const tagsOk = s.filterTags.length === 0 || s.filterTags.some(t => (it.tags || []).includes(t));
+      const projOk = s.projectFilter === 'All' || it.project === s.projectFilter;
+      const statusOk = s.statusFilter === 'All' || (it.kind === 'task' && it.status === s.statusFilter);
+      return kindOk && tagsOk && projOk && statusOk;
+    });
+
+    const prioRank = { high: 0, normal: 1, low: 2 };
+    const statRank = { doing: 0, todo: 1, done: 2 };
+    const num = v => Date.parse(v) || 0;
+    filtered.sort((a, b) => {
+      if (!!b.pinned - !!a.pinned) return (!!b.pinned) - (!!a.pinned);
+      if (s.sortBy === 'created') return num(b.created) - num(a.created);
+      if (s.sortBy === 'updated') return num(b.updated) - num(a.updated);
+      if (s.sortBy === 'priority') return (prioRank[a.priority] ?? 3) - (prioRank[b.priority] ?? 3);
+      if (s.sortBy === 'status') return (statRank[a.status] ?? 3) - (statRank[b.status] ?? 3);
+      return 0;
+    });
+
+    const rows = filtered.map(it => {
+      const selected = it.id === s.selectedId;
+      const rowStyle = "padding:12px 14px 13px;border-bottom:1px solid var(--hair);cursor:pointer;"
+        + (selected
+            ? "background:var(--bg);border-left:3px solid #F6E05E;padding-left:11px;"
+            : "border-left:3px solid transparent;");
+      const showPriority = it.kind === 'task' && it.priority && it.priority !== 'normal';
+      const priorityStyle = "font-family:'Cascadia Mono',Consolas,ui-monospace,monospace;font-size:11px;flex:0 0 auto;"
+        + (it.priority === 'high' ? "color:#B4533A;" : "color:var(--muted);");
+      return {
+        id: it.id,
+        title: it.title,
+        titleStyle: "font-weight:600;font-size:14px;color:var(--ink);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;flex:1;min-width:0;",
+        ts: it.ts,
+        showPin: !!it.pinned,
+        showDot: it.kind === 'task',
+        dotStyle: "width:9px;height:9px;flex:0 0 9px;border-radius:50%;display:inline-block;background:" + this.dotColor(it.status) + ";",
+        showPriority,
+        priorityText: it.priority,
+        priorityStyle,
+        hasPreview: !!it.preview,
+        preview: it.preview,
+        hasTags: (it.tags || []).length > 0,
+        tagsStr: (it.tags || []).map(t => '#' + t).join(' '),
+        rowStyle,
+        onClick: () => this.loadItem(it.id, false),
+      };
+    });
+
+    const allTags = this.allTags();
+    const projectFilterOptions = [{ value: 'All', label: 'All projects' }]
+      .concat(this.allProjects().map(name => ({ value: name, label: name })));
+    const kind = (this.items.find(i => i.id === s.selectedId) || {}).kind || 'note';
+    const isTask = kind === 'task';
+    const saved = !s.dirty;
+
+    const saveStyle = "border:none;border-radius:6px;padding:8px 18px;font-size:14px;font-family:inherit;"
+      + "background:#F6E05E;color:#6B5C0E;"
+      + (saved ? "opacity:0.5;cursor:default;" : "cursor:pointer;");
+
+    const pinStyle = "border-radius:6px;padding:6px 12px;font-size:13px;cursor:pointer;font-family:inherit;"
+      + (s.pinned
+          ? "background:#FBF3C9;border:1px solid #F6E05E;color:#6B5C0E;"
+          : "background:var(--surface);border:1px solid var(--hair);color:var(--muted);");
+
+    const presetStyle = "background:var(--surface);border:1px solid var(--hair);border-radius:20px;padding:6px 12px;font-size:12px;color:var(--ink);cursor:pointer;font-family:inherit;white-space:nowrap;";
+
+    return {
+      rows,
+      isEmpty: rows.length === 0,
+      chipAll: s.filter === 'All' ? chipOn : chipOff,
+      chipNotes: s.filter === 'Notes' ? chipOn : chipOff,
+      chipTasks: s.filter === 'Tasks' ? chipOn : chipOff,
+      filterBadges: s.filterTags.map(name => ({
+        name,
+        remove: () => this.setState(st => ({ filterTags: st.filterTags.filter(t => t !== name) })),
+      })),
+      toggleFilterPopup: () => this.setState(st => ({ filterPopupOpen: !st.filterPopupOpen })),
+      filterPopupOpen: s.filterPopupOpen,
+      filterSuggestions: allTags.filter(t => !s.filterTags.includes(t)).map(name => ({
+        name,
+        add: () => this.setState(st => ({ filterTags: st.filterTags.concat(name) })),
+      })),
+      hasFilterSuggestions: allTags.filter(t => !s.filterTags.includes(t)).length > 0,
+      noFilterSuggestions: allTags.filter(t => !s.filterTags.includes(t)).length === 0,
+
+      projectFilterOptions,
+      projectFilter: s.projectFilter,
+      onProjectFilter: e => this.setState({ projectFilter: e.target.value }),
+      statusFilter: s.statusFilter,
+      onStatusFilter: e => this.setState({ statusFilter: e.target.value }),
+      sortBy: s.sortBy,
+      onSortBy: e => this.setState({ sortBy: e.target.value }),
+      projectOptions: this.allProjects(),
+      editProject: s.editProject,
+      onProject: e => this.setState({ editProject: e.target.value, dirty: true }),
+
+      setAll: () => this.setState({ filter: 'All' }),
+      setNotes: () => this.setState({ filter: 'Notes' }),
+      setTasks: () => this.setState({ filter: 'Tasks' }),
+
+      editTitle: s.editTitle,
+      onTitle: e => this.setState({ editTitle: e.target.value, dirty: true }),
+      editStatus: s.editStatus,
+      onStatus: e => this.setState({ editStatus: e.target.value, dirty: true }),
+      editPriority: s.editPriority,
+      onPriority: e => this.setState({ editPriority: e.target.value, dirty: true }),
+      tagBadges: s.editTagsArr.map(name => ({
+        name,
+        remove: () => this.setState(st => ({ editTagsArr: st.editTagsArr.filter(t => t !== name), dirty: true })),
+      })),
+      toggleTagPopup: () => this.setState(st => ({ tagPopupOpen: !st.tagPopupOpen })),
+      tagPopupOpen: s.tagPopupOpen,
+      tagSuggestions: allTags.filter(t => !s.editTagsArr.includes(t)).map(name => ({
+        name,
+        add: () => this.setState(st => ({ editTagsArr: st.editTagsArr.concat(name), dirty: true })),
+      })),
+      hasSuggestions: allTags.filter(t => !s.editTagsArr.includes(t)).length > 0,
+      noSuggestions: allTags.filter(t => !s.editTagsArr.includes(t)).length === 0,
+      newTag: s.newTag,
+      onNewTag: e => this.setState({ newTag: e.target.value }),
+      onNewTagKey: e => { if (e.key === 'Enter') this.addTag(); },
+      addNewTag: () => this.addTag(),
+      editBody: s.editBody,
+      onBody: e => this.setState({ editBody: e.target.value, dirty: true }),
+
+      kindLabel: kind.toUpperCase(),
+      isTask,
+      saved,
+      saveLabel: saved ? 'Saved' : 'Save',
+      saveStyle,
+      saveNote: () => this.setState({ dirty: false }),
+      duplicateMetadata: () => this.duplicateMetadata(),
+
+      pinStyle,
+      pinLabel: s.pinned ? 'Unpin' : 'Pin',
+      togglePin: () => this.setState(st => ({ pinned: !st.pinned, dirty: true })),
+
+      showReview: s.showReview,
+      proposedText: s.proposed,
+      replaceText: () => this.setState(st => ({ editBody: st.proposed, showReview: false, dirty: true })),
+      discard: () => this.setState({ showReview: false }),
+
+      instruction: s.instruction,
+      onInstruction: e => this.setState({ instruction: e.target.value }),
+      presetStyle,
+      presetTighten: () => this.setState({ instruction: 'Tighten this up' }),
+      presetGrammar: () => this.setState({ instruction: 'Fix grammar and spelling' }),
+      presetPro: () => this.setState({ instruction: 'Make it more professional' }),
+      presetBullets: () => this.setState({ instruction: 'Turn into bullet points' }),
+      rework: () => { if (this.state.proposed) this.setState({ showReview: true }); },
+
+      themeLabel: s.dark ? 'Light' : 'Dark',
+      toggleTheme: () => this.setState(st => ({ dark: !st.dark })),
+
+      dialogOpen: s.dialogOpen,
+      openDialog: () => this.setState({ dialogOpen: true }),
+      closeDialog: () => this.setState({ dialogOpen: false }),
+
+      projectsDialogOpen: s.projectsDialogOpen,
+      openProjects: () => this.setState({ projectsDialogOpen: true }),
+      closeProjects: () => this.setState({ projectsDialogOpen: false }),
+      projectRows: s.projects.map((name, index) => ({
+        name,
+        count: this.items.filter(it => it.project === name).length + (this.items.filter(it => it.project === name).length === 1 ? ' ITEM' : ' ITEMS'),
+        rename: e => this.renameProject(index, e.target.value),
+        remove: () => this.removeProject(index),
+      })),
+      noProjects: s.projects.length === 0,
+      newProject: s.newProject,
+      onNewProject: e => this.setState({ newProject: e.target.value }),
+      onNewProjectKey: e => { if (e.key === 'Enter') this.addProject(); },
+      addProject: () => this.addProject(),
+    };
+  }
+}
+</script>
+</body>
+</html>

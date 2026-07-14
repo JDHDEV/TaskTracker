@@ -1,0 +1,561 @@
+/* Design tokens.
+   Type: Segoe UI Variable for the interface (native on Windows 11),
+   Cascadia Mono for metadata — timestamps, kind labels, tags — the way a
+   dev tool annotates things. Signature element: the highlighter yellow,
+   reserved for AI review moments and the active-row mark. */
+:root {
+  /* Neutral palette — light is the default; the dark theme swaps only these
+     (plus the window surround below). See [data-theme="dark"]. */
+  --bg: #f1f0ec;
+  --surface: #fbfaf8;
+  --ink: #23272a;
+  --muted: #6e7378;
+  --line: #e3e1db;
+  --surround: #dcdad4;
+  --outer: #ccc9c1;
+
+  /* Accents — constant across both themes, never re-themed. */
+  --mark: #f6e05e;
+  --mark-soft: #fbf3c9;
+  --mark-ink: #6b5c0e;
+  --danger: #b4533a;
+  --todo: #9aa0a6;
+  --doing: #d9a441;
+  --done: #4c8a64;
+  --scrim: rgba(35, 39, 42, 0.35);
+
+  --font-ui: "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif;
+  --font-meta: "Cascadia Mono", Consolas, ui-monospace, monospace;
+}
+
+[data-theme="dark"] {
+  --bg: #1d1c1a;
+  --surface: #272623;
+  --ink: #eceae4;
+  --muted: #a0a09a;
+  --line: #3a3833;
+  --surround: #131211;
+  --outer: #3a3833;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  font-family: var(--font-ui);
+  font-size: 14px;
+  color: var(--ink);
+  background: var(--bg);
+}
+
+button,
+input,
+select,
+textarea {
+  font: inherit;
+  color: inherit;
+}
+
+:focus-visible {
+  outline: 2px solid var(--ink);
+  outline-offset: 1px;
+}
+
+/* Shell */
+.app {
+  height: 100%;
+  display: flex;
+  flex-direction: column;
+}
+
+.topbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 14px;
+  border-bottom: 1px solid var(--line);
+  background: var(--surface);
+}
+
+.wordmark {
+  font-family: var(--font-meta);
+  font-size: 13px;
+  letter-spacing: 0.08em;
+}
+
+.toast {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 14px;
+  background: #f7e3dd;
+  color: #7c3421;
+  border-bottom: 1px solid #e8c6bb;
+}
+
+.panes {
+  flex: 1;
+  min-height: 0;
+  display: grid;
+  grid-template-columns: 300px 1fr;
+}
+
+/* Left rail */
+.rail {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  border-right: 1px solid var(--line);
+  background: var(--surface);
+}
+
+.rail-actions {
+  display: flex;
+  gap: 8px;
+  padding: 12px 12px 0;
+}
+
+.search {
+  margin: 12px;
+  padding: 7px 10px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--bg);
+}
+
+.chips {
+  display: flex;
+  gap: 6px;
+  padding: 0 12px 10px;
+  flex-wrap: wrap;
+}
+
+.chip {
+  padding: 4px 10px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+}
+
+.chip:hover:not(:disabled) {
+  border-color: var(--muted);
+  color: var(--ink);
+}
+
+.chip:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.chip-on {
+  background: var(--ink);
+  border-color: var(--ink);
+  color: var(--surface);
+}
+
+.list {
+  flex: 1;
+  overflow-y: auto;
+  margin: 0;
+  padding: 0 8px 12px;
+  list-style: none;
+  border-top: 1px solid var(--line);
+}
+
+.list-empty {
+  padding: 24px 12px;
+  color: var(--muted);
+}
+
+.row {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  width: 100%;
+  margin-top: 8px;
+  padding: 9px 10px;
+  border: 1px solid transparent;
+  border-left: 3px solid transparent;
+  border-radius: 6px;
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+}
+
+.row:hover {
+  background: var(--bg);
+}
+
+.row-on {
+  background: var(--bg);
+  border-color: var(--line);
+  border-left-color: var(--mark);
+  border-radius: 0 6px 6px 0;
+}
+
+.row-top {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+
+.row-title {
+  flex: 1;
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.row-when {
+  font-family: var(--font-meta);
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.row-body {
+  color: var(--muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.row-tags {
+  font-family: var(--font-meta);
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  flex: none;
+}
+
+.dot-todo {
+  background: var(--todo);
+}
+
+.dot-doing {
+  background: var(--doing);
+}
+
+.dot-done {
+  background: var(--done);
+}
+
+/* Pinned marker: a small highlighter diamond, distinct from status circles. */
+.pin {
+  width: 8px;
+  height: 8px;
+  flex: none;
+  background: var(--mark);
+  border: 1px solid var(--mark-ink);
+  transform: rotate(45deg);
+}
+
+.prio {
+  font-family: var(--font-meta);
+  font-size: 11px;
+  flex: none;
+}
+
+.prio-high {
+  color: var(--danger);
+}
+
+.prio-low {
+  color: var(--muted);
+}
+
+/* Editor */
+.editor {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  padding: 18px 22px;
+  gap: 12px;
+}
+
+.editor-empty {
+  align-items: center;
+  justify-content: center;
+  color: var(--muted);
+}
+
+.editor-head {
+  display: flex;
+  gap: 12px;
+  align-items: center;
+}
+
+.title {
+  flex: 1;
+  padding: 6px 2px;
+  border: none;
+  border-bottom: 1px solid transparent;
+  background: transparent;
+  font-size: 22px;
+  font-weight: 650;
+}
+
+.title:hover,
+.title:focus {
+  border-bottom-color: var(--line);
+  outline: none;
+}
+
+.meta {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.meta-kind {
+  font-family: var(--font-meta);
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.meta-tags {
+  flex: 0 1 260px;
+  padding: 5px 8px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--surface);
+  font-family: var(--font-meta);
+  font-size: 12px;
+}
+
+.meta-spring {
+  flex: 1;
+}
+
+.body {
+  flex: 1;
+  min-height: 0;
+  padding: 14px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+  font-size: 15px;
+  line-height: 1.6;
+  resize: none;
+}
+
+/* The signature: AI proposals arrive as a highlighter-marked annotation,
+   never as a silent overwrite. */
+.review {
+  border: 1px solid var(--mark);
+  border-radius: 8px;
+  background: var(--mark-soft);
+  overflow: hidden;
+}
+
+.review-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+}
+
+.review-mark {
+  font-family: var(--font-meta);
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--mark-ink);
+  background: var(--mark);
+  padding: 2px 8px;
+  border-radius: 4px;
+  align-self: flex-start;
+  flex: none;
+  margin-right: auto;
+}
+
+.review-body {
+  margin: 0;
+  padding: 4px 12px 12px;
+  max-height: 220px;
+  overflow-y: auto;
+  font-family: var(--font-ui);
+  font-size: 14px;
+  line-height: 1.55;
+  color: var(--mark-ink);
+  white-space: pre-wrap;
+}
+
+/* AI bar */
+.aibar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding-top: 2px;
+}
+
+.aibar-label {
+  font-family: var(--font-meta);
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.aibar-custom {
+  flex: 1 1 180px;
+  padding: 6px 10px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--surface);
+}
+
+/* Controls */
+.btn {
+  padding: 6px 12px;
+  border: 1px solid var(--ink);
+  border-radius: 6px;
+  background: var(--ink);
+  color: var(--surface);
+  cursor: pointer;
+}
+
+.btn:hover:not(:disabled) {
+  opacity: 0.88;
+}
+
+.btn:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+
+.btn-quiet {
+  background: transparent;
+  border-color: var(--line);
+  color: var(--ink);
+}
+
+.btn-danger {
+  background: transparent;
+  border-color: var(--danger);
+  color: var(--danger);
+}
+
+.btn-pinned {
+  background: var(--mark-soft);
+  border-color: var(--mark);
+  color: var(--mark-ink);
+}
+
+.btn-save {
+  background: var(--mark);
+  border-color: var(--mark);
+  color: var(--mark-ink);
+  font-weight: 600;
+}
+
+.select {
+  padding: 5px 8px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--surface);
+}
+
+/* Settings dialog */
+.scrim {
+  position: fixed;
+  inset: 0;
+  background: var(--scrim);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.dialog {
+  width: min(520px, calc(100vw - 32px));
+  padding: 20px 22px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--surface);
+}
+
+.dialog h2 {
+  margin: 0 0 6px;
+  font-size: 17px;
+}
+
+.dialog-note {
+  margin: 0 0 16px;
+  color: var(--muted);
+}
+
+.keyrow {
+  padding: 12px 0;
+  border-top: 1px solid var(--line);
+}
+
+.keyrow-name {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 8px;
+  font-weight: 600;
+}
+
+.keyrow-form {
+  display: flex;
+  gap: 8px;
+}
+
+.keyrow-input {
+  flex: 1;
+  padding: 6px 10px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--bg);
+  font-family: var(--font-meta);
+  font-size: 12px;
+}
+
+.pill {
+  font-family: var(--font-meta);
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--line);
+  color: var(--muted);
+}
+
+.pill-on {
+  border-color: var(--done);
+  color: var(--done);
+}
+
+.dialog-foot {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 16px;
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .btn,
+  .chip,
+  .row {
+    transition: background-color 120ms ease, opacity 120ms ease,
+      border-color 120ms ease;
+  }
+}
