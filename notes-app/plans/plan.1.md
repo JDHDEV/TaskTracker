@@ -257,7 +257,16 @@ After implementation, verify:
 - [ ] Changes are minimal — no unrelated refactoring; `project_id`/`jira_url` merged outside the task gate (D3); pin/archive still don't bump `updatedAt`
 
 ## 12. Post-Review Improvements
-*(Leave empty. After implementation and code review, document improvements here and implement them.)*
+
+Two narrow deviations from the plan's own stated intent were surfaced independently by the security-auditor and code-reviewer agents (both low-probability at single-user desktop scale, but cheap to close and required by the §11 checklist item "no raw SQLite constraint text reaches the caller"). Both implemented:
+
+1. **`delete_project` now uses `BEGIN IMMEDIATE`** (D6 specifies it literally). `self.pool.begin()` issues a *deferred* `BEGIN`, so the `COUNT` read takes no write lock and the later `DELETE` must upgrade the lock — under a concurrent writer that upgrade can surface as a raw `database is locked` error (leaked via `AppError::Db`). Switched to `self.pool.begin_with("BEGIN IMMEDIATE")` (sqlx 0.8.3+), which takes the write lock up front while preserving the `Transaction`'s RAII rollback-on-drop. `sqlite.rs` `delete_project`.
+
+2. **FK-violation backstop on the item `create()`/`update()` writes.** `ensure_project_exists` is a pre-check with a TOCTOU window: if a project is deleted between the check and the write, the FK fires and the raw `FOREIGN KEY constraint failed` would leak as `AppError::Db` — the exact leak D2a guards against, just via a race the pre-check alone can't close (the duplicate-name path already had `map_unique_violation` as its backstop; the FK path had none). Added `map_fk_violation`, mapping an FK constraint error to the same clean `AppError::Invalid("no such project")`, applied to both item write statements. `sqlite.rs` `create`/`update` + new `map_fk_violation` helper.
+
+**Note on the test seam (deviation from §6/§8 wording):** the plan calls for a `#[cfg(test)]`-gated timestamp seam. `tests/repo.rs` is an *integration* test — a separate crate that compiles `notes_app_lib` **without** `cfg(test)` — so a `#[cfg(test)]` method would be invisible to it and fail to compile. Implemented instead as a `test-support` cargo feature (off by default, so the seam never ships in release/`tauri` builds) enabled for the test crate via a self dev-dependency (`Cargo.toml`). `set_timestamps_for_test` is gated `#[cfg(feature = "test-support")]`. This preserves the plan's intent (test-only seam, not production API) with the only mechanism that actually works for an integration-test crate.
+
+Both concurrency fixes are defense-in-depth for a single-user local app; the normal (non-raced) paths are covered by `nonexistent_project_id_is_invalid_on_create_and_update`, `delete_project_blocked_message_names_count`, and the other project tests. The raced FK-backstop path is not deterministically unit-testable, but was confirmed reachable during the non-vacuous stub proof (with the app-level guard stubbed out, `delete_project` surfaced `FOREIGN KEY constraint failed`, demonstrating the FK backstop is a real, exercised path).
 
 ## 13. Execution Prompt
 

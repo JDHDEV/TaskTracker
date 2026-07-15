@@ -9,6 +9,12 @@ edition = "2021"
 name = "notes_app_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
+[features]
+# Test-only seam (timestamp stamping for deterministic ordering tests). Off in
+# production builds, so the helper never ships; the integration test crate turns
+# it on via the self dev-dependency below.
+test-support = []
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
@@ -52,6 +58,10 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 [dev-dependencies]
 # For the integration tests in tests/ — run with `cargo test` from src-tauri.
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+# Self dev-dependency purely to enable `test-support` for the integration tests
+# (cargo allows dev-dependency cycles). This exposes the timestamp seam to
+# tests/repo.rs without shipping it in release builds.
+notes-app = { path = ".", features = ["test-support"] }
 
 [profile.release]
 lto = true

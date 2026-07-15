@@ -6,7 +6,7 @@ use tauri::State;
 use crate::ai::{self, keys};
 use crate::db::ItemRepository;
 use crate::error::{AppError, Result};
-use crate::models::{Item, ListFilter, NewItem, UpdateItem};
+use crate::models::{Item, ListFilter, NewItem, Project, ProjectWithCount, UpdateItem};
 
 /// Everything commands are allowed to touch. Note the type: the repository
 /// is `dyn ItemRepository` — commands cannot know or care that it's SQLite.
@@ -48,8 +48,41 @@ pub async fn delete_item(state: State<'_, AppState>, id: String) -> Result<()> {
 }
 
 #[tauri::command]
-pub async fn search_items(state: State<'_, AppState>, query: String) -> Result<Vec<Item>> {
-    state.repo.search(&query).await
+pub async fn search_items(
+    state: State<'_, AppState>,
+    query: String,
+    filter: Option<ListFilter>,
+) -> Result<Vec<Item>> {
+    state.repo.search(&query, &filter.unwrap_or_default()).await
+}
+
+#[tauri::command]
+pub async fn list_projects(state: State<'_, AppState>) -> Result<Vec<ProjectWithCount>> {
+    state.repo.list_projects().await
+}
+
+#[tauri::command]
+pub async fn create_project(state: State<'_, AppState>, name: String) -> Result<Project> {
+    state.repo.create_project(&name).await
+}
+
+#[tauri::command]
+pub async fn rename_project(
+    state: State<'_, AppState>,
+    id: String,
+    name: String,
+) -> Result<Project> {
+    state.repo.rename_project(&id, &name).await
+}
+
+#[tauri::command]
+pub async fn delete_project(state: State<'_, AppState>, id: String) -> Result<()> {
+    state.repo.delete_project(&id).await
+}
+
+#[tauri::command]
+pub async fn list_active_tags(state: State<'_, AppState>) -> Result<Vec<String>> {
+    state.repo.list_active_tags().await
 }
 
 #[derive(Debug, Deserialize)]

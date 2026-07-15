@@ -3,7 +3,7 @@ pub mod sqlite;
 pub use sqlite::SqliteRepository;
 
 use crate::error::Result;
-use crate::models::{Item, ListFilter, NewItem, UpdateItem};
+use crate::models::{Item, ListFilter, NewItem, Project, ProjectWithCount, UpdateItem};
 
 /// The storage swap point. Commands depend on `Arc<dyn ItemRepository>` and
 /// nothing else, so moving to a cloud database is: write a second impl
@@ -17,6 +17,24 @@ pub trait ItemRepository: Send + Sync {
     async fn create(&self, input: NewItem) -> Result<Item>;
     async fn update(&self, id: &str, patch: UpdateItem) -> Result<Item>;
     async fn delete(&self, id: &str) -> Result<()>;
-    /// Full-text search over title and body. Empty query returns recent items.
-    async fn search(&self, query: &str) -> Result<Vec<Item>>;
+    /// Full-text search over title and body, then the same post-filters as
+    /// `list` (project/status/tags). Archived items are always excluded.
+    /// Empty query falls back to `list(filter)`.
+    async fn search(&self, query: &str, filter: &ListFilter) -> Result<Vec<Item>>;
+
+    /// All projects with their item counts (archived items included), ordered
+    /// by name.
+    async fn list_projects(&self) -> Result<Vec<ProjectWithCount>>;
+    /// Create a project. Name is trimmed; empty or duplicate names are rejected
+    /// with `AppError::Invalid`.
+    async fn create_project(&self, name: &str) -> Result<Project>;
+    /// Rename a project. Empty/duplicate names → `Invalid`; unknown id →
+    /// `NotFound`. Renaming to the project's own current name succeeds.
+    async fn rename_project(&self, id: &str, name: &str) -> Result<Project>;
+    /// Delete a project. Fails with `Invalid` while any item (archived included)
+    /// still references it; unknown id → `NotFound`.
+    async fn delete_project(&self, id: &str) -> Result<()>;
+    /// The derived tag vocabulary: every distinct tag carried by at least one
+    /// non-archived item that is not a done task, sorted.
+    async fn list_active_tags(&self) -> Result<Vec<String>>;
 }

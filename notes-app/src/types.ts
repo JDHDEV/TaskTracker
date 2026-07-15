@@ -3,6 +3,7 @@
 export type Kind = "note" | "task";
 export type Status = "todo" | "doing" | "done";
 export type Priority = "low" | "normal" | "high";
+export type Sort = "updated" | "created" | "priority" | "status";
 
 export interface Item {
   id: string;
@@ -17,6 +18,18 @@ export interface Item {
   updatedAt: string; // RFC 3339 — bumped by content edits only, not pin/archive
   archived: boolean;
   pinned: boolean;
+  projectId: string | null;
+  jiraUrl: string | null;
+}
+
+export interface Project {
+  id: string;
+  name: string;
+  createdAt: string; // RFC 3339
+}
+
+export interface ProjectWithCount extends Project {
+  itemCount: number;
 }
 
 export interface NewItem {
@@ -27,9 +40,11 @@ export interface NewItem {
   priority?: Priority;
   dueAt?: string;
   tags?: string[];
+  projectId?: string;
+  jiraUrl?: string;
 }
 
-/** Omitted fields are left unchanged. Send dueAt: "" to clear a due date. */
+/** Omitted fields are left unchanged. Send dueAt/jiraUrl: "" to clear them. */
 export interface UpdateItem {
   title?: string;
   body?: string;
@@ -37,6 +52,8 @@ export interface UpdateItem {
   priority?: Priority;
   dueAt?: string;
   tags?: string[];
+  projectId?: string;
+  jiraUrl?: string;
   archived?: boolean;
   pinned?: boolean;
 }
@@ -44,6 +61,10 @@ export interface UpdateItem {
 export interface ListFilter {
   kind?: Kind;
   archived?: boolean;
+  projectId?: string;
+  status?: Status;
+  tags?: string[];
+  sort?: Sort;
 }
 
 export type ProviderId = "anthropic" | "openai";
