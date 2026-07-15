@@ -3,7 +3,9 @@ import type { ProviderId } from "../types";
 
 interface Props {
   busy: boolean;
+  dirty: boolean;
   onRework: (instruction: string, provider: ProviderId) => void;
+  onSave: () => void;
 }
 
 const PRESETS = [
@@ -18,7 +20,7 @@ const PROVIDERS: { id: ProviderId; label: string }[] = [
   { id: "openai", label: "GPT" },
 ];
 
-export default function AiBar({ busy, onRework }: Props) {
+export default function AiBar({ busy, dirty, onRework, onSave }: Props) {
   const [provider, setProvider] = useState<ProviderId>(
     () => (localStorage.getItem("provider") as ProviderId) || "anthropic",
   );
@@ -53,12 +55,7 @@ export default function AiBar({ busy, onRework }: Props) {
       </select>
 
       {PRESETS.map((preset) => (
-        <button
-          key={preset}
-          className="chip"
-          disabled={busy}
-          onClick={() => onRework(preset, provider)}
-        >
+        <button key={preset} className="chip" onClick={() => setCustom(preset)}>
           {preset}
         </button>
       ))}
@@ -77,6 +74,9 @@ export default function AiBar({ busy, onRework }: Props) {
         onClick={submitCustom}
       >
         {busy ? "Working…" : "Rework"}
+      </button>
+      <button className="btn btn-save" disabled={!dirty} onClick={onSave}>
+        {dirty ? "Save" : "Saved"}
       </button>
     </div>
   );

@@ -551,6 +551,250 @@ textarea {
   margin-top: 16px;
 }
 
+/* Rail filters (tag / project / status / sort) */
+.tagfilter {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 0 12px 10px;
+}
+
+.tagfilter-label,
+.jira-label,
+.popover-label {
+  font-family: var(--font-meta);
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--muted);
+}
+
+.tagfilter-badges,
+.editor-tags {
+  position: relative;
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+/* Filter badges: soft-yellow. Editor badges: neutral. Both removable. */
+.tag-badge-filter,
+.tag-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 6px 2px 8px;
+  border-radius: 999px;
+  font-family: var(--font-meta);
+  font-size: 11px;
+}
+
+.tag-badge-filter {
+  background: var(--mark-soft);
+  border: 1px solid var(--mark);
+  color: var(--mark-ink);
+}
+
+.tag-badge {
+  background: var(--bg);
+  border: 1px solid var(--line);
+  color: var(--ink);
+}
+
+/* Released reference styling: editor badges get a dashed border + dim; rows
+   dim the whole tag line (no border). Presentation only — still removable. */
+.tag-badge-released {
+  border-style: dashed;
+  opacity: 0.55;
+}
+
+.row-tags-released {
+  opacity: 0.55;
+}
+
+.tag-x {
+  border: none;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  font-size: 13px;
+  line-height: 1;
+  padding: 0 1px;
+}
+
+.tag-add {
+  padding: 3px 10px;
+  border: 1px dashed var(--line);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--muted);
+  font-family: var(--font-meta);
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.tag-add:hover {
+  border-color: var(--muted);
+  color: var(--ink);
+}
+
+.rail-select {
+  display: block;
+  margin: 0 12px 10px;
+  width: calc(100% - 24px);
+}
+
+.rail-select-pair {
+  display: flex;
+  gap: 8px;
+  margin: 0 12px 10px;
+}
+
+.rail-select-pair > .select {
+  flex: 1;
+  min-width: 0;
+}
+
+/* Popovers (tag pickers) — flat, hairline, no shadow; anchored under trigger. */
+.popover {
+  position: absolute;
+  top: 100%;
+  left: 0;
+  margin-top: 6px;
+  z-index: 20;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+}
+
+.popover-tagfilter {
+  width: 220px;
+}
+
+.popover-editortags {
+  width: 240px;
+}
+
+.popover-pills {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.popover-pill {
+  padding: 3px 10px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--ink);
+  font-family: var(--font-meta);
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.popover-pill:hover {
+  border-color: var(--muted);
+}
+
+.popover-empty {
+  margin: 0;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.popover-new-tag {
+  display: flex;
+  gap: 6px;
+  padding-top: 8px;
+  border-top: 1px solid var(--line);
+}
+
+.popover-new-tag-input {
+  flex: 1;
+  min-width: 0;
+  padding: 5px 8px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--bg);
+  font-family: var(--font-meta);
+  font-size: 12px;
+}
+
+/* JIRA reference row */
+.jira-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.jira-input {
+  flex: 0 1 420px;
+  min-width: 0;
+  padding: 5px 8px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--bg);
+  font-family: var(--font-meta);
+  font-size: 12px;
+}
+
+.jira-chip {
+  padding: 3px 8px;
+  border: 1px solid var(--line);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--ink);
+  font-family: var(--font-meta);
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.jira-chip:hover {
+  border-color: var(--muted);
+}
+
+/* Manage projects dialog */
+.dialog-projects {
+  width: min(480px, calc(100vw - 32px));
+}
+
+.project-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 0;
+  border-top: 1px solid var(--line);
+}
+
+.project-name {
+  flex: 1;
+  min-width: 0;
+  padding: 6px 10px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--bg);
+}
+
+.project-count {
+  font-family: var(--font-meta);
+  font-size: 11px;
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.project-add-row {
+  display: flex;
+  gap: 8px;
+  margin-top: 4px;
+  padding-top: 12px;
+  border-top: 1px solid var(--line);
+}
+
 @media (prefers-reduced-motion: no-preference) {
   .btn,
   .chip,

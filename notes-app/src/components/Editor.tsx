@@ -1,17 +1,26 @@
 import { useEffect, useState } from "react";
-import type { Item, Priority, ProviderId, Status } from "../types";
+import type {
+  Item,
+  NewItem,
+  Priority,
+  ProjectWithCount,
+  ProviderId,
+  Status,
+  UpdateItem,
+} from "../types";
 import { aiRewrite } from "../lib/api";
 import AiBar from "./AiBar";
+import EditorTags from "./EditorTags";
+import JiraRow from "./JiraRow";
 
 interface Props {
   item: Item;
-  onSave: (patch: {
-    title: string;
-    body: string;
-    status?: Status;
-    priority?: Priority;
-    tags: string[];
-  }) => Promise<void>;
+  isDraft: boolean;
+  projects: ProjectWithCount[];
+  activeTags: string[];
+  onSave: (patch: UpdateItem) => Promise<boolean>;
+  onCreate: (input: NewItem) => Promise<boolean>;
+  onDuplicate: () => void;
   onArchive: (archived: boolean) => void;
   onPin: (pinned: boolean) => void;
   onDelete: () => void;
@@ -21,43 +30,75 @@ interface Props {
 const STATUSES: Status[] = ["todo", "doing", "done"];
 const PRIORITIES: Priority[] = ["low", "normal", "high"];
 
-export default function Editor({ item, onSave, onArchive, onPin, onDelete, onError }: Props) {
+export default function Editor({
+  item,
+  isDraft,
+  projects,
+  activeTags,
+  onSave,
+  onCreate,
+  onDuplicate,
+  onArchive,
+  onPin,
+  onDelete,
+  onError,
+}: Props) {
   const [title, setTitle] = useState(item.title);
   const [body, setBody] = useState(item.body);
   const [status, setStatus] = useState<Status>(item.status ?? "todo");
   const [priority, setPriority] = useState<Priority>(item.priority ?? "normal");
-  const [tags, setTags] = useState(item.tags.join(", "));
-  const [dirty, setDirty] = useState(false);
+  const [tags, setTags] = useState<string[]>(item.tags);
+  const [projectId, setProjectId] = useState(item.projectId ?? "");
+  const [jiraUrl, setJiraUrl] = useState(item.jiraUrl ?? "");
+  const [dirty, setDirty] = useState(isDraft); // a fresh draft starts dirty (DESIGN.md:65)
   const [proposal, setProposal] = useState<string | null>(null);
   const [aiBusy, setAiBusy] = useState(false);
 
-  // Reset the draft when a different item is selected.
+  // Reset the draft when a different item is selected. (Drafts remount via a
+  // per-draftSeq key, so this covers persisted → persisted transitions.)
   useEffect(() => {
     setTitle(item.title);
     setBody(item.body);
     setStatus(item.status ?? "todo");
     setPriority(item.priority ?? "normal");
-    setTags(item.tags.join(", "));
-    setDirty(false);
+    setTags(item.tags);
+    setProjectId(item.projectId ?? "");
+    setJiraUrl(item.jiraUrl ?? "");
+    setDirty(isDraft);
     setProposal(null);
-  }, [item.id]);
+  }, [item.id, isDraft]);
 
   async function save() {
     if (!title.trim()) {
       onError("Give it a title before saving.");
       return;
     }
-    await onSave({
+    const isTask = item.kind === "task";
+    if (isDraft) {
+      const input: NewItem = {
+        kind: item.kind,
+        title: title.trim(),
+        body,
+        status: isTask ? status : undefined,
+        priority: isTask ? priority : undefined,
+        tags,
+        projectId: projectId || undefined,
+        jiraUrl: jiraUrl.trim() || undefined,
+      };
+      const created = await onCreate(input);
+      if (created) setDirty(false);
+      return;
+    }
+    const saved = await onSave({
       title: title.trim(),
       body,
-      status: item.kind === "task" ? status : undefined,
-      priority: item.kind === "task" ? priority : undefined,
-      tags: tags
-        .split(",")
-        .map((t) => t.trim().replace(/^#/, ""))
-        .filter(Boolean),
+      status: isTask ? status : undefined,
+      priority: isTask ? priority : undefined,
+      tags,
+      projectId, // "" clears the assignment (D7 UpdateItem semantics)
+      jiraUrl: jiraUrl.trim(), // "" clears
     });
-    setDirty(false);
+    if (saved) setDirty(false); // a rejected save stays dirty → "Save", not "Saved"
   }
 
   // Ctrl+S / Cmd+S saves.
@@ -95,6 +136,8 @@ export default function Editor({ item, onSave, onArchive, onPin, onDelete, onErr
     };
   }
 
+  const released = item.kind === "task" && status === "done";
+
   return (
     <section className="editor">
       <header className="editor-head">
@@ -104,9 +147,11 @@ export default function Editor({ item, onSave, onArchive, onPin, onDelete, onErr
           placeholder={item.kind === "task" ? "Task title" : "Note title"}
           onChange={(e) => edit(setTitle)(e.target.value)}
         />
-        <button className="btn btn-save" disabled={!dirty} onClick={() => void save()}>
-          {dirty ? "Save" : "Saved"}
-        </button>
+        {!isDraft && (
+          <button className="btn btn-quiet" onClick={onDuplicate}>
+            Duplicate metadata
+          </button>
+        )}
       </header>
 
       <div className="meta">
@@ -139,27 +184,48 @@ export default function Editor({ item, onSave, onArchive, onPin, onDelete, onErr
             ))}
           </select>
         )}
-        <input
-          className="meta-tags"
-          value={tags}
-          placeholder="tags, comma, separated"
-          aria-label="Tags"
-          onChange={(e) => edit(setTags)(e.target.value)}
+        <select
+          className="select"
+          value={projectId}
+          aria-label="Project"
+          onChange={(e) => edit(setProjectId)(e.target.value)}
+        >
+          <option value="">No project</option>
+          {projects.map((p) => (
+            <option key={p.id} value={p.id}>
+              {p.name}
+            </option>
+          ))}
+        </select>
+        <EditorTags
+          tags={tags}
+          activeTags={activeTags}
+          released={released}
+          onChange={edit(setTags)}
         />
         <span className="meta-spring" />
-        <button
-          className={item.pinned ? "btn btn-quiet btn-pinned" : "btn btn-quiet"}
-          onClick={() => onPin(!item.pinned)}
-        >
-          {item.pinned ? "Unpin" : "Pin"}
-        </button>
-        <button className="btn btn-quiet" onClick={() => onArchive(!item.archived)}>
-          {item.archived ? "Unarchive" : "Archive"}
-        </button>
-        <button className="btn btn-danger" onClick={onDelete}>
-          Delete
-        </button>
+        {!isDraft && (
+          <>
+            <button
+              className={item.pinned ? "btn btn-quiet btn-pinned" : "btn btn-quiet"}
+              onClick={() => onPin(!item.pinned)}
+            >
+              {item.pinned ? "Unpin" : "Pin"}
+            </button>
+            <button
+              className="btn btn-quiet"
+              onClick={() => onArchive(!item.archived)}
+            >
+              {item.archived ? "Unarchive" : "Archive"}
+            </button>
+            <button className="btn btn-danger" onClick={onDelete}>
+              Delete
+            </button>
+          </>
+        )}
       </div>
+
+      <JiraRow url={jiraUrl} onChange={edit(setJiraUrl)} onError={onError} />
 
       {proposal !== null && (
         <div className="review" role="region" aria-label="AI rewrite proposal">
@@ -189,7 +255,12 @@ export default function Editor({ item, onSave, onArchive, onPin, onDelete, onErr
         onChange={(e) => edit(setBody)(e.target.value)}
       />
 
-      <AiBar busy={aiBusy} onRework={(i, p) => void rework(i, p)} />
+      <AiBar
+        busy={aiBusy}
+        dirty={dirty}
+        onRework={(i, p) => void rework(i, p)}
+        onSave={() => void save()}
+      />
     </section>
   );
 }
