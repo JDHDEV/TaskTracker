@@ -20,6 +20,12 @@ pub enum AppError {
     #[error("no API key saved for {0} — add one in Settings")]
     MissingKey(String),
 
+    #[error("JIRA is not configured — add a site URL and email in Settings")]
+    NotConfigured,
+
+    #[error("JIRA rate limit reached — try again later")]
+    RateLimited,
+
     #[error("network error: {0}")]
     Http(#[from] reqwest::Error),
 

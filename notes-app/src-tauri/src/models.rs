@@ -131,6 +131,42 @@ pub struct UpdateItem {
     pub pinned: Option<bool>,
 }
 
+/// Atlassian's coarse status bucket. The three category keys are stable across
+/// every workflow (custom status *names* vary, categories do not), so the UI
+/// maps these — not the free-text status name — to the existing status-dot
+/// colors. Mirror in `src/types.ts`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum StatusCategory {
+    New,
+    Indeterminate,
+    Done,
+}
+
+/// Enriched JIRA ticket metadata for the chip. Returned to the frontend only;
+/// never persisted. `title`/`status` are remote text and render as React text.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TicketMeta {
+    pub key: String,
+    pub title: String,
+    pub status: String,
+    pub status_category: StatusCategory,
+    /// RFC 3339, minted server-side when the fetch succeeds — lets the chip
+    /// show how fresh the enrichment is.
+    pub fetched_at: String,
+}
+
+/// Non-secret JIRA connection settings, stored in `app_settings` (NOT the
+/// keyring, which refuses read-back). The API token lives in the keyring and is
+/// never part of this struct. Mirror in `src/types.ts`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct JiraConfig {
+    pub base_url: String,
+    pub email: String,
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ListFilter {

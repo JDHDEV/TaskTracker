@@ -171,7 +171,7 @@ export default function App() {
           Manage projects
         </button>
         <button className="btn btn-quiet" onClick={() => setShowSettings(true)}>
-          API keys
+          Settings
         </button>
       </header>
 

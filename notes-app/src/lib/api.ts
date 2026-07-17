@@ -3,6 +3,7 @@ import { openUrl } from "@tauri-apps/plugin-opener";
 import { isHttpUrl } from "./jira";
 import type {
   Item,
+  JiraConfig,
   ListFilter,
   NewItem,
   Project,
@@ -11,6 +12,7 @@ import type {
   RewriteEvent,
   RewriteRequest,
   RewriteStreamRequest,
+  TicketMeta,
   UpdateItem,
 } from "../types";
 
@@ -125,6 +127,34 @@ export function setApiKey(provider: ProviderId, key: string): Promise<void> {
 
 export function hasApiKey(provider: ProviderId): Promise<boolean> {
   return invoke("has_api_key", { provider });
+}
+
+// --- JIRA enrichment. Enrichment is host-pinned server-side: the backend
+// re-extracts the ticket key from jiraUrl and calls only the configured site,
+// so the stored URL's host is never a request destination. ---
+
+/** Enrich a stored JIRA URL into ticket title/status. Rejects (bare AppError
+ *  string) when the URL has no ticket key, JIRA isn't configured, the token is
+ *  missing, or the lookup fails — callers degrade the chip to its plain label. */
+export function getJiraTicket(jiraUrl: string): Promise<TicketMeta> {
+  return invoke("get_jira_ticket", { jiraUrl });
+}
+
+export function getJiraConfig(): Promise<JiraConfig | null> {
+  return invoke("get_jira_config");
+}
+
+export function setJiraConfig(config: JiraConfig): Promise<void> {
+  return invoke("set_jira_config", { config });
+}
+
+/** Save (empty string removes) the JIRA API token in the keyring. */
+export function setJiraToken(token: string): Promise<void> {
+  return invoke("set_jira_token", { token });
+}
+
+export function hasJiraToken(): Promise<boolean> {
+  return invoke("has_jira_token");
 }
 
 // The one sanctioned non-invoke IPC touchpoint: the opener plugin invokes

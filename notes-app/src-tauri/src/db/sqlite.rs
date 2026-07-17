@@ -505,6 +505,26 @@ impl ItemRepository for SqliteRepository {
         .await?;
         Ok(tags)
     }
+
+    async fn get_setting(&self, key: &str) -> Result<Option<String>> {
+        let value = sqlx::query_scalar::<_, String>("SELECT value FROM app_settings WHERE key = ?1")
+            .bind(key)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(value)
+    }
+
+    async fn set_setting(&self, key: &str, value: &str) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO app_settings (key, value) VALUES (?1, ?2) \
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        )
+        .bind(key)
+        .bind(value)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
 }
 
 /// Clean, storage-agnostic duplicate-name error (never leaks the raw SQLite

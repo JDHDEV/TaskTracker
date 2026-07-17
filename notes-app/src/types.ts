@@ -82,6 +82,27 @@ export interface RewriteStreamRequest {
   instruction: string;
 }
 
+// --- JIRA enrichment (mirrors src-tauri/src/models.rs) ---
+
+/** Atlassian's coarse status bucket — stable across workflows, so the UI maps
+ *  it (not the free-text status name) to the status-dot colors. */
+export type StatusCategory = "new" | "indeterminate" | "done";
+
+export interface TicketMeta {
+  key: string;
+  title: string;
+  status: string;
+  statusCategory: StatusCategory;
+  fetchedAt: string; // RFC 3339
+}
+
+/** Non-secret JIRA connection. The API token is NOT here — it lives in the
+ *  keyring and is never returned to the frontend. */
+export interface JiraConfig {
+  baseUrl: string;
+  email: string;
+}
+
 export type RewriteErrorCode = "cancelled" | "network" | "provider" | "invalid";
 
 /** Tagged union mirroring src-tauri/src/ai/mod.rs RewriteEvent. Chunks precede

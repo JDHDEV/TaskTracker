@@ -9,7 +9,10 @@ use tauri::State;
 use crate::ai::{self, keys, ChunkSink, RewriteErrorCode, RewriteEvent};
 use crate::db::ItemRepository;
 use crate::error::{AppError, Result};
-use crate::models::{Item, ListFilter, NewItem, Project, ProjectWithCount, UpdateItem};
+use crate::jira;
+use crate::models::{
+    Item, JiraConfig, ListFilter, NewItem, Project, ProjectWithCount, TicketMeta, UpdateItem,
+};
 
 /// Everything commands are allowed to touch. Note the type: the repository
 /// is `dyn ItemRepository` — commands cannot know or care that it's SQLite.
@@ -228,4 +231,78 @@ pub fn set_api_key(provider: String, key: String) -> Result<()> {
 #[tauri::command]
 pub fn has_api_key(provider: String) -> bool {
     keys::has_key(&provider)
+}
+
+// --- JIRA enrichment -------------------------------------------------------
+
+/// `app_settings` key holding the JSON-encoded non-secret `JiraConfig`. The
+/// token is NOT here — it lives in the keyring under `jira::TOKEN_ID`.
+const JIRA_CONFIG_KEY: &str = "jira_config";
+
+/// Shared config read, so `get_jira_ticket` doesn't have to reconstruct a
+/// `State` to reuse the command.
+async fn load_jira_config(repo: &dyn ItemRepository) -> Result<Option<JiraConfig>> {
+    match repo.get_setting(JIRA_CONFIG_KEY).await? {
+        Some(json) => {
+            let config = serde_json::from_str::<JiraConfig>(&json)
+                .map_err(|e| AppError::Invalid(format!("stored JIRA config is corrupt: {e}")))?;
+            Ok(Some(config))
+        }
+        None => Ok(None),
+    }
+}
+
+/// The saved non-secret JIRA connection, or `None` if never configured.
+#[tauri::command]
+pub async fn get_jira_config(state: State<'_, AppState>) -> Result<Option<JiraConfig>> {
+    load_jira_config(state.repo.as_ref()).await
+}
+
+/// Save the non-secret JIRA connection. Rejects a non-https site URL and an
+/// empty email before persisting.
+#[tauri::command]
+pub async fn set_jira_config(state: State<'_, AppState>, config: JiraConfig) -> Result<()> {
+    jira::validate_base_url(&config.base_url)?;
+    if config.email.trim().is_empty() {
+        return Err(AppError::Invalid("JIRA email must not be empty".into()));
+    }
+    let json = serde_json::to_string(&config)
+        .map_err(|e| AppError::Invalid(format!("could not encode JIRA config: {e}")))?;
+    state.repo.set_setting(JIRA_CONFIG_KEY, &json).await
+}
+
+/// Save (or, with an empty value, delete) the JIRA API token in the keyring.
+/// Boolean-only presence thereafter — no command ever returns it.
+#[tauri::command]
+pub fn set_jira_token(token: String) -> Result<()> {
+    keys::set_key(jira::TOKEN_ID, &token)
+}
+
+#[tauri::command]
+pub fn has_jira_token() -> bool {
+    keys::has_key(jira::TOKEN_ID)
+}
+
+/// Enrich a stored `jira_url` into ticket title/status. SECURITY (the Critical
+/// item): the ticket key is re-extracted HERE, server-side, and the request
+/// goes only to the configured `base_url` — the host in `jira_url` is never a
+/// request destination. Failure order matters: an unparseable/keyless URL is
+/// rejected BEFORE any config/token/network work, so a metadata-host URL like
+/// `http://169.254.169.254/latest/meta-data/` never triggers a lookup.
+#[tauri::command]
+pub async fn get_jira_ticket(state: State<'_, AppState>, jira_url: String) -> Result<TicketMeta> {
+    let key = jira::extract_ticket_key(&jira_url)
+        .ok_or_else(|| AppError::Invalid("no JIRA ticket key in that URL".into()))?;
+
+    let config = load_jira_config(state.repo.as_ref())
+        .await?
+        .ok_or(AppError::NotConfigured)?;
+    // Defense-in-depth: re-validate the stored base URL before dialing it.
+    jira::validate_base_url(&config.base_url)?;
+    let token = keys::get_key(jira::TOKEN_ID)?; // missing → MissingKey
+
+    let provider = jira::jira_provider_for(jira::DEFAULT_PROVIDER)?;
+    provider
+        .fetch_ticket(&state.http, &config, &token, &key)
+        .await
 }

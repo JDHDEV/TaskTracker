@@ -758,6 +758,10 @@ textarea {
 }
 
 .jira-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 340px;
   padding: 3px 8px;
   border: 1px solid var(--line);
   border-radius: 999px;
@@ -770,6 +774,14 @@ textarea {
 
 .jira-chip:hover {
   border-color: var(--muted);
+}
+
+/* Enriched label (KEY — title · status): ellipsize so a long summary can't
+   stretch the chip past its max-width. */
+.jira-chip-text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 /* Due date (task-only) */

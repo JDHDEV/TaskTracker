@@ -1,5 +1,4 @@
-import * as api from "../lib/api";
-import { ticketLabel } from "../lib/jira";
+import JiraChip from "./JiraChip";
 
 interface Props {
   url: string;
@@ -7,9 +6,10 @@ interface Props {
   onError: (message: string) => void;
 }
 
-// JIRA reference row: a mono URL field plus a link chip (a <button>, never an
-// <a href> the webview could follow) that opens the ticket in the default
-// browser via the guarded api.openExternal.
+// JIRA reference row: a mono URL field plus the link chip. The chip (a <button>,
+// never an <a href> the webview could follow) opens the ticket in the default
+// browser and, when JIRA is configured, enriches its label with live ticket
+// title/status — see JiraChip / useJiraEnrichment.
 export default function JiraRow({ url, onChange, onError }: Props) {
   const trimmed = url.trim();
   return (
@@ -22,15 +22,7 @@ export default function JiraRow({ url, onChange, onError }: Props) {
         aria-label="JIRA ticket URL"
         onChange={(e) => onChange(e.target.value)}
       />
-      {trimmed && (
-        <button
-          className="jira-chip"
-          title={url}
-          onClick={() => void api.openExternal(trimmed).catch((e) => onError(String(e)))}
-        >
-          {ticketLabel(trimmed)}
-        </button>
-      )}
+      {trimmed && <JiraChip url={trimmed} onError={onError} />}
     </div>
   );
 }

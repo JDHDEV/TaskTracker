@@ -2,6 +2,7 @@ pub mod ai;
 mod commands;
 pub mod db;
 pub mod error;
+pub mod jira;
 pub mod models;
 
 use std::collections::HashMap;
@@ -25,9 +26,19 @@ pub fn run() {
             // A cloud build would construct a different ItemRepository here.
             let repo = tauri::async_runtime::block_on(SqliteRepository::connect(&db_path))?;
 
+            // Redirects disabled: the AI and JIRA endpoints never legitimately
+            // redirect, and following one would let a (trusted, TLS-verified)
+            // configured host bounce a request to an internal address — closing
+            // the JIRA host-pinning boundary fully (defense-in-depth over the
+            // server-side base_url pin). Shared by all HTTP callers.
+            let http = reqwest::Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .expect("failed to build HTTP client");
+
             app.manage(commands::AppState {
                 repo: Arc::new(repo),
-                http: reqwest::Client::new(),
+                http,
                 cancellations: Mutex::new(HashMap::new()),
             });
             Ok(())
@@ -49,6 +60,11 @@ pub fn run() {
             commands::ai_rewrite_cancel,
             commands::set_api_key,
             commands::has_api_key,
+            commands::get_jira_config,
+            commands::set_jira_config,
+            commands::set_jira_token,
+            commands::has_jira_token,
+            commands::get_jira_ticket,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

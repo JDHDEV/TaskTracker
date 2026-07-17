@@ -37,4 +37,10 @@ pub trait ItemRepository: Send + Sync {
     /// The derived tag vocabulary: every distinct tag carried by at least one
     /// non-archived item that is not a done task, sorted.
     async fn list_active_tags(&self) -> Result<Vec<String>>;
+
+    /// Read a non-secret app setting (the `app_settings` key/value store), or
+    /// `None` if unset. Secrets never live here — they stay in the keyring.
+    async fn get_setting(&self, key: &str) -> Result<Option<String>>;
+    /// Upsert a non-secret app setting.
+    async fn set_setting(&self, key: &str, value: &str) -> Result<()>;
 }

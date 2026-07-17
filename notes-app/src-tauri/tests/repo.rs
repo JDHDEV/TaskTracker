@@ -1127,3 +1127,36 @@ async fn project_shapes_serialize_camelcase() {
     assert!(json2["itemCount"].is_number());
     assert_eq!(json2["itemCount"], 0);
 }
+
+// ---------------------------------------------------------------------------
+// app_settings key/value store (Phase 4 Track 4 — backs the non-secret JIRA
+// config; secrets never live here)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn app_settings_round_trip_and_upsert() {
+    let repo = SqliteRepository::connect_in_memory().await.unwrap();
+
+    // absent key → None
+    assert_eq!(repo.get_setting("jira_config").await.unwrap(), None);
+
+    repo.set_setting("jira_config", "first").await.unwrap();
+    assert_eq!(
+        repo.get_setting("jira_config").await.unwrap().as_deref(),
+        Some("first")
+    );
+
+    // set again on the same key overwrites (upsert), not a PK violation
+    repo.set_setting("jira_config", "second").await.unwrap();
+    assert_eq!(
+        repo.get_setting("jira_config").await.unwrap().as_deref(),
+        Some("second")
+    );
+
+    // distinct keys are independent
+    repo.set_setting("other", "x").await.unwrap();
+    assert_eq!(
+        repo.get_setting("jira_config").await.unwrap().as_deref(),
+        Some("second")
+    );
+}
