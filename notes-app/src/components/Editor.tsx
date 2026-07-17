@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type {
   Item,
   NewItem,
@@ -8,7 +8,7 @@ import type {
   Status,
   UpdateItem,
 } from "../types";
-import { aiRewrite } from "../lib/api";
+import { aiRewriteStream } from "../lib/api";
 import { fromDateInputValue, toDateInputValue } from "../lib/dueDate";
 import AiBar from "./AiBar";
 import EditorTags from "./EditorTags";
@@ -55,10 +55,17 @@ export default function Editor({
   const [jiraUrl, setJiraUrl] = useState(item.jiraUrl ?? "");
   const [dirty, setDirty] = useState(isDraft); // a fresh draft starts dirty (DESIGN.md:65)
   const [proposal, setProposal] = useState<string | null>(null);
+  const [streaming, setStreaming] = useState(false);
   const [aiBusy, setAiBusy] = useState(false);
+  // Backend-cancel handle for the in-flight stream (null when none). Held in a
+  // ref so navigation/discard can stop a zombie stream without a re-render.
+  const stopRef = useRef<(() => void) | null>(null);
 
-  // Reset the draft when a different item is selected. (Drafts remount via a
-  // per-draftSeq key, so this covers persisted → persisted transitions.)
+  // Re-seed local state from the item. App.tsx keys this component by
+  // draft-seq/selected-id, so most selections remount it; this effect covers
+  // the residual same-instance updates. Either way the cleanup below runs
+  // (React runs effect cleanup on unmount and on dep-change alike), so a stream
+  // in flight is always stopped when the editor moves off its item.
   useEffect(() => {
     setTitle(item.title);
     setBody(item.body);
@@ -70,6 +77,14 @@ export default function Editor({
     setJiraUrl(item.jiraUrl ?? "");
     setDirty(isDraft);
     setProposal(null);
+    setStreaming(false);
+    setAiBusy(false);
+    // Navigating away mid-stream must kill the backend stream, not just the
+    // card — the cleanup marks the in-flight request cancelled and cancels it.
+    return () => {
+      stopRef.current?.();
+      stopRef.current = null;
+    };
   }, [item.id, isDraft]);
 
   async function save() {
@@ -125,15 +140,55 @@ export default function Editor({
       onError("There is no text to rework yet.");
       return;
     }
+    stopRef.current?.(); // defensive: the AiBar disables Rework while busy, so
+    // this can't re-enter mid-stream today — but a future caller might.
     setAiBusy(true);
+    setStreaming(true);
+    setProposal(""); // instant empty card; tokens accumulate into it
+
+    // Per-request cancel flag lives in this closure, so a late chunk or the
+    // settled promise from THIS request can't touch a newer request's card.
+    let cancelled = false;
+    const requestId = crypto.randomUUID();
+    const { result, cancel } = aiRewriteStream(
+      { requestId, provider, text: body, instruction },
+      (delta) => {
+        if (cancelled) return;
+        setProposal((prev) => (prev ?? "") + delta);
+      },
+    );
+    const stop = () => {
+      cancelled = true;
+      cancel();
+    };
+    stopRef.current = stop;
+
     try {
-      const result = await aiRewrite({ provider, text: body, instruction });
-      setProposal(result);
+      const finalText = await result;
+      if (cancelled) return;
+      setProposal(finalText); // canonical, fully-accumulated text
     } catch (err) {
+      if (cancelled) return; // user-initiated cancel → silent, card already cleared
+      setProposal(null);
       onError(String(err));
     } finally {
-      setAiBusy(false);
+      if (!cancelled) {
+        setStreaming(false);
+        setAiBusy(false);
+        if (stopRef.current === stop) stopRef.current = null;
+      }
     }
+  }
+
+  // Discard: stop the backend stream (if any), then clear the card. Wiring the
+  // cancel here means discarding mid-stream actually halts the backend, not
+  // just the display.
+  function discardProposal() {
+    stopRef.current?.();
+    stopRef.current = null;
+    setProposal(null);
+    setStreaming(false);
+    setAiBusy(false);
   }
 
   function edit<T>(setter: (value: T) => void) {
@@ -249,9 +304,12 @@ export default function Editor({
       {proposal !== null && (
         <div className="review" role="region" aria-label="AI rewrite proposal">
           <div className="review-head">
-            <span className="review-mark">Proposed rewrite</span>
+            <span className="review-mark">
+              {streaming ? "Streaming…" : "Proposed rewrite"}
+            </span>
             <button
               className="btn"
+              disabled={streaming}
               onClick={() => {
                 edit(setBody)(proposal);
                 setProposal(null);
@@ -259,11 +317,14 @@ export default function Editor({
             >
               Replace text
             </button>
-            <button className="btn btn-quiet" onClick={() => setProposal(null)}>
+            <button className="btn btn-quiet" onClick={discardProposal}>
               Discard
             </button>
           </div>
           <pre className="review-body">{proposal}</pre>
+          <span className="sr-only" role="status" aria-live="polite">
+            {streaming ? "Streaming rewrite" : "Rewrite ready"}
+          </span>
         </div>
       )}
 

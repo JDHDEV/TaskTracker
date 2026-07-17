@@ -1,4 +1,4 @@
-import { invoke } from "@tauri-apps/api/core";
+import { Channel, invoke } from "@tauri-apps/api/core";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { isHttpUrl } from "./jira";
 import type {
@@ -8,7 +8,9 @@ import type {
   Project,
   ProjectWithCount,
   ProviderId,
+  RewriteEvent,
   RewriteRequest,
+  RewriteStreamRequest,
   UpdateItem,
 } from "../types";
 
@@ -61,6 +63,60 @@ export function listActiveTags(): Promise<string[]> {
 
 export function aiRewrite(req: RewriteRequest): Promise<string> {
   return invoke("ai_rewrite", { req });
+}
+
+/**
+ * Streaming rewrite. The Tauri `Channel` is constructed and consumed here so
+ * components only ever see an `onChunk` callback and a `{ result, cancel }`
+ * handle (CC4 — no component touches Channel/invoke directly).
+ *
+ * `onChunk` fires per text delta. `result` resolves with the full rewrite on
+ * the terminal `done` event, and rejects on a terminal `error` (including a
+ * cancellation) OR on a preflight rejection of the invoke promise (empty text,
+ * unknown provider, missing key) — which arrives before any channel event.
+ * `cancel` requests cooperative backend cancellation.
+ */
+export function aiRewriteStream(
+  req: RewriteStreamRequest,
+  onChunk: (delta: string) => void,
+): { result: Promise<string>; cancel: () => void } {
+  const channel = new Channel<RewriteEvent>();
+  // Reject with the bare message (not an Error), matching every other error
+  // path in the app — callers do `String(err)`, and an Error would add an
+  // "Error: " prefix that no other toast has (AppError serializes to a string).
+  let settle!: { resolve: (text: string) => void; reject: (err: unknown) => void };
+  const result = new Promise<string>((resolve, reject) => {
+    settle = { resolve, reject };
+  });
+
+  channel.onmessage = (event) => {
+    switch (event.type) {
+      case "chunk":
+        onChunk(event.delta);
+        break;
+      case "done":
+        settle.resolve(event.text);
+        break;
+      case "error":
+        settle.reject(event.message);
+        break;
+    }
+  };
+
+  invoke<void>("ai_rewrite_stream", { req, onEvent: channel }).catch((err) => {
+    // Preflight rejection: no channel event will arrive, so settle here with
+    // the raw invoke rejection (a bare AppError string).
+    settle.reject(err);
+  });
+
+  return {
+    result,
+    cancel: () => {
+      void invoke("ai_rewrite_cancel", { requestId: req.requestId }).catch(
+        () => {},
+      );
+    },
+  };
 }
 
 export function setApiKey(provider: ProviderId, key: string): Promise<void> {

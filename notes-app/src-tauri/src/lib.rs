@@ -4,7 +4,8 @@ pub mod db;
 pub mod error;
 pub mod models;
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 use tauri::Manager;
 
@@ -27,6 +28,7 @@ pub fn run() {
             app.manage(commands::AppState {
                 repo: Arc::new(repo),
                 http: reqwest::Client::new(),
+                cancellations: Mutex::new(HashMap::new()),
             });
             Ok(())
         })
@@ -43,6 +45,8 @@ pub fn run() {
             commands::delete_project,
             commands::list_active_tags,
             commands::ai_rewrite,
+            commands::ai_rewrite_stream,
+            commands::ai_rewrite_cancel,
             commands::set_api_key,
             commands::has_api_key,
         ])

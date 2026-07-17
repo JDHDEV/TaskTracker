@@ -74,3 +74,19 @@ export interface RewriteRequest {
   text: string;
   instruction: string;
 }
+
+export interface RewriteStreamRequest {
+  requestId: string;
+  provider: ProviderId;
+  text: string;
+  instruction: string;
+}
+
+export type RewriteErrorCode = "cancelled" | "network" | "provider" | "invalid";
+
+/** Tagged union mirroring src-tauri/src/ai/mod.rs RewriteEvent. Chunks precede
+ *  exactly one terminal Done or Error. */
+export type RewriteEvent =
+  | { type: "chunk"; delta: string }
+  | { type: "done"; text: string }
+  | { type: "error"; code: RewriteErrorCode; message: string };
