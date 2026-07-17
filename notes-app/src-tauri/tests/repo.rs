@@ -702,6 +702,27 @@ async fn sort_rowid_tiebreak_is_stable() {
     }
 }
 
+#[tokio::test]
+async fn minted_timestamps_have_fixed_fractional_precision() {
+    // K10: `to_rfc3339()` trims trailing fractional zeros, so two same-instant
+    // timestamps can differ in digit width and sort wrong lexically (a hazard
+    // masked today only by the rowid tiebreak). The producer pins to exactly
+    // three fractional digits; assert that so lexical == chronological order.
+    // Red against the old `chrono::Utc::now().to_rfc3339()` producer, which emits
+    // microsecond (or zero) precision.
+    let repo = SqliteRepository::connect_in_memory().await.unwrap();
+    let item = repo.create(new_item(Kind::Note, "a", "")).await.unwrap();
+    let frac: String = item
+        .created_at
+        .split('.')
+        .nth(1)
+        .expect("minted timestamp carries a fractional part")
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    assert_eq!(frac.len(), 3, "expected fixed ms precision, got {}", item.created_at);
+}
+
 // ---------------------------------------------------------------------------
 // search() post-filters (D1 signature)
 // ---------------------------------------------------------------------------

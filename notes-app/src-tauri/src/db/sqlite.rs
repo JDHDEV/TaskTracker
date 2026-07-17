@@ -12,6 +12,15 @@ use crate::models::{
 
 use super::ItemRepository;
 
+/// Mint an RFC 3339 timestamp with fixed millisecond precision. `to_rfc3339()`
+/// trims trailing fractional zeros (variable digit count), so lexical order only
+/// equals chronological order when precision is pinned — a latent hazard masked
+/// today by the `rowid` tiebreak (K10). Every timestamp minted here uses the
+/// same width, keeping same-second items lexically comparable.
+fn now_rfc3339() -> String {
+    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, false)
+}
+
 pub struct SqliteRepository {
     pool: SqlitePool,
 }
@@ -186,7 +195,7 @@ impl ItemRepository for SqliteRepository {
             self.ensure_project_exists(pid).await?;
         }
 
-        let now = chrono::Utc::now().to_rfc3339();
+        let now = now_rfc3339();
         let item = Item {
             id: uuid::Uuid::new_v4().to_string(),
             kind: input.kind,
@@ -307,7 +316,7 @@ impl ItemRepository for SqliteRepository {
             item.pinned = pinned;
         }
         if edited {
-            item.updated_at = chrono::Utc::now().to_rfc3339();
+            item.updated_at = now_rfc3339();
         }
 
         sqlx::query(
@@ -403,7 +412,7 @@ impl ItemRepository for SqliteRepository {
         let project = Project {
             id: uuid::Uuid::new_v4().to_string(),
             name: name.to_string(),
-            created_at: chrono::Utc::now().to_rfc3339(),
+            created_at: now_rfc3339(),
         };
         sqlx::query("INSERT INTO projects (id, name, created_at) VALUES (?1, ?2, ?3)")
             .bind(&project.id)

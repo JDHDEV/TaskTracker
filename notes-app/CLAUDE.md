@@ -17,7 +17,7 @@ Stack: Tauri 2 shell · React 19 + TypeScript (Vite) · Rust core · SQLite via 
 ## Invariants (enforced in the repository layer — keep them there, not just in UI)
 - The backend owns `id`, `createdAt`, `updatedAt`. `updatedAt` moves ONLY on content edits (title, body, status, priority, dueAt, tags — and once added: project, jiraUrl). Pin and archive flips never move it, and never reorder the list by recency.
 - `kind` is fixed at creation. Notes never carry status, priority, or dueAt — patches attempting it are silently ignored.
-- List order: `pinned DESC`, then the sort mode, with `rowid DESC` as the tiebreak (equal timestamps must never flap). Archived items are excluded from the default list AND from search.
+- List order: `pinned DESC`, then the sort mode, with a monotonic insertion sequence as the tiebreak (SQLite `rowid`; a future Postgres impl an `IDENTITY`/`seq` column) — equal timestamps must never flap. Archived items are excluded from the default list AND from search.
 - All search input goes through `fts_query()` (quoted prefix phrases). Never feed raw user text to `MATCH`.
 - API keys live in the OS credential store (`keyring`). No command returns a key — `has_api_key` returns a boolean only. Saving an empty key deletes it.
 - AI rewrites are proposals. Nothing replaces the body without an explicit user action (`Replace text`).
