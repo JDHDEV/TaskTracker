@@ -24,7 +24,17 @@ This folder is an overlay onto a fresh Tauri scaffold, which supplies the pieces
 
 First compile pulls the full Rust dependency tree — a few minutes. After that, incremental builds are quick and the frontend hot-reloads.
 
-To produce a distributable installer later: `npm run tauri build` (NSIS/MSI output under `src-tauri/target/release/bundle`).
+## Building the installer
+
+`npm run tauri build` produces an NSIS per-user installer under `src-tauri/target/release/bundle/nsis/`. The bundle target is NSIS only (no MSI) — lighter, no extra WiX toolchain; add MSI only if enterprise/GPO deployment is needed. `webviewInstallMode` is `downloadBootstrapper` (Win11 ships WebView2 in-box, so this is a no-op there and a small bootstrapper elsewhere).
+
+**Unsigned — SmartScreen warning (known limitation).** The installer is not code-signed, so Windows SmartScreen shows "Windows protected your PC" on first run; choose **More info → Run anyway**. This is acceptable for single-developer dogfooding and must be re-evaluated the moment the build is handed to anyone else. Signing material (a cert in the OS store / CI secret; only the public thumbprint in config) is deliberately absent — no secret ships in the repo or bundle.
+
+**No auto-updater.** None is configured; rebuild and reinstall to update. An updater would need its own signing keypair and a hosted manifest — out of scope for a self-rebuilding single user.
+
+**Version-sync discipline (DoD).** `package.json`, `src-tauri/tauri.conf.json`, and `src-tauri/Cargo.toml` all carry the app version and nothing enforces agreement — **bump all three in the same commit**.
+
+After building, smoke the keyring in the *packaged* build (not just `tauri dev`), under the dogfood Windows account: install, launch from the Start-menu shortcut, save an API key, relaunch, confirm the app still reports the key saved (`has_api_key`) and a real rewrite round-trips against Windows Credential Manager.
 
 ## Using the AI rework
 
