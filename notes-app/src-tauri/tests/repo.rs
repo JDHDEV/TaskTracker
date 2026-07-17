@@ -1009,6 +1009,83 @@ async fn jira_url_scheme_allowlist() {
 }
 
 // ---------------------------------------------------------------------------
+// due_at (Phase 4 Track 2 — capture/display is frontend-only; this locks down
+// the existing repository semantics)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn due_at_set_on_create_persists() {
+    let repo = SqliteRepository::connect_in_memory().await.unwrap();
+    let created = repo
+        .create(NewItem { due_at: Some("2026-07-20T00:00:00Z".into()), ..new_item(Kind::Task, "t", "") })
+        .await
+        .unwrap();
+    assert_eq!(created.due_at.as_deref(), Some("2026-07-20T00:00:00Z"));
+    let fetched = repo.get(&created.id).await.unwrap();
+    assert_eq!(fetched.due_at.as_deref(), Some("2026-07-20T00:00:00Z"));
+}
+
+#[tokio::test]
+async fn due_at_empty_string_clears_on_update() {
+    let repo = SqliteRepository::connect_in_memory().await.unwrap();
+    let task = repo
+        .create(NewItem { due_at: Some("2026-07-20T00:00:00Z".into()), ..new_item(Kind::Task, "t", "") })
+        .await
+        .unwrap();
+    let cleared = repo
+        .update(&task.id, UpdateItem { due_at: Some(String::new()), ..Default::default() })
+        .await
+        .unwrap();
+    assert_eq!(cleared.due_at, None);
+}
+
+#[tokio::test]
+async fn due_at_omitted_patch_leaves_existing_value_unchanged() {
+    let repo = SqliteRepository::connect_in_memory().await.unwrap();
+    let task = repo
+        .create(NewItem { due_at: Some("2026-07-20T00:00:00Z".into()), ..new_item(Kind::Task, "t", "") })
+        .await
+        .unwrap();
+    // unrelated patch, due_at omitted (None) — must survive
+    let after = repo
+        .update(&task.id, UpdateItem { title: Some("renamed".into()), ..Default::default() })
+        .await
+        .unwrap();
+    assert_eq!(after.due_at.as_deref(), Some("2026-07-20T00:00:00Z"));
+}
+
+#[tokio::test]
+async fn due_at_patch_on_a_note_is_silently_ignored() {
+    // CLAUDE.md invariant: notes never carry dueAt — a patch attempting to set
+    // it must be silently ignored, not applied and not an error. The due_at
+    // block in `update()` is gated on `item.kind == Kind::Task`; this pins that
+    // gate for notes specifically (previously untested).
+    let repo = SqliteRepository::connect_in_memory().await.unwrap();
+    let note = repo.create(new_item(Kind::Note, "n", "")).await.unwrap();
+    assert_eq!(note.due_at, None);
+
+    let after = repo
+        .update(&note.id, UpdateItem { due_at: Some("2026-07-20T00:00:00Z".into()), ..Default::default() })
+        .await
+        .unwrap();
+    assert_eq!(after.due_at, None, "a due_at patch on a note must be silently dropped");
+}
+
+#[tokio::test]
+async fn due_at_change_on_task_bumps_updated_at() {
+    let repo = SqliteRepository::connect_in_memory().await.unwrap();
+    let task = repo.create(new_item(Kind::Task, "t", "")).await.unwrap();
+    let old = "2000-01-01T00:00:00+00:00";
+    repo.set_timestamps_for_test(&task.id, old, old).await.unwrap();
+
+    let updated = repo
+        .update(&task.id, UpdateItem { due_at: Some("2026-07-20T00:00:00Z".into()), ..Default::default() })
+        .await
+        .unwrap();
+    assert!(updated.updated_at > old.to_string(), "setting due_at bumps updated_at");
+}
+
+// ---------------------------------------------------------------------------
 // ListFilter / Project camelCase IPC shape
 // ---------------------------------------------------------------------------
 

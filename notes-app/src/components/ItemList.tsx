@@ -1,4 +1,5 @@
 import type { Item, Kind, ProjectWithCount, Sort, Status } from "../types";
+import { formatDueDate, isOverdue } from "../lib/dueDate";
 import TagFilter from "./TagFilter";
 
 export type KindFilter = "all" | Kind;
@@ -74,6 +75,7 @@ export default function ItemList({
   onSort,
   onCreate,
 }: Props) {
+  const now = new Date(); // one clock read per render; overdue is a same-day check
   return (
     <aside className="rail">
       <div className="rail-actions">
@@ -164,6 +166,8 @@ export default function ItemList({
         )}
         {items.map((item) => {
           const released = item.kind === "task" && item.status === "done";
+          // A finished task is never late; only tasks carry a due date.
+          const overdue = !released && isOverdue(item.dueAt, now);
           return (
             <li key={item.id}>
               <button
@@ -186,6 +190,12 @@ export default function ItemList({
                         {item.priority}
                       </span>
                     )}
+                  {item.kind === "task" && item.dueAt && (
+                    <span className={overdue ? "row-due row-due-over" : "row-due"}>
+                      due {formatDueDate(item.dueAt)}
+                      {overdue && " · overdue"}
+                    </span>
+                  )}
                   <span className="row-when">{when(item.updatedAt)}</span>
                 </span>
                 {item.body && <span className="row-body">{item.body}</span>}

@@ -9,6 +9,7 @@ import type {
   UpdateItem,
 } from "../types";
 import { aiRewrite } from "../lib/api";
+import { fromDateInputValue, toDateInputValue } from "../lib/dueDate";
 import AiBar from "./AiBar";
 import EditorTags from "./EditorTags";
 import JiraRow from "./JiraRow";
@@ -47,6 +48,8 @@ export default function Editor({
   const [body, setBody] = useState(item.body);
   const [status, setStatus] = useState<Status>(item.status ?? "todo");
   const [priority, setPriority] = useState<Priority>(item.priority ?? "normal");
+  // Holds the input's yyyy-mm-dd string, not the RFC 3339 wire value.
+  const [dueAt, setDueAt] = useState(toDateInputValue(item.dueAt));
   const [tags, setTags] = useState<string[]>(item.tags);
   const [projectId, setProjectId] = useState(item.projectId ?? "");
   const [jiraUrl, setJiraUrl] = useState(item.jiraUrl ?? "");
@@ -61,6 +64,7 @@ export default function Editor({
     setBody(item.body);
     setStatus(item.status ?? "todo");
     setPriority(item.priority ?? "normal");
+    setDueAt(toDateInputValue(item.dueAt));
     setTags(item.tags);
     setProjectId(item.projectId ?? "");
     setJiraUrl(item.jiraUrl ?? "");
@@ -81,6 +85,7 @@ export default function Editor({
         body,
         status: isTask ? status : undefined,
         priority: isTask ? priority : undefined,
+        dueAt: isTask ? fromDateInputValue(dueAt) || undefined : undefined,
         tags,
         projectId: projectId || undefined,
         jiraUrl: jiraUrl.trim() || undefined,
@@ -94,6 +99,8 @@ export default function Editor({
       body,
       status: isTask ? status : undefined,
       priority: isTask ? priority : undefined,
+      // "" clears; a task-only field, so notes send undefined (unchanged).
+      dueAt: isTask ? (dueAt ? fromDateInputValue(dueAt) : "") : undefined,
       tags,
       projectId, // "" clears the assignment (D7 UpdateItem semantics)
       jiraUrl: jiraUrl.trim(), // "" clears
@@ -183,6 +190,18 @@ export default function Editor({
               </option>
             ))}
           </select>
+        )}
+        {item.kind === "task" && (
+          <label className="due-field">
+            <span className="due-label">DUE</span>
+            <input
+              type="date"
+              className="due-input"
+              value={dueAt}
+              aria-label="Due date"
+              onChange={(e) => edit(setDueAt)(e.target.value)}
+            />
+          </label>
         )}
         <select
           className="select"

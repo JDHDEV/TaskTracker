@@ -73,6 +73,12 @@ Tags are a derived vocabulary, not a managed list: a tag exists because at least
 
 In **Manage projects**, each row's mono count reflects live assignments. `Remove` is disabled — half opacity, not clickable — whenever the count is 1 or more: a project can only be removed once no notes or tasks are assigned to it. (This replaces any orphan-on-remove behavior.)
 
+### Due dates (new)
+
+Due dates are **task-only** — notes never carry one (a backend invariant, so there is no due control on a note). In the editor meta row a task gains a `DUE` field after priority and before the project select: a mono UPPERCASE `DUE` label next to a native date input (`<input type="date">`), styled like the JIRA field. Granularity is a single calendar day, not a time. Setting or clearing the date marks the item dirty like any other edit; an empty field means no due date. In dark mode the OS-drawn calendar-picker glyph is inverted for contrast — it is a legibility correction, not a themed accent.
+
+On a task row in the list, a task with a due date shows `due Jul 20` (same month/day formatting as the timestamp). A due date in the past reads in danger red **with a trailing `· overdue` word** — the colour is never the only signal. A **done** task never renders as overdue: finished work is not late.
+
 ## Dialogs
 
 **API keys** — 520px card on the scrim: heading `API keys`; muted note `Keys are stored in the Windows credential manager on this machine. They are used for rework requests and are never shown again here.`; two rows (`Anthropic (Claude)`, `OpenAI (GPT)`), each with a state pill — `key saved` in green `#4C8A64` outline or `no key` muted — a password input (`Paste key from console.anthropic.com (empty removes)`) and a solid-ink `Save key`; right-aligned `Done`.

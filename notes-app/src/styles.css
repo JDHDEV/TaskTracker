@@ -561,6 +561,7 @@ textarea {
 
 .tagfilter-label,
 .jira-label,
+.due-label,
 .popover-label {
   font-family: var(--font-meta);
   font-size: 11px;
@@ -756,6 +757,40 @@ textarea {
 
 .jira-chip:hover {
   border-color: var(--muted);
+}
+
+/* Due date (task-only) */
+.due-field {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.due-input {
+  padding: 4px 8px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--bg);
+  color: var(--ink);
+  font-family: var(--font-meta);
+  font-size: 12px;
+}
+
+/* The calendar-picker glyph is OS-drawn; invert it in dark mode for contrast
+   (a legibility fix, not a themed accent). */
+[data-theme="dark"] .due-input::-webkit-calendar-picker-indicator {
+  filter: invert(1);
+}
+
+.row-due {
+  font-family: var(--font-meta);
+  font-size: 11px;
+  color: var(--muted);
+  flex: none;
+}
+
+.row-due-over {
+  color: var(--danger);
 }
 
 /* Manage projects dialog */
