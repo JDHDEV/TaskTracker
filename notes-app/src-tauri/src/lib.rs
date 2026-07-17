@@ -56,6 +56,7 @@ pub fn run() {
             commands::delete_project,
             commands::list_active_tags,
             commands::ai_rewrite,
+            commands::ai_generate_title,
             commands::ai_rewrite_stream,
             commands::ai_rewrite_cancel,
             commands::set_api_key,

@@ -2,6 +2,7 @@ import { Channel, invoke } from "@tauri-apps/api/core";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { isHttpUrl } from "./jira";
 import type {
+  GenerateTitleRequest,
   Item,
   JiraConfig,
   ListFilter,
@@ -65,6 +66,20 @@ export function listActiveTags(): Promise<string[]> {
 
 export function aiRewrite(req: RewriteRequest): Promise<string> {
   return invoke("ai_rewrite", { req });
+}
+
+/**
+ * Generate a title from `text` (R1 after a rework, R4 on an empty-title save).
+ * Rejects with a bare AppError string — callers do `String(err)`. The distinct
+ * missing-key copy and the generic "couldn't generate a title — try again"
+ * copy both pass through verbatim (the backend scrubs raw vendor bodies).
+ */
+export function aiGenerateTitle(
+  provider: ProviderId,
+  text: string,
+): Promise<string> {
+  const req: GenerateTitleRequest = { provider, text };
+  return invoke("ai_generate_title", { req });
 }
 
 /**

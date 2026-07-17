@@ -399,6 +399,37 @@ textarea {
   white-space: pre-wrap;
 }
 
+/* Proposed-title row inside the review card. Uses only the constant yellow
+   tokens, so it renders identically in light and dark (neutrals swap, yellows
+   stay). The hairline above separates it from the body (or the header, when the
+   title is the only half left). */
+.review-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 12px;
+  border-top: 1px solid var(--mark);
+}
+
+.review-title-label {
+  font-family: var(--font-meta);
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--mark-ink);
+  flex: none;
+}
+
+.review-title-text {
+  flex: 1 1 auto;
+  min-width: 0;
+  color: var(--mark-ink);
+  font-size: 14px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 /* Announced to assistive tech only (stream start/done), never drawn. */
 .sr-only {
   position: absolute;

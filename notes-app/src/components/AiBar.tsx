@@ -1,9 +1,13 @@
 import { useState } from "react";
 import type { ProviderId } from "../types";
+import { getPreferredProvider, setPreferredProvider } from "../lib/aiProvider";
 
 interface Props {
   busy: boolean;
   dirty: boolean;
+  /** R4: an empty-title save is generating a title — Save is disabled and
+   *  reads "Generating title…" for the duration. */
+  generatingTitle: boolean;
   onRework: (instruction: string, provider: ProviderId) => void;
   onSave: () => void;
 }
@@ -20,15 +24,19 @@ const PROVIDERS: { id: ProviderId; label: string }[] = [
   { id: "openai", label: "GPT" },
 ];
 
-export default function AiBar({ busy, dirty, onRework, onSave }: Props) {
-  const [provider, setProvider] = useState<ProviderId>(
-    () => (localStorage.getItem("provider") as ProviderId) || "anthropic",
-  );
+export default function AiBar({
+  busy,
+  dirty,
+  generatingTitle,
+  onRework,
+  onSave,
+}: Props) {
+  const [provider, setProvider] = useState<ProviderId>(getPreferredProvider);
   const [custom, setCustom] = useState("");
 
   function pickProvider(next: ProviderId) {
     setProvider(next);
-    localStorage.setItem("provider", next);
+    setPreferredProvider(next);
   }
 
   function submitCustom() {
@@ -75,8 +83,12 @@ export default function AiBar({ busy, dirty, onRework, onSave }: Props) {
       >
         {busy ? "Working…" : "Rework"}
       </button>
-      <button className="btn btn-save" disabled={!dirty} onClick={onSave}>
-        {dirty ? "Save" : "Saved"}
+      <button
+        className="btn btn-save"
+        disabled={!dirty || generatingTitle}
+        onClick={onSave}
+      >
+        {generatingTitle ? "Generating title…" : dirty ? "Save" : "Saved"}
       </button>
     </div>
   );

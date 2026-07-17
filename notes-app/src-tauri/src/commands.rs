@@ -117,6 +117,27 @@ pub async fn ai_rewrite(state: State<'_, AppState>, req: RewriteRequest) -> Resu
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct GenerateTitleRequest {
+    pub provider: String,
+    pub text: String,
+}
+
+/// Generates a title from `text` (R1 after a rework, R4 on an empty-title save).
+/// A thin wrapper: it only resolves the provider and delegates to the testable
+/// `ai::generate_title` core, which owns the empty-text guard, error mapping,
+/// and `sanitize_title` (D13). The frontend accepts the returned title; the
+/// backend never persists it.
+#[tauri::command]
+pub async fn ai_generate_title(
+    state: State<'_, AppState>,
+    req: GenerateTitleRequest,
+) -> Result<String> {
+    let provider = ai::provider_for(&req.provider)?;
+    ai::generate_title(&*provider, &state.http, &req.text).await
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct RewriteStreamRequest {
     pub request_id: String,
     pub provider: String,

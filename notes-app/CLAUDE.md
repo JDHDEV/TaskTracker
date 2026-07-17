@@ -20,7 +20,7 @@ Stack: Tauri 2 shell · React 19 + TypeScript (Vite) · Rust core · SQLite via 
 - List order: `pinned DESC`, then the sort mode, with a monotonic insertion sequence as the tiebreak (SQLite `rowid`; a future Postgres impl an `IDENTITY`/`seq` column) — equal timestamps must never flap. Archived items are excluded from the default list AND from search.
 - All search input goes through `fts_query()` (quoted prefix phrases). Never feed raw user text to `MATCH`.
 - API keys live in the OS credential store (`keyring`). No command returns a key — `has_api_key` returns a boolean only. Saving an empty key deletes it.
-- AI rewrites are proposals. Nothing replaces the body without an explicit user action (`Replace text`).
+- AI rewrites are proposals. Nothing replaces the **body** without an explicit user action (`Replace text`). Proposed **titles** are likewise accepted only via an explicit `Replace title` — with one carve-out: saving an item whose title is empty generates and auto-accepts a title as part of that explicit Save. That carve-out fills only an empty title (never overwrites a typed one) and never touches the body.
 - Tag vocabulary is DERIVED, never stored: a tag exists while ≥1 non-archived item that is not a done task carries it. Do not add a tags table.
 - Projects are id-referenced entities (rename-safe). Deleting a project that still has items assigned must fail in the repository with a clear error — the disabled UI button is not the enforcement.
 - Empty string clears optional text fields over IPC (`dueAt`, and once added `jiraUrl`); omitted fields mean "unchanged".

@@ -82,6 +82,11 @@ export interface RewriteStreamRequest {
   instruction: string;
 }
 
+export interface GenerateTitleRequest {
+  provider: ProviderId;
+  text: string;
+}
+
 // --- JIRA enrichment (mirrors src-tauri/src/models.rs) ---
 
 /** Atlassian's coarse status bucket — stable across workflows, so the UI maps
