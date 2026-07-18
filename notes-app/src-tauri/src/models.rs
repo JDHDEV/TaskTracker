@@ -62,25 +62,20 @@ pub struct Item {
     pub jira_url: Option<String>,
 }
 
-/// A project: id-referenced so renames don't touch items. Not `Deserialize` —
-/// `create_project`/`rename_project` take a plain name, nothing parses a Project.
-#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
+/// A known project for the frontend: catalog identity (id, name, directory
+/// path) plus whether it is currently loaded, and a live item count for loaded
+/// projects only (`None` when unloaded — a closed store is not opened just to
+/// count). Serialized only (assembled by the `ProjectManager`); the id is the
+/// UUID from the store's `meta` table. Mirror in `src/types.ts`.
+#[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-pub struct Project {
+pub struct ProjectInfo {
     pub id: String,
     pub name: String,
-    pub created_at: String,
-}
-
-/// A project plus how many items reference it (archived included, so the count
-/// agrees with the delete guard). Serializes `item_count` as `itemCount`.
-#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
-#[serde(rename_all = "camelCase")]
-pub struct ProjectWithCount {
-    pub id: String,
-    pub name: String,
-    pub created_at: String,
-    pub item_count: i64,
+    pub path: String,
+    pub loaded: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub item_count: Option<i64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -98,8 +93,11 @@ pub struct NewItem {
     pub due_at: Option<String>,
     #[serde(default)]
     pub tags: Option<Vec<String>>,
-    #[serde(default)]
-    pub project_id: Option<String>,
+    /// REQUIRED: the project this item is created into — the manager's routing
+    /// key, consumed to pick the target store and never persisted inside it
+    /// (per-store rows always store `project_id = NULL`; the manager stamps the
+    /// owning UUID onto every returned item). An empty string is rejected.
+    pub project_id: String,
     #[serde(default)]
     pub jira_url: Option<String>,
 }
@@ -121,8 +119,8 @@ pub struct UpdateItem {
     pub due_at: Option<String>,
     #[serde(default)]
     pub tags: Option<Vec<String>>,
-    #[serde(default)]
-    pub project_id: Option<String>,
+    // No `project_id`: items do not move between stores in v1 (a future "move
+    // item" is a copy-delete across stores with id preservation).
     #[serde(default)]
     pub jira_url: Option<String>,
     #[serde(default)]
@@ -175,6 +173,10 @@ pub struct ListFilter {
     /// Defaults to false: archived items stay out of every list until asked for.
     #[serde(default)]
     pub archived: Option<bool>,
+    /// Selects WHICH loaded project to query: the `ProjectManager` restricts the
+    /// fan-out to this project's store when set, or all loaded stores when
+    /// omitted. It is NOT a per-row SQL predicate — a whole store is one project,
+    /// so the per-store query no longer filters on `project_id`.
     #[serde(default)]
     pub project_id: Option<String>,
     #[serde(default)]

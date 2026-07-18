@@ -40,7 +40,7 @@ Header block:
 2. Search input on the bg-color field: placeholder `Search title and body`
 3. **Filter by tag** row: mono label `FILTER BY TAG`; zero or more selected badges (soft-yellow `#FBF3C9` fill, `#F6E05E` border, dark-yellow mono text, each with a `×` remove); a `+ tag` button (dashed border, mono, muted) opening a 220px popup: mono label `TAGS`, then hairline pills of the remaining **active** tags (see tag lifecycle below); if none remain, `All tags selected.` No new-tag creation here.
 4. Filter chips: `All`, `Notes`, `Tasks` — pills; active = solid ink with surface text
-5. Full-width project select: `All projects` + one option per project
+5. Full-width project select: `All projects` + one option per **loaded** project (see "Projects as loadable on-disk stores")
 6. Half-width pair: status filter (`All statuses`, `todo`, `doing`, `done`) and sort (`Sort: updated`, `Sort: created`, `Sort: priority`, `Sort: status`)
 
 List rows (12px 14px padding, bottom hairline): optional pin diamond (8px yellow square rotated 45°, thin dark-yellow border), a 9px status dot for tasks, the title (600 weight, ellipsis), a priority word for tasks when not normal (`high` in danger, `low` in muted — mono 11px), right-aligned mono timestamp (`14:32` today, else `Jul 9`); below, an optional muted preview line, then a mono tags line like `#platform #migration`. Selected row: bg-color fill with a 3px yellow left edge. **On a task marked done, the row's tag line renders in the released style — ~55% opacity** (see lifecycle). Empty state: `Nothing here yet — create your first note.`
@@ -73,9 +73,30 @@ Empty editor state: `Select something on the left, or create a note to start.`
 
 Tags are a derived vocabulary, not a managed list: a tag exists because at least one item carries it. Every tag on an item is a *reference*, and a reference is **active** while its item is neither a done task nor archived. The moment a ticket is finished (status set to `done`), its tag references are released: the tags stay visible on that item for history — rendered in a released style, ~55% opacity, with dashed badge borders in the editor — and they can still be removed by hand via `×`, but they no longer count. A tag whose last active reference is released disappears from both `+ tag` popups and from `FILTER BY TAG`; if it was selected as a filter badge, the badge is removed and the list recomputes. Reopening the task (status back to todo/doing) or typing the tag again via `new tag` brings it back into the vocabulary.
 
-### Project removal guard (new)
+### Projects as loadable on-disk stores (new — replaces the row-based project model)
 
-In **Manage projects**, each row's mono count reflects live assignments. `Remove` is disabled — half opacity, not clickable — whenever the count is 1 or more: a project can only be removed once no notes or tasks are assigned to it. (This replaces any orphan-on-remove behavior.)
+A project is a **folder on disk** the user opens and closes, not a row in a shared database. Each project is a self-contained SQLite store in its directory; the app shows the union of the currently **loaded** projects. This replaces the earlier row-based project + removal-guard model entirely.
+
+**Main screen effects:**
+- The rail's project select lists the **loaded** projects only (`All projects` + one option per loaded project). Filtering to a project scopes the list/search to that store.
+- When **more than one** project is loaded, each list row carries a muted mono project label (below the tags line, `--muted`, 0.08em tracking) so a row's origin is never ambiguous. With one (or zero) project loaded the label is omitted.
+- `New note` / `New task` are **disabled when no project is loaded**; the rail and editor empty states then read `No projects loaded — open or create one to start.`
+- A new item is created **into a project store**: the target is the rail's filtered project, or — when the filter is `All projects` — the editor's project select becomes a required choice (`Choose a project…`) and `Save` stays disabled until one is picked. An existing item's project is **read-only** (items do not move between projects in v1).
+- **Search** results are grouped by project — hits from one project are contiguous (projects ordered by name), each group in its own relevance order — because bm25 relevance is not comparable across separate stores; the per-row project label is the grouping cue.
+- Startup surfaces any per-project load failure (a moved, corrupt, or newer-version file) as a one-time non-alarming status line, never a crash.
+- **Unloading a project whose item is open** in the editor (or whose id a dirty draft targets) first confirms, then closes the item with a `role="status"` screen-reader announcement.
+
+### Project manager dialog (new)
+
+**Manage projects** replaces the old rename/remove dialog. One row per known project: the project **name**, its muted on-disk **path**, a mono state chip (`N ITEMS` in the `--done` green when loaded, else `UNLOADED` in `--muted`), and **visually and verbally distinct** actions so reversible and irreversible operations never look alike:
+- **Load / Unload** — the reversible toggle. Load opens the store; Unload closes it (files untouched), and is confirmed by the main screen when it would evict the open item.
+- **Reload** (loaded rows only, quiet) — re-reads the project from its on-disk `items/*.md` files after an out-of-band change (a `git pull` / folder sync). Any file that can't be imported (e.g. one still carrying unresolved git conflict markers) is reported by name so the user knows which items are missing until they resolve them; the rest import. No file watcher — this is the deliberate manual refresh.
+- **Forget** — removes the project from this list; its files are left on disk (re-openable later). Disabled until the project is unloaded.
+- **Delete files** — destructive, in danger outline: a confirm names the **absolute path**, then the store contents (the canonical `items/` folder + the rebuildable `index.db` and its WAL sidecars + any pre-upgrade `.bak` + the generated `.gitignore`) and the catalog row are deleted. Disabled until unloaded.
+
+A bottom row offers `New project name` + **Create in folder…** and **Open project…**, both using the native OS folder picker; focus returns to the trigger after the picker closes. Two empty states: `No projects yet. Create a new one or open an existing folder to start.` (none known) and `No projects are loaded.` (some known, none loaded). All styling uses existing tokens (loaded/unloaded indicators reuse `--done` / `--muted`; Delete files reuses `--danger`) — no new colors.
+
+A project's items are stored as one git-mergeable Markdown-with-frontmatter file each (`items/<uuid>.md`); the SQLite `index.db` beside them is a git-ignored, rebuildable search/query index, not the source of truth. A directory opened from an earlier single-file (`project.db`) layout is upgraded in place on first load, its original kept as a `.bak`. This is a storage-shape detail with no other UI surface beyond Reload and the Delete-files wording above.
 
 ### Due dates (new)
 
@@ -91,7 +112,7 @@ The JIRA chip (the `<button>` beside the ticket URL, which always opens the tick
 
 **Settings** — 520px card on the scrim: heading `Settings`; muted note `Keys and the JIRA token are stored in the Windows credential manager on this machine. They are used for requests and are never shown again here.`; two API-key rows (`Anthropic (Claude)`, `OpenAI (GPT)`), each with a state pill — `key saved` in green `#4C8A64` outline or `no key` muted — a password input (`Paste key from console.anthropic.com (empty removes)`) and a solid-ink `Save key`. Below them a `JIRA` row with a `token saved` / `no token` pill, a short note, a site-URL + account-email pair with `Save connection` (the site URL must be https), and a password token input (`empty removes`) with `Save token`. Right-aligned `Done`.
 
-**Manage projects** — 480px card on the scrim: heading `Manage projects`; muted note `Rename a project inline. A project can be removed only when no notes or tasks are assigned to it.`; one row per project: an inline rename input on the bg field, a mono count (`1 ITEM` / `3 ITEMS`), and a `Remove` button in danger outline, disabled per the guard above; empty state `No projects yet.`; an add row under a top hairline: `New project name` input + solid-ink `Add project` (Enter adds); right-aligned `Done`.
+**Manage projects** — a card on the scrim; the project manager surface specified in "Project manager dialog (new)" above (rows of name + muted path + loaded state + the actions Load/Unload, Reload (loaded rows), Forget, Delete files; a `New project name` + `Create in folder…` / `Open project…` row; two empty states; right-aligned `Done`). Supersedes the earlier inline-rename + count + Remove-guard dialog.
 
 ## Reference sample state (used across design reviews — handy for manual testing)
 
@@ -108,7 +129,7 @@ Because item 5 is finished and nothing else carries `admin`, that tag appears in
 
 Editor shows item 2: title `Send follow-up email to platform team`, status `doing`, priority `high priority`, project `Platform Migration`, tag badge `#platform`, unpinned, `Save` enabled. The JIRA row holds `https://acme.atlassian.net/browse/PLAT-142`, its chip reading `PLAT-142 ↗`. Review card open with: `Hi team — following up on Tuesday's discussion. We agreed to freeze schema changes until the cutover completes, and I'll circulate the rollback checklist by Thursday. Please flag any blocking migrations before then.` The body beneath holds a rougher draft of the same message.
 
-Two states worth checking by hand: (a) the **Manage projects** dialog — `Platform Migration 2 ITEMS`, `Q3 Planning 2 ITEMS`, `Admin 1 ITEM` all with disabled Remove, and `Sandbox 0 ITEMS` with Remove enabled; (b) the main screen in **dark mode**, yellow review card unchanged.
+Two states worth checking by hand: (a) the **Manage projects** dialog — each loaded project shows its item-count chip (`Platform Migration 2 ITEMS`, `Admin 1 ITEM`) with an `Unload` button plus disabled `Forget`/`Delete files` (unload-first), while any unloaded project reads `UNLOADED` with `Load` + enabled `Forget`/`Delete files`; (b) the main screen in **dark mode**, yellow review card unchanged. (This reference predates the loadable-project model — treat "projects" here as separate loadable folders; the row/editor states above still hold for whichever projects are loaded.)
 
 ## Voice
 

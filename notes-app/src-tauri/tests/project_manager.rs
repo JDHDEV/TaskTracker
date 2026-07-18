@@ -1,0 +1,1119 @@
+//! Integration tests for `ProjectManager` (plan.6, Section 8: "Integration Tests
+//! (manager)" + "Unit Tests (creation/opening)"). Real SQLite throughout —
+//! `Catalog::open_in_memory()` for the app-level catalog, real on-disk
+//! `SqliteRepository` stores in `tempfile` temp dirs for every per-project
+//! store (a project IS a directory; its lifecycle can't be tested against
+//! `:memory:`).
+//!
+//! Path-validation containment gotcha: `validate_project_dir` rejects any
+//! project directory inside `app_data_dir` except its `projects/` subtree, so
+//! every test builds the manager's `app_data_dir` as ONE temp dir and creates
+//! each project directory in a SEPARATE temp dir outside it.
+//!
+//! `paths.rs` already unit-tests path validation itself (UNC/device/`..`/ADS,
+//! containment) — not duplicated here.
+
+use std::path::Path;
+
+use notes_app_lib::db::{ItemRepository, SqliteRepository};
+use notes_app_lib::error::AppError;
+use notes_app_lib::models::{Kind, ListFilter, NewItem, ProjectInfo, Status, UpdateItem};
+use notes_app_lib::projects::catalog::Catalog;
+use notes_app_lib::projects::ProjectManager;
+
+use tempfile::{tempdir, TempDir};
+
+// ---------------------------------------------------------------------------
+// Fixtures
+// ---------------------------------------------------------------------------
+
+/// A manager with an in-memory catalog and a fresh `app_data_dir`. The
+/// returned `TempDir` must be kept alive for the test's duration (it anchors
+/// the manager's containment check).
+async fn new_manager() -> (ProjectManager, TempDir) {
+    let app = tempdir().unwrap();
+    let catalog = Catalog::open_in_memory().await.unwrap();
+    let mgr = ProjectManager::new(catalog, app.path().to_path_buf());
+    (mgr, app)
+}
+
+/// Create a loaded project in its own temp dir OUTSIDE the manager's
+/// `app_data_dir` (see the module-level path-validation note). The returned
+/// `TempDir` must be kept alive as long as the project may be read from disk.
+async fn create_project(mgr: &ProjectManager, name: &str) -> (ProjectInfo, TempDir) {
+    let dir = tempdir().unwrap();
+    let info = mgr.create_project(dir.path().to_str().unwrap(), name).await.unwrap();
+    (info, dir)
+}
+
+fn new_item(project_id: &str, kind: Kind, title: &str) -> NewItem {
+    NewItem {
+        kind,
+        title: title.into(),
+        body: Some(String::new()),
+        status: None,
+        priority: None,
+        due_at: None,
+        tags: None,
+        project_id: project_id.into(),
+        jira_url: None,
+    }
+}
+
+fn item_with_tags(project_id: &str, kind: Kind, title: &str, tags: &[&str]) -> NewItem {
+    NewItem {
+        tags: Some(tags.iter().map(|t| t.to_string()).collect()),
+        ..new_item(project_id, kind, title)
+    }
+}
+
+/// Canonicalize and strip the `\\?\` verbatim prefix, mirroring what
+/// `validate_project_dir` stores as a project's catalog path.
+fn canonical_string(p: &Path) -> String {
+    let c = std::fs::canonicalize(p).unwrap();
+    c.to_string_lossy().trim_start_matches(r"\\?\").to_string()
+}
+
+/// The transferable store entries: the git-portable `project.json` identity, the
+/// SQLite index plus its `-wal`/`-shm` sidecars, and `.gitignore`. The sidecars
+/// MUST travel with the index — `pool.close()` does not reliably checkpoint the
+/// WAL into the main file, so a copied `index.db` without its `-wal` can be
+/// missing even the `application_id` header. But a sidecar may also have been
+/// checkpointed away (then legitimately absent, its data already in the main
+/// file), so each transfer tolerates a missing/vanished source. The canonical
+/// `items/` tree rounds out a full copy.
+const STORE_ENTRIES: &[&str] =
+    &["project.json", "index.db", "index.db-wal", "index.db-shm", ".gitignore"];
+
+/// Copy a whole Stage-2 project directory (a project IS a directory) into
+/// another — used by the copy/move reconciliation tests.
+fn copy_store_files(from: &Path, to: &Path) {
+    std::fs::create_dir_all(to).unwrap();
+    for name in STORE_ENTRIES {
+        copy_if_present(&from.join(name), &to.join(name));
+    }
+    let items = from.join("items");
+    if items.exists() {
+        copy_dir_all(&items, &to.join("items"));
+    }
+}
+
+fn copy_dir_all(from: &Path, to: &Path) {
+    std::fs::create_dir_all(to).unwrap();
+    for entry in std::fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        let src = entry.path();
+        let dst = to.join(entry.file_name());
+        if src.is_dir() {
+            copy_dir_all(&src, &dst);
+        } else {
+            std::fs::copy(&src, &dst).unwrap();
+        }
+    }
+}
+
+/// Move the store into another dir, simulating the user relocating the project
+/// folder. Leaves `from` storeless (its `index.db`/`items/` gone) so the manager
+/// reconciles it as a move, not a copy.
+fn move_store_files(from: &Path, to: &Path) {
+    std::fs::create_dir_all(to).unwrap();
+    for name in STORE_ENTRIES {
+        move_if_present(&from.join(name), &to.join(name));
+    }
+    let items = from.join("items");
+    if items.exists() {
+        fs_retry(|| std::fs::rename(&items, &to.join("items")));
+    }
+}
+
+/// Copy `src`→`dst` if present, retrying transient errors; a missing/vanished
+/// source is a no-op (a checkpointed-away sidecar's data is already in the main
+/// index).
+fn copy_if_present(src: &Path, dst: &Path) {
+    if !src.exists() {
+        return;
+    }
+    for _ in 0..40 {
+        match std::fs::copy(src, dst) {
+            Ok(_) => return,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+            Err(_) => std::thread::sleep(std::time::Duration::from_millis(25)),
+        }
+    }
+    let _ = std::fs::copy(src, dst);
+}
+
+/// Rename `src`→`dst` if present, retrying transient errors; a missing/vanished
+/// source is a no-op (same sidecar reasoning as `copy_if_present`).
+fn move_if_present(src: &Path, dst: &Path) {
+    if !src.exists() {
+        return;
+    }
+    for _ in 0..40 {
+        match std::fs::rename(src, dst) {
+            Ok(()) => return,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+            Err(_) => std::thread::sleep(std::time::Duration::from_millis(25)),
+        }
+    }
+    let _ = std::fs::rename(src, dst);
+}
+
+/// Retry a filesystem op that can transiently fail for a few dozen ms after a
+/// SQLite pool closes on Windows (the OS holds a brief handle on the just-closed
+/// store — WAL sidecar teardown / an AV or indexer scan). Mirrors the app's own
+/// `remove_file_retrying`. Panics with the real error if it never succeeds.
+fn fs_retry<F: FnMut() -> std::io::Result<()>>(mut op: F) {
+    for _ in 0..40 {
+        if op().is_ok() {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+    op().unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// Lifecycle
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn create_project_is_loaded_with_zero_items() {
+    let (mgr, _app) = new_manager().await;
+    let (info, _dir) = create_project(&mgr, "Alpha").await;
+
+    assert!(info.loaded);
+    assert_eq!(info.item_count, Some(0));
+    assert_eq!(info.name, "Alpha");
+
+    let listed = mgr.list_projects().await.unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].id, info.id);
+    assert!(listed[0].loaded);
+}
+
+#[tokio::test]
+async fn create_second_project_is_independent() {
+    let (mgr, _app) = new_manager().await;
+    let (a, _dir_a) = create_project(&mgr, "Alpha").await;
+    let (b, _dir_b) = create_project(&mgr, "Beta").await;
+
+    assert_ne!(a.id, b.id);
+    let listed = mgr.list_projects().await.unwrap();
+    assert_eq!(listed.len(), 2);
+    // Catalog lists by name ascending.
+    assert_eq!(listed[0].name, "Alpha");
+    assert_eq!(listed[1].name, "Beta");
+}
+
+#[tokio::test]
+async fn unload_flips_loaded_flag_and_frees_the_file() {
+    let (mgr, _app) = new_manager().await;
+    let (info, dir) = create_project(&mgr, "Alpha").await;
+
+    mgr.unload(&info.id).await.unwrap();
+
+    let listed = mgr.list_projects().await.unwrap();
+    assert!(!listed[0].loaded);
+    assert_eq!(listed[0].item_count, None);
+
+    // The pool is closed on unload, so the store file becomes deletable — within
+    // a brief window on Windows (the OS releases its transient handle shortly
+    // after the close; see fs_retry).
+    fs_retry(|| std::fs::remove_file(dir.path().join("index.db")));
+}
+
+#[tokio::test]
+async fn unload_not_loaded_is_clean_not_found() {
+    let (mgr, _app) = new_manager().await;
+    let err = mgr.unload("does-not-exist").await.unwrap_err();
+    assert!(matches!(err, AppError::NotFound));
+}
+
+#[tokio::test]
+async fn double_load_same_folder_is_rejected() {
+    let (mgr, _app) = new_manager().await;
+    let dir = tempdir().unwrap();
+    mgr.create_project(dir.path().to_str().unwrap(), "Alpha").await.unwrap();
+
+    let err = mgr.open_project(dir.path().to_str().unwrap()).await.unwrap_err();
+    match err {
+        AppError::Invalid(msg) => assert!(msg.contains("already loaded"), "got: {msg}"),
+        other => panic!("expected Invalid(\"...already loaded...\"), got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn forget_requires_unload_first_then_leaves_files_and_is_reloadable() {
+    let (mgr, _app) = new_manager().await;
+    let (info, dir) = create_project(&mgr, "Alpha").await;
+
+    let err = mgr.forget(&info.id).await.unwrap_err();
+    assert!(matches!(err, AppError::Invalid(_)), "forget while loaded must be rejected");
+
+    mgr.unload(&info.id).await.unwrap();
+    mgr.forget(&info.id).await.unwrap();
+
+    assert!(mgr.list_projects().await.unwrap().is_empty());
+    assert!(dir.path().join("index.db").exists(), "forget must leave the files on disk");
+
+    // Reloadable: opening the same folder re-adopts the same UUID.
+    let reopened = mgr.open_project(dir.path().to_str().unwrap()).await.unwrap();
+    assert_eq!(reopened.id, info.id);
+    assert!(reopened.loaded);
+}
+
+#[tokio::test]
+async fn delete_files_requires_unload_first_then_removes_store_and_catalog_row() {
+    let (mgr, _app) = new_manager().await;
+    let (info, dir) = create_project(&mgr, "Alpha").await;
+    assert!(dir.path().join(".gitignore").exists(), "create_project generates a .gitignore");
+
+    let err = mgr.delete_files(&info.id).await.unwrap_err();
+    assert!(matches!(err, AppError::Invalid(_)), "delete_files while loaded must be rejected");
+
+    mgr.unload(&info.id).await.unwrap();
+    mgr.delete_files(&info.id).await.unwrap();
+
+    assert!(!dir.path().join("index.db").exists());
+    assert!(!dir.path().join("index.db-wal").exists());
+    assert!(!dir.path().join("index.db-shm").exists());
+    assert!(!dir.path().join("items").exists(), "delete_files removes the canonical items/ dir");
+    assert!(!dir.path().join(".gitignore").exists());
+    assert!(mgr.list_projects().await.unwrap().is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// Routing
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn create_lands_only_in_target_store() {
+    let (mgr, _app) = new_manager().await;
+    let (a, _dir_a) = create_project(&mgr, "Alpha").await;
+    let (b, _dir_b) = create_project(&mgr, "Beta").await;
+
+    let item_a = mgr.create(new_item(&a.id, Kind::Note, "in alpha")).await.unwrap();
+    assert_eq!(item_a.project_id.as_deref(), Some(a.id.as_str()));
+
+    let only_a = mgr
+        .list_all(&ListFilter { project_id: Some(a.id.clone()), ..Default::default() })
+        .await
+        .unwrap();
+    assert_eq!(only_a.len(), 1);
+    assert_eq!(only_a[0].id, item_a.id);
+
+    let only_b = mgr
+        .list_all(&ListFilter { project_id: Some(b.id.clone()), ..Default::default() })
+        .await
+        .unwrap();
+    assert!(only_b.is_empty(), "an item created into A must never appear when scoped to B");
+}
+
+#[tokio::test]
+async fn create_with_empty_project_id_is_invalid() {
+    let (mgr, _app) = new_manager().await;
+    let err = mgr.create(new_item("", Kind::Note, "x")).await.unwrap_err();
+    assert!(matches!(err, AppError::Invalid(_)));
+}
+
+#[tokio::test]
+async fn create_with_unloaded_or_unknown_project_id_is_rejected() {
+    let (mgr, _app) = new_manager().await;
+    let err = mgr.create(new_item("does-not-exist", Kind::Note, "x")).await.unwrap_err();
+    // A not-loaded/unknown target is a clear Invalid("that project isn't
+    // loaded"), not the generic item-NotFound.
+    assert!(matches!(err, AppError::Invalid(_)), "got {err:?}");
+}
+
+#[tokio::test]
+async fn get_update_delete_route_across_loaded_stores_by_id() {
+    let (mgr, _app) = new_manager().await;
+    let (a, _dir_a) = create_project(&mgr, "Alpha").await;
+    let (b, _dir_b) = create_project(&mgr, "Beta").await;
+
+    let item_a = mgr.create(new_item(&a.id, Kind::Note, "alpha item")).await.unwrap();
+    let item_b = mgr.create(new_item(&b.id, Kind::Note, "beta item")).await.unwrap();
+
+    assert_eq!(mgr.get(&item_a.id).await.unwrap().project_id.as_deref(), Some(a.id.as_str()));
+    assert_eq!(mgr.get(&item_b.id).await.unwrap().project_id.as_deref(), Some(b.id.as_str()));
+
+    // update() stamps the owning project id on the returned item.
+    let updated = mgr
+        .update(&item_b.id, UpdateItem { title: Some("renamed".into()), ..Default::default() })
+        .await
+        .unwrap();
+    assert_eq!(updated.title, "renamed");
+    assert_eq!(updated.project_id.as_deref(), Some(b.id.as_str()));
+
+    // delete() only removes from the owning store.
+    mgr.delete(&item_a.id).await.unwrap();
+    assert!(matches!(mgr.get(&item_a.id).await.unwrap_err(), AppError::NotFound));
+    assert!(mgr.get(&item_b.id).await.is_ok());
+}
+
+#[tokio::test]
+async fn id_in_no_loaded_store_is_not_found() {
+    let (mgr, _app) = new_manager().await;
+    let (_info, _dir) = create_project(&mgr, "Alpha").await;
+
+    assert!(matches!(mgr.get("nope").await.unwrap_err(), AppError::NotFound));
+    assert!(matches!(mgr.update("nope", UpdateItem::default()).await.unwrap_err(), AppError::NotFound));
+    assert!(matches!(mgr.delete("nope").await.unwrap_err(), AppError::NotFound));
+}
+
+// ---------------------------------------------------------------------------
+// Tag union
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn tag_union_disjoint_and_shared_are_deduped_and_sorted() {
+    let (mgr, _app) = new_manager().await;
+    let (a, _dir_a) = create_project(&mgr, "Alpha").await;
+    let (b, _dir_b) = create_project(&mgr, "Beta").await;
+
+    mgr.create(item_with_tags(&a.id, Kind::Note, "a1", &["gamma", "common"])).await.unwrap();
+    mgr.create(item_with_tags(&b.id, Kind::Note, "b1", &["beta-tag", "common"])).await.unwrap();
+
+    let union = mgr.active_tags_union().await.unwrap();
+    assert_eq!(union, vec!["beta-tag".to_string(), "common".into(), "gamma".into()]);
+}
+
+#[tokio::test]
+async fn tag_survives_when_last_carrier_in_one_project_archives_but_another_project_still_carries_it() {
+    // Headline spec scenario (plan.6 Section 8).
+    let (mgr, _app) = new_manager().await;
+    let (a, _dir_a) = create_project(&mgr, "Alpha").await;
+    let (b, _dir_b) = create_project(&mgr, "Beta").await;
+
+    let item_a = mgr.create(item_with_tags(&a.id, Kind::Note, "a1", &["shared"])).await.unwrap();
+    mgr.create(item_with_tags(&b.id, Kind::Note, "b1", &["shared"])).await.unwrap();
+
+    mgr.update(&item_a.id, UpdateItem { archived: Some(true), ..Default::default() }).await.unwrap();
+
+    let union = mgr.active_tags_union().await.unwrap();
+    assert!(
+        union.contains(&"shared".to_string()),
+        "tag must survive via project B even though A's only carrier was archived"
+    );
+}
+
+#[tokio::test]
+async fn tag_drops_when_its_last_carrier_everywhere_is_gone() {
+    let (mgr, _app) = new_manager().await;
+    let (a, _dir_a) = create_project(&mgr, "Alpha").await;
+    let (b, _dir_b) = create_project(&mgr, "Beta").await;
+    // Keeps the union non-empty so we're testing "this tag drops", not
+    // "the whole union collapsed".
+    mgr.create(item_with_tags(&a.id, Kind::Note, "a1", &["other"])).await.unwrap();
+    let solo = mgr.create(item_with_tags(&b.id, Kind::Note, "solo-carrier", &["onlyme"])).await.unwrap();
+    assert!(mgr.active_tags_union().await.unwrap().contains(&"onlyme".to_string()));
+
+    mgr.update(&solo.id, UpdateItem { archived: Some(true), ..Default::default() }).await.unwrap();
+    assert!(!mgr.active_tags_union().await.unwrap().contains(&"onlyme".to_string()));
+}
+
+#[tokio::test]
+async fn unloading_a_project_drops_its_exclusive_tags_and_reloading_restores_them() {
+    let (mgr, _app) = new_manager().await;
+    let (a, _dir_a) = create_project(&mgr, "Alpha").await;
+    let (b, _dir_b) = create_project(&mgr, "Beta").await;
+    mgr.create(item_with_tags(&a.id, Kind::Note, "a1", &["alpha-only"])).await.unwrap();
+    mgr.create(item_with_tags(&b.id, Kind::Note, "b1", &["beta-only"])).await.unwrap();
+
+    assert!(mgr.active_tags_union().await.unwrap().contains(&"beta-only".to_string()));
+
+    mgr.unload(&b.id).await.unwrap();
+    let after_unload = mgr.active_tags_union().await.unwrap();
+    assert!(!after_unload.contains(&"beta-only".to_string()), "unloading B must drop its exclusive tag");
+    assert!(after_unload.contains(&"alpha-only".to_string()), "A's tag must be unaffected");
+
+    mgr.load(&b.id).await.unwrap();
+    assert!(mgr.active_tags_union().await.unwrap().contains(&"beta-only".to_string()), "reloading B restores its tag");
+}
+
+#[tokio::test]
+async fn zero_loaded_projects_gives_empty_tag_union_not_error() {
+    let (mgr, _app) = new_manager().await;
+    assert!(mgr.active_tags_union().await.unwrap().is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// Search
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn search_hits_from_both_projects_are_stamped_and_grouped_contiguously() {
+    let (mgr, _app) = new_manager().await;
+    let (a, _dir_a) = create_project(&mgr, "Alpha").await; // catalog/name order: Alpha, Beta
+    let (b, _dir_b) = create_project(&mgr, "Beta").await;
+
+    mgr.create(new_item(&a.id, Kind::Note, "shared keyword one")).await.unwrap();
+    mgr.create(new_item(&a.id, Kind::Note, "shared keyword two")).await.unwrap();
+    mgr.create(new_item(&b.id, Kind::Note, "shared keyword three")).await.unwrap();
+
+    let hits = mgr.search_all("shared", &ListFilter::default()).await.unwrap();
+    assert_eq!(hits.len(), 3);
+    // Groups ordered by project name (Alpha before Beta); each item stamped
+    // with its owning project and items from one project stay contiguous.
+    assert_eq!(hits[0].project_id.as_deref(), Some(a.id.as_str()));
+    assert_eq!(hits[1].project_id.as_deref(), Some(a.id.as_str()));
+    assert_eq!(hits[2].project_id.as_deref(), Some(b.id.as_str()));
+}
+
+#[tokio::test]
+async fn search_excludes_archived_items_across_stores() {
+    let (mgr, _app) = new_manager().await;
+    let (a, _dir_a) = create_project(&mgr, "Alpha").await;
+    let (b, _dir_b) = create_project(&mgr, "Beta").await;
+    let item_a = mgr.create(new_item(&a.id, Kind::Note, "findme alpha")).await.unwrap();
+    mgr.create(new_item(&b.id, Kind::Note, "findme beta")).await.unwrap();
+    mgr.update(&item_a.id, UpdateItem { archived: Some(true), ..Default::default() }).await.unwrap();
+
+    let hits = mgr.search_all("findme", &ListFilter::default()).await.unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].project_id.as_deref(), Some(b.id.as_str()));
+}
+
+#[tokio::test]
+async fn search_status_filter_and_combines_post_merge() {
+    let (mgr, _app) = new_manager().await;
+    let (a, _dir_a) = create_project(&mgr, "Alpha").await;
+    let (b, _dir_b) = create_project(&mgr, "Beta").await;
+    let task_a = mgr
+        .create(NewItem { status: Some(Status::Doing), ..new_item(&a.id, Kind::Task, "widget alpha") })
+        .await
+        .unwrap();
+    mgr.create(NewItem { status: Some(Status::Todo), ..new_item(&b.id, Kind::Task, "widget beta") })
+        .await
+        .unwrap();
+
+    let hits = mgr
+        .search_all("widget", &ListFilter { status: Some(Status::Doing), ..Default::default() })
+        .await
+        .unwrap();
+    assert_eq!(hits.len(), 1, "status filter must AND-combine with the search term across both stores");
+    assert_eq!(hits[0].id, task_a.id);
+}
+
+#[tokio::test]
+async fn search_fts_hostile_input_does_not_error() {
+    let (mgr, _app) = new_manager().await;
+    let (a, _dir_a) = create_project(&mgr, "Alpha").await;
+    let (b, _dir_b) = create_project(&mgr, "Beta").await;
+    mgr.create(new_item(&a.id, Kind::Note, "n")).await.unwrap();
+    mgr.create(new_item(&b.id, Kind::Note, "n")).await.unwrap();
+
+    let hits = mgr.search_all("\"unbalanced (syntax -bomb", &ListFilter::default()).await.unwrap();
+    assert!(hits.is_empty());
+}
+
+#[tokio::test]
+async fn unloading_a_project_removes_its_hits_from_search() {
+    let (mgr, _app) = new_manager().await;
+    let (a, _dir_a) = create_project(&mgr, "Alpha").await;
+    let (b, _dir_b) = create_project(&mgr, "Beta").await;
+    mgr.create(new_item(&a.id, Kind::Note, "findme alpha")).await.unwrap();
+    mgr.create(new_item(&b.id, Kind::Note, "findme beta")).await.unwrap();
+
+    assert_eq!(mgr.search_all("findme", &ListFilter::default()).await.unwrap().len(), 2);
+    mgr.unload(&b.id).await.unwrap();
+    let hits = mgr.search_all("findme", &ListFilter::default()).await.unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].project_id.as_deref(), Some(a.id.as_str()));
+}
+
+// ---------------------------------------------------------------------------
+// Ordering
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn list_all_interleaves_recency_globally_across_two_loaded_projects() {
+    // Built directly against SqliteRepository (not via the manager) so
+    // timestamps can be pinned exactly, per the plan's guidance — this avoids
+    // relying on rapid-create timestamp uniqueness across two files.
+    let (mgr, _app) = new_manager().await;
+    let dir_a = tempdir().unwrap();
+    let dir_b = tempdir().unwrap();
+
+    let ts_old = "2026-07-14T00:00:01.000+00:00";
+    let ts_mid = "2026-07-14T00:00:02.000+00:00";
+    let ts_new = "2026-07-14T00:00:03.000+00:00";
+
+    {
+        let repo_a = SqliteRepository::create_at(&dir_a.path().join("project.db"), "proj-a", "Alpha")
+            .await
+            .unwrap();
+        let a_old = repo_a.create(new_item("", Kind::Note, "a-old")).await.unwrap();
+        let a_new = repo_a.create(new_item("", Kind::Note, "a-new")).await.unwrap();
+        repo_a.set_timestamps_for_test(&a_old.id, ts_old, ts_old).await.unwrap();
+        repo_a.set_timestamps_for_test(&a_new.id, ts_new, ts_new).await.unwrap();
+        repo_a.close().await;
+
+        let repo_b = SqliteRepository::create_at(&dir_b.path().join("project.db"), "proj-b", "Beta")
+            .await
+            .unwrap();
+        let b_mid = repo_b.create(new_item("", Kind::Note, "b-mid")).await.unwrap();
+        repo_b.set_timestamps_for_test(&b_mid.id, ts_mid, ts_mid).await.unwrap();
+        repo_b.close().await;
+    }
+
+    mgr.open_project(dir_a.path().to_str().unwrap()).await.unwrap();
+    mgr.open_project(dir_b.path().to_str().unwrap()).await.unwrap();
+
+    let order: Vec<String> =
+        mgr.list_all(&ListFilter::default()).await.unwrap().into_iter().map(|i| i.title).collect();
+    // A naive per-store concatenation could never produce this interleave
+    // (b-mid sits strictly between a-new and a-old): only a real global
+    // k-way merge does.
+    assert_eq!(order, vec!["a-new".to_string(), "b-mid".into(), "a-old".into()]);
+}
+
+#[tokio::test]
+async fn list_all_pinned_item_in_one_project_leads_items_in_the_other() {
+    let (mgr, _app) = new_manager().await;
+    let (a, _dir_a) = create_project(&mgr, "Alpha").await;
+    let (b, _dir_b) = create_project(&mgr, "Beta").await;
+
+    // Created FIRST (older) in B; A's item is created after (newer), so under
+    // plain recency ordering A would lead — until B's item is pinned.
+    let to_pin = mgr.create(new_item(&b.id, Kind::Note, "beta pinned")).await.unwrap();
+    mgr.create(new_item(&a.id, Kind::Note, "alpha newer")).await.unwrap();
+    mgr.update(&to_pin.id, UpdateItem { pinned: Some(true), ..Default::default() }).await.unwrap();
+
+    let order = mgr.list_all(&ListFilter::default()).await.unwrap();
+    assert_eq!(order[0].id, to_pin.id, "pinned item from project B must lead a more-recent item in A");
+}
+
+// ---------------------------------------------------------------------------
+// Per-store invariant regression against a SECONDARY loaded project (proves
+// the manager isn't wired only to the first store it loads)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn secondary_loaded_project_content_edit_bumps_updated_at_but_pin_and_archive_do_not() {
+    let (mgr, _app) = new_manager().await;
+    let (_first, _dir_first) = create_project(&mgr, "Alpha").await;
+    let (second, _dir_second) = create_project(&mgr, "Beta").await;
+
+    let item = mgr.create(new_item(&second.id, Kind::Task, "beta task")).await.unwrap();
+
+    // Force a stale baseline directly on the SECOND store's index (a side
+    // connection to the same file the manager already has open) so the bump
+    // assertion can't tie on same-millisecond clock resolution.
+    let db_path = Path::new(&second.path).join("index.db");
+    let side = SqliteRepository::open_existing(&db_path).await.unwrap();
+    let old = "2000-01-01T00:00:00+00:00";
+    side.set_timestamps_for_test(&item.id, old, old).await.unwrap();
+    side.close().await;
+
+    let edited = mgr
+        .update(&item.id, UpdateItem { title: Some("renamed".into()), ..Default::default() })
+        .await
+        .unwrap();
+    assert!(edited.updated_at > old.to_string(), "a content edit on the SECOND project must bump updated_at");
+
+    let baseline = edited.updated_at.clone();
+    let pinned = mgr.update(&item.id, UpdateItem { pinned: Some(true), ..Default::default() }).await.unwrap();
+    assert_eq!(pinned.updated_at, baseline, "pin flip on the SECOND project must not bump updated_at");
+    let archived =
+        mgr.update(&item.id, UpdateItem { archived: Some(true), ..Default::default() }).await.unwrap();
+    assert_eq!(archived.updated_at, baseline, "archive flip on the SECOND project must not bump updated_at");
+
+    // Archived items are excluded from list_all on the SECOND project too.
+    let listed = mgr
+        .list_all(&ListFilter { project_id: Some(second.id.clone()), ..Default::default() })
+        .await
+        .unwrap();
+    assert!(listed.is_empty());
+}
+
+#[tokio::test]
+async fn secondary_loaded_project_done_task_drops_its_tag_from_the_union() {
+    let (mgr, _app) = new_manager().await;
+    let (_first, _dir_first) = create_project(&mgr, "Alpha").await;
+    let (second, _dir_second) = create_project(&mgr, "Beta").await;
+
+    let task = mgr
+        .create(item_with_tags(&second.id, Kind::Task, "beta task", &["beta-solo"]))
+        .await
+        .unwrap();
+    assert!(mgr.active_tags_union().await.unwrap().contains(&"beta-solo".to_string()));
+
+    mgr.update(&task.id, UpdateItem { status: Some(Status::Done), ..Default::default() }).await.unwrap();
+    assert!(
+        !mgr.active_tags_union().await.unwrap().contains(&"beta-solo".to_string()),
+        "a done task's tag must drop even when it lives in a non-primary store"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Creation/opening hardening (SqliteRepository::create_at / open_existing)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn create_at_fresh_dir_yields_independently_usable_store() {
+    let dir = tempdir().unwrap();
+    let repo = SqliteRepository::create_at(&dir.path().join("project.db"), "id-1", "Solo").await.unwrap();
+    let item = repo.create(new_item("", Kind::Note, "hello")).await.unwrap();
+    assert_eq!(repo.get(&item.id).await.unwrap().title, "hello");
+    let (pid, pname) = repo.read_meta().await.unwrap();
+    assert_eq!(pid, "id-1");
+    assert_eq!(pname, "Solo");
+    repo.close().await;
+}
+
+#[tokio::test]
+async fn create_at_where_a_db_already_exists_errors_without_truncating() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("project.db");
+    let repo = SqliteRepository::create_at(&path, "id-1", "Solo").await.unwrap();
+    let item = repo.create(new_item("", Kind::Note, "keep me")).await.unwrap();
+    repo.close().await;
+
+    let err = SqliteRepository::create_at(&path, "id-2", "Other").await.unwrap_err();
+    assert!(matches!(err, AppError::Invalid(_)));
+
+    // The original store must be intact — create_at never truncates.
+    let reopened = SqliteRepository::open_existing(&path).await.unwrap();
+    assert_eq!(reopened.get(&item.id).await.unwrap().title, "keep me");
+}
+
+#[tokio::test]
+async fn open_existing_on_missing_file_is_clean_error() {
+    let dir = tempdir().unwrap();
+    let err = SqliteRepository::open_existing(&dir.path().join("nope.db")).await.unwrap_err();
+    assert!(matches!(err, AppError::Invalid(_)));
+}
+
+#[tokio::test]
+async fn open_existing_on_garbage_file_is_scrubbed_and_leaks_nothing() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("project.db");
+    std::fs::write(&path, b"not a sqlite file at all, just plain bytes").unwrap();
+
+    let err = SqliteRepository::open_existing(&path).await.unwrap_err();
+    match err {
+        AppError::Invalid(msg) => {
+            assert!(!msg.contains("disk image"), "must not echo raw SQLite text: {msg}");
+            assert!(!msg.to_lowercase().contains("sqlite"), "must not echo raw SQLite text: {msg}");
+            assert!(!msg.contains(&path.to_string_lossy().to_string()), "must never echo the filesystem path");
+        }
+        other => panic!("expected a scrubbed Invalid error, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn open_existing_rejects_foreign_application_id() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("project.db");
+
+    // A plain SQLite file with the DEFAULT application_id (0) — never stamped
+    // as a worknotes store.
+    let options = sqlx::sqlite::SqliteConnectOptions::new().filename(&path).create_if_missing(true);
+    let pool = sqlx::sqlite::SqlitePoolOptions::new().max_connections(1).connect_with(options).await.unwrap();
+    pool.close().await;
+
+    let err = SqliteRepository::open_existing(&path).await.unwrap_err();
+    assert!(matches!(err, AppError::Invalid(_)));
+}
+
+#[tokio::test]
+async fn open_existing_rejects_an_unknown_trigger() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("project.db");
+    let repo = SqliteRepository::create_at(&path, "id-1", "Solo").await.unwrap();
+    repo.close().await;
+
+    let options = sqlx::sqlite::SqliteConnectOptions::new().filename(&path).create_if_missing(false);
+    let pool = sqlx::sqlite::SqlitePoolOptions::new().max_connections(1).connect_with(options).await.unwrap();
+    sqlx::query("CREATE TRIGGER evil_trigger AFTER INSERT ON items BEGIN SELECT 1; END;")
+        .execute(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+
+    let err = SqliteRepository::open_existing(&path).await.unwrap_err();
+    assert!(matches!(err, AppError::Invalid(_)));
+}
+
+#[tokio::test]
+async fn open_existing_rejects_a_newer_version_db() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("project.db");
+    let repo = SqliteRepository::create_at(&path, "id-1", "Solo").await.unwrap();
+    repo.close().await;
+
+    let options = sqlx::sqlite::SqliteConnectOptions::new().filename(&path).create_if_missing(false);
+    let pool = sqlx::sqlite::SqlitePoolOptions::new().max_connections(1).connect_with(options).await.unwrap();
+    // A migration version our binary doesn't know about, higher than any real
+    // one — sqlx's Migrator rejects this as VersionMissing.
+    sqlx::query(
+        "INSERT INTO _sqlx_migrations (version, description, success, checksum, execution_time) \
+         VALUES (?1, ?2, 1, ?3, 0)",
+    )
+    .bind(999_999_999_i64)
+    .bind("a migration from the future")
+    .bind(Vec::<u8>::new())
+    .execute(&pool)
+    .await
+    .unwrap();
+    pool.close().await;
+
+    let err = SqliteRepository::open_existing(&path).await.unwrap_err();
+    match err {
+        AppError::Invalid(msg) => assert!(msg.contains("newer version"), "got: {msg}"),
+        other => panic!("expected Invalid(\"...newer version...\"), got {other:?}"),
+    }
+}
+
+// The oversized-file rejection (MAX_PROJECT_DB_BYTES in db/sqlite.rs) is NOT
+// exercised here: constructing a real >512MB fixture is impractical on this
+// disk-constrained machine (see project memory: cargo-test-disk-full-workaround).
+// Verified by code inspection instead: open_existing() reads
+// std::fs::metadata(path).len() and rejects before touching the file's
+// contents whenever len() > MAX_PROJECT_DB_BYTES.
+#[tokio::test]
+#[ignore = "would require materializing a >512MB fixture file; verified by code inspection instead"]
+async fn open_existing_rejects_an_oversized_file() {}
+
+// ---------------------------------------------------------------------------
+// WAL persistence
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn reopening_after_close_loses_no_committed_writes() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("project.db");
+    let repo = SqliteRepository::create_at(&path, "id-1", "Solo").await.unwrap();
+    let item = repo.create(new_item("", Kind::Task, "durable")).await.unwrap();
+    repo.close().await;
+
+    let reopened = SqliteRepository::open_existing(&path).await.unwrap();
+    let fetched = reopened.get(&item.id).await.unwrap();
+    assert_eq!(fetched.title, "durable");
+    assert_eq!(fetched.id, item.id);
+}
+
+// ---------------------------------------------------------------------------
+// Duplicate-UUID / moved-file reconciliation
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn open_project_refuses_a_copy_while_the_original_still_exists() {
+    let (mgr, _app) = new_manager().await;
+    let (info, dir_original) = create_project(&mgr, "Alpha").await;
+    // Unload so the copy attempt hits the "known at another path" branch
+    // rather than the (separately correct) "already loaded" rejection.
+    mgr.unload(&info.id).await.unwrap();
+
+    let dir_copy = tempdir().unwrap();
+    copy_store_files(dir_original.path(), dir_copy.path());
+
+    let err = mgr.open_project(dir_copy.path().to_str().unwrap()).await.unwrap_err();
+    match err {
+        AppError::Invalid(msg) => assert!(msg.contains("copy"), "got: {msg}"),
+        other => panic!("expected Invalid(\"...copy...\"), got {other:?}"),
+    }
+    // The original is untouched.
+    assert!(dir_original.path().join("index.db").exists());
+}
+
+#[tokio::test]
+async fn open_project_on_a_moved_directory_reconciles_the_catalog_path() {
+    let (mgr, _app) = new_manager().await;
+    let (info, dir_original) = create_project(&mgr, "Alpha").await;
+    mgr.unload(&info.id).await.unwrap();
+
+    let dir_moved = tempdir().unwrap();
+    move_store_files(dir_original.path(), dir_moved.path());
+
+    let reopened = mgr.open_project(dir_moved.path().to_str().unwrap()).await.unwrap();
+    assert_eq!(reopened.id, info.id, "a moved file keeps its identity");
+    assert!(reopened.loaded);
+
+    let listed = mgr.list_projects().await.unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].path, canonical_string(dir_moved.path()), "the catalog path must update to the new folder");
+}
+
+// ---------------------------------------------------------------------------
+// Unload-vs-in-flight-query race + settings isolation (Section 4/8)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn querying_a_store_after_its_pool_is_closed_errors_cleanly_never_panics() {
+    // Models the unload-vs-in-flight-query race (plan §5 "Unload"): unload closes
+    // the pool; a query that races the close must resolve or surface a clean
+    // error — never a panic. Deterministic form: close, then query.
+    let dir = tempdir().unwrap();
+    let repo = SqliteRepository::create_at(&dir.path().join("project.db"), "id-1", "Solo").await.unwrap();
+    repo.close().await;
+    assert!(repo.list(&ListFilter::default()).await.is_err(), "list on a closed pool must Err, not panic");
+    assert!(repo.get("anything").await.is_err(), "get on a closed pool must Err, not panic");
+}
+
+#[tokio::test]
+async fn app_settings_inside_a_loaded_project_store_are_never_surfaced() {
+    // Section 4.5: settings come ONLY from the catalog, never a loaded project
+    // store. Inject a rogue app_settings row into a valid worknotes store, load
+    // it, and confirm the manager's (catalog-backed) accessor ignores it.
+    let (mgr, _app) = new_manager().await;
+    let dir = tempdir().unwrap();
+    let db_path = dir.path().join("project.db");
+    {
+        let repo = SqliteRepository::create_at(&db_path, "id-1", "Rogue").await.unwrap();
+        repo.close().await;
+    }
+    let options = sqlx::sqlite::SqliteConnectOptions::new().filename(&db_path).create_if_missing(false);
+    let pool = sqlx::sqlite::SqlitePoolOptions::new().max_connections(1).connect_with(options).await.unwrap();
+    sqlx::query("INSERT INTO app_settings (key, value) VALUES ('jira_config', 'ROGUE')")
+        .execute(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+
+    mgr.open_project(dir.path().to_str().unwrap()).await.unwrap();
+    // The catalog is the sole source of settings; the store's rogue row is never read.
+    assert_eq!(mgr.get_setting("jira_config").await.unwrap(), None);
+}
+
+// ---------------------------------------------------------------------------
+// Stage 2: canonical file store, in-place upgrade, git-clone, reload
+// ---------------------------------------------------------------------------
+
+/// A minimal valid canonical note file (raw string, as git would deliver it).
+fn note_md(id: &str, title: &str) -> String {
+    format!(
+        "---\nid: {id}\nkind: note\ntitle: \"{title}\"\npinned: false\narchived: false\n\
+         tags: []\ncreated_at: 2026-07-14T00:00:00.000+00:00\n\
+         updated_at: 2026-07-14T00:00:00.000+00:00\n---\n{title} body\n"
+    )
+}
+
+fn count_md_files(items_dir: &Path) -> usize {
+    std::fs::read_dir(items_dir)
+        .map(|rd| {
+            rd.filter_map(|e| e.ok())
+                .filter(|e| e.path().extension().and_then(|s| s.to_str()) == Some("md"))
+                .count()
+        })
+        .unwrap_or(0)
+}
+
+#[tokio::test]
+async fn create_project_uses_the_index_and_items_layout_and_writes_an_item_file() {
+    let (mgr, _app) = new_manager().await;
+    let (info, dir) = create_project(&mgr, "Alpha").await;
+
+    assert!(dir.path().join("index.db").exists(), "Stage 2 store is index.db");
+    assert!(dir.path().join("items").is_dir(), "canonical items/ dir is created");
+    assert!(!dir.path().join("project.db").exists(), "no Stage-1 file for a new project");
+
+    let item = mgr.create(new_item(&info.id, Kind::Note, "hello world")).await.unwrap();
+    // The write is mirrored to a canonical <id>.md BEFORE the index row.
+    let file = dir.path().join("items").join(format!("{}.md", item.id));
+    assert!(file.exists(), "creating an item writes its canonical file");
+    let text = std::fs::read_to_string(&file).unwrap();
+    assert!(text.contains("hello world"), "the file carries the title");
+    assert!(!text.contains("project_id"), "an item file never carries project_id");
+
+    // Deleting removes the file too.
+    mgr.delete(&item.id).await.unwrap();
+    assert!(!file.exists(), "deleting an item removes its canonical file");
+}
+
+#[tokio::test]
+async fn stage1_project_db_is_upgraded_in_place_preserving_every_item() {
+    // The real on-disk scenario: a Stage-1 store (project.db, no items/) is
+    // opened and converted once — data preserved, original kept as a .bak.
+    let (mgr, _app) = new_manager().await;
+    let dir = tempdir().unwrap();
+    {
+        let repo =
+            SqliteRepository::create_at(&dir.path().join("project.db"), "legacy-uuid", "Legacy")
+                .await
+                .unwrap();
+        // Index-only writes (items_dir unset) — exactly a Stage-1 store.
+        repo.create(new_item("", Kind::Note, "one")).await.unwrap();
+        repo.create(new_item("", Kind::Task, "two")).await.unwrap();
+        repo.close().await;
+    }
+
+    let info = mgr.open_project(dir.path().to_str().unwrap()).await.unwrap();
+
+    // Data preserved and now served from the rebuilt index.
+    let items = mgr
+        .list_all(&ListFilter { project_id: Some(info.id.clone()), ..Default::default() })
+        .await
+        .unwrap();
+    assert_eq!(items.len(), 2, "both legacy items survive the upgrade");
+
+    // Layout converted: index.db + one canonical file per item; the original
+    // project.db is retired to a .bak (never deleted).
+    assert!(dir.path().join("index.db").exists());
+    assert_eq!(count_md_files(&dir.path().join("items")), 2);
+    assert!(!dir.path().join("project.db").exists(), "the Stage-1 store is renamed away");
+    assert!(dir.path().join("project.db.pre-stage2.bak").exists(), "original preserved as backup");
+    // Identity is preserved from the Stage-1 store's meta AND published to the
+    // git-portable identity file so a future clone keeps it.
+    assert_eq!(info.id, "legacy-uuid");
+    let identity = std::fs::read_to_string(dir.path().join("project.json")).unwrap();
+    assert!(identity.contains("legacy-uuid"), "upgrade writes the git-portable identity file");
+}
+
+#[tokio::test]
+async fn two_projects_sharing_an_item_id_via_files_refuse_ambiguous_retrieval() {
+    // Real UUIDs never collide, but hand-crafted/merged files could put the same
+    // id in two DISTINCT projects (each with its own identity). Loaded together,
+    // the merged list keeps both, but id-based retrieval must refuse rather than
+    // silently route to whichever store enumerated first (owner()'s guard).
+    let (mgr, _app) = new_manager().await;
+    let shared = "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee";
+
+    let dir_a = tempdir().unwrap();
+    let dir_b = tempdir().unwrap();
+    for dir in [&dir_a, &dir_b] {
+        let items = dir.path().join("items");
+        std::fs::create_dir_all(&items).unwrap();
+        std::fs::write(items.join(format!("{shared}.md")), note_md(shared, "shared id")).unwrap();
+    }
+
+    // No identity files → each folder is adopted as its own project (distinct
+    // UUIDs), so both load; their shared item id is what collides.
+    let a = mgr.open_project(dir_a.path().to_str().unwrap()).await.unwrap();
+    let b = mgr.open_project(dir_b.path().to_str().unwrap()).await.unwrap();
+    assert_ne!(a.id, b.id);
+
+    // Merge keeps both copies (one per project).
+    assert_eq!(mgr.list_all(&ListFilter::default()).await.unwrap().len(), 2);
+    // Ambiguous id → clean Invalid, never a silent wrong-store route.
+    match mgr.get(shared).await.unwrap_err() {
+        AppError::Invalid(msg) => assert!(msg.contains("more than one"), "got: {msg}"),
+        other => panic!("expected an ambiguity Invalid, got {other:?}"),
+    }
+    assert!(matches!(mgr.update(shared, UpdateItem::default()).await.unwrap_err(), AppError::Invalid(_)));
+}
+
+#[tokio::test]
+async fn a_clone_carrying_the_identity_of_a_loaded_project_is_refused() {
+    // The Stage-2 workflow: items/*.md + project.json are committed to git;
+    // index.db is git-ignored. Re-opening a clone of an ALREADY-KNOWN project on
+    // the same machine must be refused (its committed identity is recognized),
+    // never silently registered as a second project with colliding item ids.
+    let (mgr, _app) = new_manager().await;
+    let (info, dir) = create_project(&mgr, "Alpha").await;
+    mgr.create(new_item(&info.id, Kind::Note, "shared item")).await.unwrap();
+
+    // Simulate `git clone`: copy the tracked files (project.json + items/) but
+    // NOT the git-ignored index.db.
+    let clone = tempdir().unwrap();
+    std::fs::copy(dir.path().join("project.json"), clone.path().join("project.json")).unwrap();
+    copy_dir_all(&dir.path().join("items"), &clone.path().join("items"));
+
+    // While the original is loaded: the clone is a duplicate of a loaded project.
+    let err = mgr.open_project(clone.path().to_str().unwrap()).await.unwrap_err();
+    assert!(matches!(err, AppError::Invalid(_)), "a clone of a loaded project is refused");
+
+    // Even unloaded, the clone is recognized as a copy of a known project (its
+    // committed identity matches a catalog row whose original files still exist).
+    mgr.unload(&info.id).await.unwrap();
+    match mgr.open_project(clone.path().to_str().unwrap()).await.unwrap_err() {
+        AppError::Invalid(msg) => assert!(msg.contains("copy"), "got: {msg}"),
+        other => panic!("expected a copy rejection, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_git_clone_with_only_item_files_builds_a_fresh_index_on_open() {
+    // A cloned/synced project dir carries items/*.md but no index.db (git-ignored).
+    let (mgr, _app) = new_manager().await;
+    let dir = tempdir().unwrap();
+    let items_dir = dir.path().join("items");
+    std::fs::create_dir_all(&items_dir).unwrap();
+    std::fs::write(
+        items_dir.join("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa.md"),
+        note_md("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", "cloned one"),
+    )
+    .unwrap();
+    std::fs::write(
+        items_dir.join("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb.md"),
+        note_md("bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb", "cloned two"),
+    )
+    .unwrap();
+
+    let info = mgr.open_project(dir.path().to_str().unwrap()).await.unwrap();
+    assert!(dir.path().join("index.db").exists(), "a fresh index is built from the files");
+
+    let titles: Vec<String> = mgr
+        .list_all(&ListFilter { project_id: Some(info.id.clone()), ..Default::default() })
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|i| i.title)
+        .collect();
+    assert_eq!(titles.len(), 2);
+    assert!(titles.contains(&"cloned one".to_string()) && titles.contains(&"cloned two".to_string()));
+}
+
+#[tokio::test]
+async fn reload_picks_up_files_added_and_removed_out_of_band() {
+    // Post-git-pull: a file appears and another vanishes; reload rebuilds the
+    // index from what's on disk.
+    let (mgr, _app) = new_manager().await;
+    let (info, dir) = create_project(&mgr, "Alpha").await;
+    let items_dir = dir.path().join("items");
+
+    let kept = mgr.create(new_item(&info.id, Kind::Note, "kept")).await.unwrap();
+    let removed = mgr.create(new_item(&info.id, Kind::Note, "removed")).await.unwrap();
+    assert_eq!(mgr.list_all(&ListFilter::default()).await.unwrap().len(), 2);
+
+    // Simulate a pull: add a new file, delete an existing one.
+    std::fs::write(
+        items_dir.join("cccccccc-cccc-cccc-cccc-cccccccccccc.md"),
+        note_md("cccccccc-cccc-cccc-cccc-cccccccccccc", "pulled in"),
+    )
+    .unwrap();
+    std::fs::remove_file(items_dir.join(format!("{}.md", removed.id))).unwrap();
+
+    let warnings = mgr.reload(&info.id).await.unwrap();
+    assert!(warnings.is_empty(), "clean files reload without warnings");
+
+    let titles: Vec<String> =
+        mgr.list_all(&ListFilter::default()).await.unwrap().into_iter().map(|i| i.title).collect();
+    assert_eq!(titles.len(), 2);
+    assert!(titles.contains(&"kept".to_string()), "an untouched item survives reload");
+    assert!(titles.contains(&"pulled in".to_string()), "a pulled-in file appears after reload");
+    assert!(!titles.contains(&"removed".to_string()), "a deleted file is gone after reload");
+    let _ = kept;
+}
+
+#[tokio::test]
+async fn reload_reports_conflict_marker_files_and_imports_the_rest() {
+    // Per-file partial success: a file with unresolved git conflict markers is
+    // skipped and reported; the clean files still import.
+    let (mgr, _app) = new_manager().await;
+    let (info, dir) = create_project(&mgr, "Alpha").await;
+    let items_dir = dir.path().join("items");
+
+    mgr.create(new_item(&info.id, Kind::Note, "clean")).await.unwrap();
+    let conflicted = "dddddddd-dddd-dddd-dddd-dddddddddddd.md";
+    std::fs::write(
+        items_dir.join(conflicted),
+        "---\nid: dddddddd-dddd-dddd-dddd-dddddddddddd\nkind: note\ntitle: \"x\"\n\
+         <<<<<<< HEAD\npinned: false\n=======\npinned: true\n>>>>>>> branch\narchived: false\n\
+         tags: []\ncreated_at: 2026-07-14T00:00:00.000+00:00\n\
+         updated_at: 2026-07-14T00:00:00.000+00:00\n---\nbody\n",
+    )
+    .unwrap();
+
+    let warnings = mgr.reload(&info.id).await.unwrap();
+    assert_eq!(warnings.len(), 1, "the one conflicted file is reported");
+    assert!(warnings[0].contains(conflicted), "the warning names the offending file");
+    assert!(warnings[0].contains("conflict"), "the warning explains why");
+
+    // The clean item still imported.
+    let titles: Vec<String> =
+        mgr.list_all(&ListFilter::default()).await.unwrap().into_iter().map(|i| i.title).collect();
+    assert_eq!(titles, vec!["clean".to_string()]);
+}

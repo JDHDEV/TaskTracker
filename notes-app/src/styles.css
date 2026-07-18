@@ -102,6 +102,14 @@ textarea {
   border-bottom: 1px solid #e8c6bb;
 }
 
+/* A non-alarming status line (startup warnings, unload eviction notice) — the
+   neutral surface, not the danger tint the error toast carries. */
+.toast-notice {
+  background: var(--surface);
+  color: var(--muted);
+  border-bottom: 1px solid var(--line);
+}
+
 .panes {
   flex: 1;
   min-height: 0;
@@ -234,6 +242,15 @@ textarea {
 .row-tags {
   font-family: var(--font-meta);
   font-size: 11px;
+  color: var(--muted);
+}
+
+/* Muted project label on a list row, shown only when >1 project is loaded so a
+   row's origin isn't ambiguous. Mono/muted like the other row metadata. */
+.row-project {
+  font-family: var(--font-meta);
+  font-size: 11px;
+  letter-spacing: 0.08em;
   color: var(--muted);
 }
 
@@ -851,7 +868,7 @@ textarea {
 
 /* Manage projects dialog */
 .dialog-projects {
-  width: min(480px, calc(100vw - 32px));
+  width: min(560px, calc(100vw - 32px));
 }
 
 .project-row {
@@ -871,11 +888,57 @@ textarea {
   background: var(--bg);
 }
 
-.project-count {
+/* Identity block in a project row: name over its muted on-disk path. */
+.project-ident {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.project-name-text {
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.project-path {
   font-family: var(--font-meta);
   font-size: 11px;
   color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+/* Loaded/unloaded state chip — reuses the muted + done tokens, no new colors. */
+.project-state {
+  font-family: var(--font-meta);
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.project-state-on {
+  color: var(--done);
+}
+
+/* Reset the row list's default list styling — rows are the project-row flex
+   items; the <ul>/<li> is purely for screen-reader "list of N" semantics. */
+.project-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+
+/* Forget is quiet like Unload but dashed, so the reversible toggle (Load/Unload)
+   and the catalog-only removal read as distinct affordances (danger red stays
+   reserved for Delete files). */
+.btn-forget {
+  border-style: dashed;
 }
 
 .project-add-row {

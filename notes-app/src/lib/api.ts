@@ -1,5 +1,6 @@
 import { Channel, invoke } from "@tauri-apps/api/core";
 import { openUrl } from "@tauri-apps/plugin-opener";
+import { ask } from "@tauri-apps/plugin-dialog";
 import { isHttpUrl } from "./jira";
 import type {
   GenerateTitleRequest,
@@ -7,8 +8,7 @@ import type {
   JiraConfig,
   ListFilter,
   NewItem,
-  Project,
-  ProjectWithCount,
+  ProjectInfo,
   ProviderId,
   RewriteEvent,
   RewriteRequest,
@@ -44,20 +44,61 @@ export function searchItems(query: string, filter?: ListFilter): Promise<Item[]>
   return invoke("search_items", { query, filter });
 }
 
-export function listProjects(): Promise<ProjectWithCount[]> {
+// --- Projects as loadable on-disk stores. A project is a directory the user
+// chooses; the backend validates every path server-side. list_projects returns
+// the catalog (known projects) with a `loaded` flag and an itemCount for loaded
+// ones. ---
+
+export function listProjects(): Promise<ProjectInfo[]> {
   return invoke("list_projects");
 }
 
-export function createProject(name: string): Promise<Project> {
-  return invoke("create_project", { name });
+/** Create a new project at `dir` (validated Rust-side) and load it. */
+export function createProject(dir: string, name: string): Promise<ProjectInfo> {
+  return invoke("create_project", { dir, name });
 }
 
-export function renameProject(id: string, name: string): Promise<Project> {
-  return invoke("rename_project", { id, name });
+/** Open (and load) an existing project from `dir`. */
+export function openProject(dir: string): Promise<ProjectInfo> {
+  return invoke("open_project", { dir });
 }
 
-export function deleteProject(id: string): Promise<void> {
-  return invoke("delete_project", { id });
+export function loadProject(id: string): Promise<ProjectInfo> {
+  return invoke("load_project", { id });
+}
+
+export function unloadProject(id: string): Promise<void> {
+  return invoke("unload_project", { id });
+}
+
+/**
+ * Reload a project from its on-disk `items/*.md` files (Stage 2 — after a
+ * `git pull`/sync changed them). Resolves to per-file import warnings: a line
+ * per file that couldn't be imported (e.g. unresolved git conflict markers),
+ * empty when everything imported cleanly.
+ */
+export function reloadProject(id: string): Promise<string[]> {
+  return invoke("reload_project", { id });
+}
+
+/** Remove a project from the catalog; its files are left on disk. */
+export function forgetProject(id: string): Promise<void> {
+  return invoke("forget_project", { id });
+}
+
+/** Destructively delete a project's files, then its catalog row. */
+export function deleteProjectFiles(id: string): Promise<void> {
+  return invoke("delete_project_files", { id });
+}
+
+/** Show the native folder picker; resolves to the chosen path or null. */
+export function pickProjectFolder(): Promise<string | null> {
+  return invoke("pick_project_folder");
+}
+
+/** Non-fatal per-project warnings gathered at startup, for a one-time notice. */
+export function startupWarnings(): Promise<string[]> {
+  return invoke("startup_warnings");
 }
 
 export function listActiveTags(): Promise<string[]> {
@@ -182,4 +223,15 @@ export async function openExternal(url: string): Promise<void> {
     throw new Error("Refusing to open a non-http(s) URL.");
   }
   await openUrl(url);
+}
+
+/**
+ * Native confirmation dialog. The Tauri webview suppresses the browser's
+ * synchronous `window.confirm`, so every destructive/consequential prompt
+ * (delete, unload, reload, delete-files) routes through the dialog plugin's
+ * async `ask` instead. Resolves `true` when the user accepts. Routed through
+ * api.ts like `openExternal`, so plugin IPC stays out of components.
+ */
+export function confirmDialog(message: string, title = "worknotes"): Promise<boolean> {
+  return ask(message, { title, kind: "warning" });
 }

@@ -81,6 +81,6 @@ Acceptance: walk the "Reference sample state" section of DESIGN.md and reproduce
 
 - Due-date UI (backend fully supports `dueAt`; empty string clears)
 - Streaming rewrites into the editor via Tauri channels
-- `PostgresRepository` (second `ItemRepository` impl; own SQL incl. `tsvector` search) for cloud sync
+- ~~`PostgresRepository` (second `ItemRepository` impl; own SQL incl. `tsvector` search) for cloud sync~~ — **superseded as the sync direction** by "Projects as Loadable On-Disk Databases" (plans/plan.6.md), now fully shipped incl. Stage 2: sync is per-project directories in user-chosen locations — whole-file via OneDrive/Syncthing, OR git-based merge of the canonical `items/*.md` file-per-item store (with the SQLite `index.db` demoted to a git-ignored rebuildable index). The `ItemRepository` trait seam survives and a Postgres impl remains possible, but cloud-sync-via-Postgres is no longer the planned path.
 - Installer via `npm run tauri build`
 - JIRA enrichment (ticket status/title on the chip) via Atlassian's API — a third swap-point trait, same pattern as storage and AI

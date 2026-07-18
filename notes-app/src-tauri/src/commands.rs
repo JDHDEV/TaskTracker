@@ -7,17 +7,16 @@ use tauri::ipc::Channel;
 use tauri::State;
 
 use crate::ai::{self, keys, ChunkSink, RewriteErrorCode, RewriteEvent};
-use crate::db::ItemRepository;
 use crate::error::{AppError, Result};
 use crate::jira;
-use crate::models::{
-    Item, JiraConfig, ListFilter, NewItem, Project, ProjectWithCount, TicketMeta, UpdateItem,
-};
+use crate::models::{Item, JiraConfig, ListFilter, NewItem, ProjectInfo, TicketMeta, UpdateItem};
+use crate::projects::ProjectManager;
 
-/// Everything commands are allowed to touch. Note the type: the repository
-/// is `dyn ItemRepository` — commands cannot know or care that it's SQLite.
+/// Everything commands are allowed to touch. Commands depend only on the
+/// `ProjectManager` (which owns the loaded per-project stores behind the
+/// `ItemRepository` trait) — never on a concrete storage impl.
 pub struct AppState {
-    pub repo: Arc<dyn ItemRepository>,
+    pub manager: Arc<ProjectManager>,
     pub http: reqwest::Client,
     /// In-flight streaming rewrites, keyed by their request id, so
     /// `ai_rewrite_cancel` can flip the flag the stream loop polls. Entries
@@ -30,17 +29,17 @@ pub async fn list_items(
     state: State<'_, AppState>,
     filter: Option<ListFilter>,
 ) -> Result<Vec<Item>> {
-    state.repo.list(&filter.unwrap_or_default()).await
+    state.manager.list_all(&filter.unwrap_or_default()).await
 }
 
 #[tauri::command]
 pub async fn get_item(state: State<'_, AppState>, id: String) -> Result<Item> {
-    state.repo.get(&id).await
+    state.manager.get(&id).await
 }
 
 #[tauri::command]
 pub async fn create_item(state: State<'_, AppState>, input: NewItem) -> Result<Item> {
-    state.repo.create(input).await
+    state.manager.create(input).await
 }
 
 #[tauri::command]
@@ -49,12 +48,12 @@ pub async fn update_item(
     id: String,
     patch: UpdateItem,
 ) -> Result<Item> {
-    state.repo.update(&id, patch).await
+    state.manager.update(&id, patch).await
 }
 
 #[tauri::command]
 pub async fn delete_item(state: State<'_, AppState>, id: String) -> Result<()> {
-    state.repo.delete(&id).await
+    state.manager.delete(&id).await
 }
 
 #[tauri::command]
@@ -63,36 +62,92 @@ pub async fn search_items(
     query: String,
     filter: Option<ListFilter>,
 ) -> Result<Vec<Item>> {
-    state.repo.search(&query, &filter.unwrap_or_default()).await
-}
-
-#[tauri::command]
-pub async fn list_projects(state: State<'_, AppState>) -> Result<Vec<ProjectWithCount>> {
-    state.repo.list_projects().await
-}
-
-#[tauri::command]
-pub async fn create_project(state: State<'_, AppState>, name: String) -> Result<Project> {
-    state.repo.create_project(&name).await
-}
-
-#[tauri::command]
-pub async fn rename_project(
-    state: State<'_, AppState>,
-    id: String,
-    name: String,
-) -> Result<Project> {
-    state.repo.rename_project(&id, &name).await
-}
-
-#[tauri::command]
-pub async fn delete_project(state: State<'_, AppState>, id: String) -> Result<()> {
-    state.repo.delete_project(&id).await
+    state.manager.search_all(&query, &filter.unwrap_or_default()).await
 }
 
 #[tauri::command]
 pub async fn list_active_tags(state: State<'_, AppState>) -> Result<Vec<String>> {
-    state.repo.list_active_tags().await
+    state.manager.active_tags_union().await
+}
+
+// --- Project lifecycle -----------------------------------------------------
+
+/// Every known project (loaded or not) with a loaded flag and a live item count
+/// for loaded ones.
+#[tauri::command]
+pub async fn list_projects(state: State<'_, AppState>) -> Result<Vec<ProjectInfo>> {
+    state.manager.list_projects().await
+}
+
+/// Create a new project at a user-chosen directory (validated Rust-side) and
+/// load it.
+#[tauri::command]
+pub async fn create_project(
+    state: State<'_, AppState>,
+    dir: String,
+    name: String,
+) -> Result<ProjectInfo> {
+    state.manager.create_project(&dir, &name).await
+}
+
+/// Open (and load) an existing project from a user-chosen directory.
+#[tauri::command]
+pub async fn open_project(state: State<'_, AppState>, dir: String) -> Result<ProjectInfo> {
+    state.manager.open_project(&dir).await
+}
+
+/// Load a known project by id.
+#[tauri::command]
+pub async fn load_project(state: State<'_, AppState>, id: String) -> Result<ProjectInfo> {
+    state.manager.load(&id).await
+}
+
+/// Unload a loaded project (closes its store; reversible).
+#[tauri::command]
+pub async fn unload_project(state: State<'_, AppState>, id: String) -> Result<()> {
+    state.manager.unload(&id).await
+}
+
+/// Reload a project from its on-disk `items/*.md` files (Stage 2, after a
+/// `git pull` changed them). Returns per-file import warnings (e.g. files with
+/// unresolved conflict markers) so the UI can report which items were skipped.
+#[tauri::command]
+pub async fn reload_project(state: State<'_, AppState>, id: String) -> Result<Vec<String>> {
+    state.manager.reload(&id).await
+}
+
+/// Forget a project (removes it from the catalog; files untouched). Must be
+/// unloaded first.
+#[tauri::command]
+pub async fn forget_project(state: State<'_, AppState>, id: String) -> Result<()> {
+    state.manager.forget(&id).await
+}
+
+/// Destructively delete a project's files, then its catalog row. Must be
+/// unloaded first.
+#[tauri::command]
+pub async fn delete_project_files(state: State<'_, AppState>, id: String) -> Result<()> {
+    state.manager.delete_files(&id).await
+}
+
+/// Non-fatal per-project warnings gathered at startup (moved/corrupt/newer
+/// project files), for a one-time frontend notice.
+#[tauri::command]
+pub fn startup_warnings(state: State<'_, AppState>) -> Vec<String> {
+    state.manager.startup_warnings()
+}
+
+/// Show the native folder picker and return the chosen directory path (or `None`
+/// if cancelled). Thin by design: the OS picker is UX only — the returned path
+/// is re-validated server-side in `create_project`/`open_project` before any use.
+#[tauri::command]
+pub async fn pick_project_folder(app: tauri::AppHandle) -> Result<Option<String>> {
+    use tauri_plugin_dialog::DialogExt;
+    let picked =
+        tauri::async_runtime::spawn_blocking(move || app.dialog().file().blocking_pick_folder())
+            .await
+            .map_err(|_| AppError::Invalid("the folder picker could not be opened".into()))?;
+    Ok(picked.map(|folder| folder.to_string()))
 }
 
 #[derive(Debug, Deserialize)]
@@ -261,9 +316,10 @@ pub fn has_api_key(provider: String) -> bool {
 const JIRA_CONFIG_KEY: &str = "jira_config";
 
 /// Shared config read, so `get_jira_ticket` doesn't have to reconstruct a
-/// `State` to reuse the command.
-async fn load_jira_config(repo: &dyn ItemRepository) -> Result<Option<JiraConfig>> {
-    match repo.get_setting(JIRA_CONFIG_KEY).await? {
+/// `State`. Settings live ONLY in the catalog (Section 4.5) — never a project
+/// store — so this reads through the manager's catalog accessor.
+async fn load_jira_config(manager: &ProjectManager) -> Result<Option<JiraConfig>> {
+    match manager.get_setting(JIRA_CONFIG_KEY).await? {
         Some(json) => {
             let config = serde_json::from_str::<JiraConfig>(&json)
                 .map_err(|e| AppError::Invalid(format!("stored JIRA config is corrupt: {e}")))?;
@@ -276,7 +332,7 @@ async fn load_jira_config(repo: &dyn ItemRepository) -> Result<Option<JiraConfig
 /// The saved non-secret JIRA connection, or `None` if never configured.
 #[tauri::command]
 pub async fn get_jira_config(state: State<'_, AppState>) -> Result<Option<JiraConfig>> {
-    load_jira_config(state.repo.as_ref()).await
+    load_jira_config(&state.manager).await
 }
 
 /// Save the non-secret JIRA connection. Rejects a non-https site URL and an
@@ -289,7 +345,7 @@ pub async fn set_jira_config(state: State<'_, AppState>, config: JiraConfig) -> 
     }
     let json = serde_json::to_string(&config)
         .map_err(|e| AppError::Invalid(format!("could not encode JIRA config: {e}")))?;
-    state.repo.set_setting(JIRA_CONFIG_KEY, &json).await
+    state.manager.set_setting(JIRA_CONFIG_KEY, &json).await
 }
 
 /// Save (or, with an empty value, delete) the JIRA API token in the keyring.
@@ -315,7 +371,7 @@ pub async fn get_jira_ticket(state: State<'_, AppState>, jira_url: String) -> Re
     let key = jira::extract_ticket_key(&jira_url)
         .ok_or_else(|| AppError::Invalid("no JIRA ticket key in that URL".into()))?;
 
-    let config = load_jira_config(state.repo.as_ref())
+    let config = load_jira_config(&state.manager)
         .await?
         .ok_or(AppError::NotConfigured)?;
     // Defense-in-depth: re-validate the stored base URL before dialing it.

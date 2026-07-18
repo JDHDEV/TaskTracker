@@ -22,14 +22,14 @@ export interface Item {
   jiraUrl: string | null;
 }
 
-export interface Project {
+/** A known project: catalog identity + whether it is loaded, plus a live item
+ *  count for loaded projects only (undefined when unloaded). */
+export interface ProjectInfo {
   id: string;
   name: string;
-  createdAt: string; // RFC 3339
-}
-
-export interface ProjectWithCount extends Project {
-  itemCount: number;
+  path: string;
+  loaded: boolean;
+  itemCount?: number;
 }
 
 export interface NewItem {
@@ -40,11 +40,13 @@ export interface NewItem {
   priority?: Priority;
   dueAt?: string;
   tags?: string[];
-  projectId?: string;
+  /** Required: the project this item is created into (the routing target). */
+  projectId: string;
   jiraUrl?: string;
 }
 
-/** Omitted fields are left unchanged. Send dueAt/jiraUrl: "" to clear them. */
+/** Omitted fields are left unchanged. Send dueAt/jiraUrl: "" to clear them.
+ *  No projectId: items do not move between projects in v1. */
 export interface UpdateItem {
   title?: string;
   body?: string;
@@ -52,7 +54,6 @@ export interface UpdateItem {
   priority?: Priority;
   dueAt?: string;
   tags?: string[];
-  projectId?: string;
   jiraUrl?: string;
   archived?: boolean;
   pinned?: boolean;

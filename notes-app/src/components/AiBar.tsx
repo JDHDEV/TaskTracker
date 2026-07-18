@@ -8,6 +8,9 @@ interface Props {
   /** R4: an empty-title save is generating a title — Save is disabled and
    *  reads "Generating title…" for the duration. */
   generatingTitle: boolean;
+  /** A new draft with no project chosen yet — Save is blocked until one is
+   *  picked (a new item must be created into a specific project store). */
+  saveBlocked: boolean;
   onRework: (instruction: string, provider: ProviderId) => void;
   onSave: () => void;
 }
@@ -28,6 +31,7 @@ export default function AiBar({
   busy,
   dirty,
   generatingTitle,
+  saveBlocked,
   onRework,
   onSave,
 }: Props) {
@@ -85,7 +89,8 @@ export default function AiBar({
       </button>
       <button
         className="btn btn-save"
-        disabled={!dirty || generatingTitle}
+        disabled={!dirty || generatingTitle || saveBlocked}
+        title={saveBlocked ? "Choose a project first" : undefined}
         onClick={onSave}
       >
         {generatingTitle ? "Generating title…" : dirty ? "Save" : "Saved"}

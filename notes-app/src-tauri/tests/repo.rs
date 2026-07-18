@@ -1,8 +1,12 @@
 use notes_app_lib::db::{ItemRepository, SqliteRepository};
 use notes_app_lib::error::AppError;
-use notes_app_lib::models::{
-    Kind, ListFilter, NewItem, Priority, Project, ProjectWithCount, Sort, Status, UpdateItem,
-};
+use notes_app_lib::models::{Kind, ListFilter, NewItem, Priority, Sort, Status, UpdateItem};
+
+// The per-project store no longer owns project CRUD or app settings (those moved
+// to the app-level catalog + ProjectManager — see tests/project_manager.rs), and
+// a row's `project_id` is never persisted (always NULL; the manager stamps the
+// owning UUID). These tests cover what the store still owns: item CRUD, FTS
+// search, the derived tag vocabulary, sort/tiebreak, jira_url, and due_at.
 
 fn new_item(kind: Kind, title: &str, body: &str) -> NewItem {
     NewItem {
@@ -13,7 +17,8 @@ fn new_item(kind: Kind, title: &str, body: &str) -> NewItem {
         priority: None,
         due_at: None,
         tags: Some(vec!["work".into()]),
-        project_id: None,
+        // Routing key consumed by the manager; the store ignores it and stores NULL.
+        project_id: String::new(),
         jira_url: None,
     }
 }
@@ -38,6 +43,8 @@ async fn crud_search_and_fts() {
     assert_eq!(note.kind, Kind::Note);
     assert_eq!(note.status, None);
     assert_eq!(note.tags.0, vec!["work".to_string()]);
+    // project_id is never persisted in-store (Decision 4).
+    assert_eq!(note.project_id, None);
 
     let task = repo
         .create(new_item(Kind::Task, "Send follow-up email", "To the platform team"))
@@ -152,209 +159,21 @@ async fn validation_and_serde_shape() {
     assert!(json["dueAt"].is_null());
     assert!(json["createdAt"].is_string());
     assert_eq!(json["tags"][0], "work");
-    // new Phase 1 fields: camelCase keys, null when unset
+    // projectId is NULL in-store (the manager stamps the owning UUID on return);
+    // jiraUrl null when unset
     assert!(json["projectId"].is_null());
     assert!(json["jiraUrl"].is_null());
 
-    // and NewItem deserializes from camelCase with optional fields omitted
+    // NewItem deserializes from camelCase; projectId is now REQUIRED (the routing
+    // target), and optional fields may be omitted
     let parsed: NewItem =
-        serde_json::from_str(r#"{"kind":"note","title":"From JS"}"#).unwrap();
+        serde_json::from_str(r#"{"kind":"note","title":"From JS","projectId":"p1"}"#).unwrap();
     assert_eq!(parsed.kind, Kind::Note);
-    assert!(parsed.project_id.is_none());
+    assert_eq!(parsed.project_id, "p1");
     assert!(parsed.jira_url.is_none());
-}
 
-// ---------------------------------------------------------------------------
-// Project CRUD
-// ---------------------------------------------------------------------------
-
-#[tokio::test]
-async fn create_project_trims_and_shapes() {
-    let repo = SqliteRepository::connect_in_memory().await.unwrap();
-    let p = repo.create_project("  Ops  ").await.unwrap();
-    assert!(!p.id.is_empty());
-    assert_eq!(p.name, "Ops", "name is trimmed");
-    // created_at parses as RFC3339
-    assert!(chrono::DateTime::parse_from_rfc3339(&p.created_at).is_ok());
-}
-
-#[tokio::test]
-async fn create_project_rejects_empty_name() {
-    let repo = SqliteRepository::connect_in_memory().await.unwrap();
-    let err = repo.create_project("   ").await.unwrap_err();
-    assert!(matches!(err, AppError::Invalid(_)));
-}
-
-#[tokio::test]
-async fn create_project_rejects_duplicate_cleanly() {
-    let repo = SqliteRepository::connect_in_memory().await.unwrap();
-    repo.create_project("Ops").await.unwrap();
-    // exact duplicate, and duplicate-after-trim
-    let err = repo.create_project("Ops").await.unwrap_err();
-    let AppError::Invalid(msg) = err else { panic!("expected Invalid, got a leaked error") };
-    assert!(!msg.contains("UNIQUE"), "must not leak raw sqlx constraint text: {msg}");
-
-    let err2 = repo.create_project("  Ops ").await.unwrap_err();
-    assert!(matches!(err2, AppError::Invalid(_)));
-}
-
-#[tokio::test]
-async fn create_project_binary_collation_is_case_sensitive() {
-    // Q1 decision: binary collation. "Ops" and "OPS" are distinct projects.
-    let repo = SqliteRepository::connect_in_memory().await.unwrap();
-    repo.create_project("Ops").await.unwrap();
-    repo.create_project("OPS").await.unwrap();
-    assert_eq!(repo.list_projects().await.unwrap().len(), 2);
-}
-
-#[tokio::test]
-async fn rename_project_is_reflected_and_rename_safe() {
-    let repo = SqliteRepository::connect_in_memory().await.unwrap();
-    let p = repo.create_project("Old").await.unwrap();
-    // assign an item to it
-    let item = repo.create(new_item(Kind::Task, "T", "")).await.unwrap();
-    repo.update(&item.id, UpdateItem { project_id: Some(p.id.clone()), ..Default::default() })
-        .await
-        .unwrap();
-
-    repo.rename_project(&p.id, "New").await.unwrap();
-    let listed = repo.list_projects().await.unwrap();
-    assert_eq!(listed.iter().find(|x| x.id == p.id).unwrap().name, "New");
-    // id-referenced: the item keeps the same project_id across a rename
-    assert_eq!(repo.get(&item.id).await.unwrap().project_id, Some(p.id));
-}
-
-#[tokio::test]
-async fn rename_project_to_own_name_succeeds() {
-    let repo = SqliteRepository::connect_in_memory().await.unwrap();
-    let p = repo.create_project("Same").await.unwrap();
-    // proves the `id <> ?` predicate: no self-collision
-    let renamed = repo.rename_project(&p.id, "Same").await.unwrap();
-    assert_eq!(renamed.name, "Same");
-}
-
-#[tokio::test]
-async fn rename_project_to_taken_name_is_invalid() {
-    let repo = SqliteRepository::connect_in_memory().await.unwrap();
-    repo.create_project("A").await.unwrap();
-    let b = repo.create_project("B").await.unwrap();
-    let err = repo.rename_project(&b.id, "A").await.unwrap_err();
-    assert!(matches!(err, AppError::Invalid(_)));
-}
-
-#[tokio::test]
-async fn rename_project_nonexistent_is_not_found() {
-    let repo = SqliteRepository::connect_in_memory().await.unwrap();
-    let err = repo.rename_project("no-such-id", "X").await.unwrap_err();
-    assert!(matches!(err, AppError::NotFound));
-}
-
-#[tokio::test]
-async fn list_projects_counts_including_zero() {
-    let repo = SqliteRepository::connect_in_memory().await.unwrap();
-    let empty = repo.create_project("Empty").await.unwrap();
-    let one = repo.create_project("One").await.unwrap();
-    let many = repo.create_project("Many").await.unwrap();
-
-    let i1 = repo.create(new_item(Kind::Task, "a", "")).await.unwrap();
-    repo.update(&i1.id, UpdateItem { project_id: Some(one.id.clone()), ..Default::default() })
-        .await
-        .unwrap();
-    for t in ["b", "c"] {
-        let it = repo.create(new_item(Kind::Task, t, "")).await.unwrap();
-        repo.update(&it.id, UpdateItem { project_id: Some(many.id.clone()), ..Default::default() })
-            .await
-            .unwrap();
-    }
-
-    let listed = repo.list_projects().await.unwrap();
-    let count = |id: &str| listed.iter().find(|p| p.id == id).unwrap().item_count;
-    // zero-item project appears AND reads as 0 (proves LEFT JOIN + COUNT(i.id))
-    assert_eq!(count(&empty.id), 0);
-    assert_eq!(count(&one.id), 1);
-    assert_eq!(count(&many.id), 2);
-    // default order is by name (Q2 default)
-    let names: Vec<&str> = listed.iter().map(|p| p.name.as_str()).collect();
-    assert_eq!(names, vec!["Empty", "Many", "One"]);
-}
-
-// ---------------------------------------------------------------------------
-// delete_project (removal guard)
-// ---------------------------------------------------------------------------
-
-#[tokio::test]
-async fn delete_project_succeeds_when_empty() {
-    let repo = SqliteRepository::connect_in_memory().await.unwrap();
-    let p = repo.create_project("Gone").await.unwrap();
-    repo.delete_project(&p.id).await.unwrap();
-    assert!(repo.list_projects().await.unwrap().iter().all(|x| x.id != p.id));
-}
-
-#[tokio::test]
-async fn delete_project_blocked_message_names_count() {
-    let repo = SqliteRepository::connect_in_memory().await.unwrap();
-    let p = repo.create_project("Busy").await.unwrap();
-    let i1 = repo.create(new_item(Kind::Task, "a", "")).await.unwrap();
-    repo.update(&i1.id, UpdateItem { project_id: Some(p.id.clone()), ..Default::default() })
-        .await
-        .unwrap();
-
-    // N=1: message must name the count (a leaked FK AppError::Db is also is_err()
-    // but violates the contract) — assert the enum AND the substring.
-    let err = repo.delete_project(&p.id).await.unwrap_err();
-    let AppError::Invalid(msg) = err else { panic!("expected Invalid, got {err:?}") };
-    assert!(msg.contains('1'), "message must name the count: {msg}");
-    assert!(!msg.contains("FOREIGN KEY"), "must not leak raw FK text: {msg}");
-
-    // N=2
-    let i2 = repo.create(new_item(Kind::Task, "b", "")).await.unwrap();
-    repo.update(&i2.id, UpdateItem { project_id: Some(p.id.clone()), ..Default::default() })
-        .await
-        .unwrap();
-    let err2 = repo.delete_project(&p.id).await.unwrap_err();
-    let AppError::Invalid(msg2) = err2 else { panic!("expected Invalid") };
-    assert!(msg2.contains('2'), "message must name the count: {msg2}");
-
-    // guard didn't partially apply: project still present
-    assert!(repo.list_projects().await.unwrap().iter().any(|x| x.id == p.id));
-}
-
-#[tokio::test]
-async fn delete_project_counts_archived_items() {
-    let repo = SqliteRepository::connect_in_memory().await.unwrap();
-    let p = repo.create_project("Arch").await.unwrap();
-    let i = repo.create(new_item(Kind::Task, "a", "")).await.unwrap();
-    repo.update(&i.id, UpdateItem { project_id: Some(p.id.clone()), ..Default::default() })
-        .await
-        .unwrap();
-    // archived items still reference the project → delete still blocked
-    repo.update(&i.id, UpdateItem { archived: Some(true), ..Default::default() })
-        .await
-        .unwrap();
-    assert!(matches!(repo.delete_project(&p.id).await, Err(AppError::Invalid(_))));
-}
-
-#[tokio::test]
-async fn delete_project_succeeds_after_unassign() {
-    let repo = SqliteRepository::connect_in_memory().await.unwrap();
-    let p = repo.create_project("Freed").await.unwrap();
-    let i = repo.create(new_item(Kind::Task, "a", "")).await.unwrap();
-    repo.update(&i.id, UpdateItem { project_id: Some(p.id.clone()), ..Default::default() })
-        .await
-        .unwrap();
-    assert!(repo.delete_project(&p.id).await.is_err());
-    // unassign (empty string clears) — proves the guard uses a live count
-    repo.update(&i.id, UpdateItem { project_id: Some(String::new()), ..Default::default() })
-        .await
-        .unwrap();
-    repo.delete_project(&p.id).await.unwrap();
-}
-
-#[tokio::test]
-async fn delete_project_nonexistent_is_not_found() {
-    let repo = SqliteRepository::connect_in_memory().await.unwrap();
-    let err = repo.delete_project("no-such-id").await.unwrap_err();
-    assert!(matches!(err, AppError::NotFound));
+    // omitting the required projectId is a deserialization error
+    assert!(serde_json::from_str::<NewItem>(r#"{"kind":"note","title":"x"}"#).is_err());
 }
 
 // ---------------------------------------------------------------------------
@@ -445,27 +264,16 @@ async fn active_tags_empty_and_no_items() {
 }
 
 // ---------------------------------------------------------------------------
-// Filters combine (AND across categories, OR within tags)
+// Filters combine (AND across categories, OR within tags). Project scoping is
+// no longer a per-store filter (the manager chooses which stores to query), so
+// these cover kind/status/tags only.
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn filter_project_and_status_alone() {
+async fn filter_status_alone_excludes_notes() {
     let repo = SqliteRepository::connect_in_memory().await.unwrap();
-    let proj = repo.create_project("P").await.unwrap();
     let task = repo.create(new_item(Kind::Task, "t", "")).await.unwrap();
-    repo.update(&task.id, UpdateItem { project_id: Some(proj.id.clone()), ..Default::default() })
-        .await
-        .unwrap();
     repo.create(new_item(Kind::Note, "n", "")).await.unwrap();
-
-    // project filter alone
-    let by_proj = repo
-        .list(&ListFilter { project_id: Some(proj.id.clone()), ..Default::default() })
-        .await
-        .unwrap();
-    assert_eq!(by_proj.len(), 1);
-    assert_eq!(by_proj[0].id, task.id);
-
     // status filter alone — a note (NULL status) must not match, no error
     let by_status = repo
         .list(&ListFilter { status: Some(Status::Todo), ..Default::default() })
@@ -520,35 +328,26 @@ async fn filter_tag_no_carrier_is_empty_not_error() {
 }
 
 #[tokio::test]
-async fn filter_project_status_tag_combined_is_anded() {
+async fn filter_status_and_tag_combined_is_anded() {
     let repo = SqliteRepository::connect_in_memory().await.unwrap();
-    let proj = repo.create_project("P").await.unwrap();
-    let other = repo.create_project("Other").await.unwrap();
-
-    // fully matching: proj + todo + tag "a"
+    // fully matching: todo + tag "a"
     let good = repo.create(item_with_tags(Kind::Task, "good", &["a"])).await.unwrap();
-    repo.update(&good.id, UpdateItem { project_id: Some(proj.id.clone()), status: Some(Status::Todo), ..Default::default() })
+    repo.update(&good.id, UpdateItem { status: Some(Status::Todo), ..Default::default() })
         .await
         .unwrap();
-    // right project + tag but wrong status
+    // right tag but wrong status
     let wrong_status = repo.create(item_with_tags(Kind::Task, "ws", &["a"])).await.unwrap();
-    repo.update(&wrong_status.id, UpdateItem { project_id: Some(proj.id.clone()), status: Some(Status::Doing), ..Default::default() })
+    repo.update(&wrong_status.id, UpdateItem { status: Some(Status::Doing), ..Default::default() })
         .await
         .unwrap();
-    // right status + tag but wrong project
-    let wrong_proj = repo.create(item_with_tags(Kind::Task, "wp", &["a"])).await.unwrap();
-    repo.update(&wrong_proj.id, UpdateItem { project_id: Some(other.id.clone()), status: Some(Status::Todo), ..Default::default() })
-        .await
-        .unwrap();
-    // right project + status but wrong tag
+    // right status but wrong tag
     let wrong_tag = repo.create(item_with_tags(Kind::Task, "wt", &["z"])).await.unwrap();
-    repo.update(&wrong_tag.id, UpdateItem { project_id: Some(proj.id.clone()), status: Some(Status::Todo), ..Default::default() })
+    repo.update(&wrong_tag.id, UpdateItem { status: Some(Status::Todo), ..Default::default() })
         .await
         .unwrap();
 
     let got = repo
         .list(&ListFilter {
-            project_id: Some(proj.id.clone()),
             status: Some(Status::Todo),
             tags: Some(vec!["a".into()]),
             ..Default::default()
@@ -562,17 +361,13 @@ async fn filter_project_status_tag_combined_is_anded() {
 #[tokio::test]
 async fn filter_archived_exclusion_holds_with_other_filters() {
     let repo = SqliteRepository::connect_in_memory().await.unwrap();
-    let proj = repo.create_project("P").await.unwrap();
     let a = repo.create(item_with_tags(Kind::Task, "a", &["t"])).await.unwrap();
-    repo.update(&a.id, UpdateItem { project_id: Some(proj.id.clone()), ..Default::default() })
-        .await
-        .unwrap();
     repo.update(&a.id, UpdateItem { archived: Some(true), ..Default::default() })
         .await
         .unwrap();
-    // default (archived false) + project filter → excluded
+    // default (archived false) + tag filter → excluded
     let got = repo
-        .list(&ListFilter { project_id: Some(proj.id.clone()), tags: Some(vec!["t".into()]), ..Default::default() })
+        .list(&ListFilter { tags: Some(vec!["t".into()]), ..Default::default() })
         .await
         .unwrap();
     assert!(got.is_empty());
@@ -589,6 +384,16 @@ async fn sort_updated_is_default() {
     let b = repo.create(new_item(Kind::Note, "b", "")).await.unwrap();
     // edit a → it becomes most recently updated
     repo.update(&a.id, UpdateItem { body: Some("edited".into()), ..Default::default() })
+        .await
+        .unwrap();
+    // Pin explicit, distinct timestamps so a same-millisecond tie between the
+    // rapid create/update calls can't flip the order under the (created_at, id)
+    // tiebreak — this retires the documented flake (memory: flaky-sort-updated).
+    // a is edited last, so its updated_at is the newest; b stays oldest.
+    repo.set_timestamps_for_test(&a.id, "2026-07-14T00:00:00.000+00:00", "2026-07-14T00:00:02.000+00:00")
+        .await
+        .unwrap();
+    repo.set_timestamps_for_test(&b.id, "2026-07-14T00:00:01.000+00:00", "2026-07-14T00:00:01.000+00:00")
         .await
         .unwrap();
     let default_order = repo.list(&ListFilter::default()).await.unwrap();
@@ -683,22 +488,31 @@ async fn sort_pinned_supremacy_under_priority_and_status() {
 }
 
 #[tokio::test]
-async fn sort_rowid_tiebreak_is_stable() {
-    // Depends on the test-support timestamp seam: force equal timestamps so the
-    // rowid DESC tiebreak is the only differentiator.
+async fn sort_equal_timestamps_tiebreak_by_id_asc() {
+    // The tiebreak is (created_at DESC, id ASC), NOT rowid — rowids collide
+    // across per-project files and are reassigned on index rebuild, so they
+    // cannot order a merged multi-store set. Force equal timestamps and known
+    // ids so `id ASC` is the sole differentiator, and assert the order is
+    // stable across repeated calls (never flaps). Replaces the retired
+    // sort_rowid_tiebreak_is_stable test.
     let repo = SqliteRepository::connect_in_memory().await.unwrap();
     let a = repo.create(new_item(Kind::Note, "a", "")).await.unwrap();
     let b = repo.create(new_item(Kind::Note, "b", "")).await.unwrap();
-    let ts = "2026-07-14T00:00:00+00:00";
+    let ts = "2026-07-14T00:00:00.000+00:00";
     repo.set_timestamps_for_test(&a.id, ts, ts).await.unwrap();
     repo.set_timestamps_for_test(&b.id, ts, ts).await.unwrap();
+    // Force ids so "id-1" < "id-2" lexically, independent of the minted UUIDs
+    // and of insertion order (b, the later insert, gets the SMALLER id).
+    repo.set_id_for_test(&a.id, "id-2").await.unwrap();
+    repo.set_id_for_test(&b.id, "id-1").await.unwrap();
 
-    // b was inserted after a → higher rowid → first under rowid DESC. Stable
-    // across repeated calls (never flaps).
+    // Equal timestamps → id ASC decides: "id-1" (was b) leads "id-2" (was a).
+    // rowid DESC would have put b first for a different reason; this proves the
+    // ordering follows id, not insertion.
     for _ in 0..3 {
         let order: Vec<String> =
             repo.list(&ListFilter::default()).await.unwrap().into_iter().map(|i| i.id).collect();
-        assert_eq!(order, vec![b.id.clone(), a.id.clone()]);
+        assert_eq!(order, vec!["id-1".to_string(), "id-2".to_string()]);
     }
 }
 
@@ -708,8 +522,6 @@ async fn minted_timestamps_have_fixed_fractional_precision() {
     // timestamps can differ in digit width and sort wrong lexically (a hazard
     // masked today only by the rowid tiebreak). The producer pins to exactly
     // three fractional digits; assert that so lexical == chronological order.
-    // Red against the old `chrono::Utc::now().to_rfc3339()` producer, which emits
-    // microsecond (or zero) precision.
     let repo = SqliteRepository::connect_in_memory().await.unwrap();
     let item = repo.create(new_item(Kind::Note, "a", "")).await.unwrap();
     let frac: String = item
@@ -723,31 +535,23 @@ async fn minted_timestamps_have_fixed_fractional_precision() {
     assert_eq!(frac.len(), 3, "expected fixed ms precision, got {}", item.created_at);
 }
 
+#[tokio::test]
+async fn application_id_matches_const() {
+    // The 0005_meta.sql migration stamps PRAGMA application_id; it MUST equal
+    // the single-source-of-truth Rust const, because foreign-DB rejection
+    // (Section 4.3) compares an opened file's header against that const.
+    // connect_in_memory runs the same migration set a real store does.
+    let repo = SqliteRepository::connect_in_memory().await.unwrap();
+    assert_eq!(
+        repo.application_id_for_test().await.unwrap(),
+        notes_app_lib::db::WORKNOTES_APPLICATION_ID,
+        "migration application_id literal must equal db::WORKNOTES_APPLICATION_ID"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // search() post-filters (D1 signature)
 // ---------------------------------------------------------------------------
-
-#[tokio::test]
-async fn search_respects_project_filter() {
-    let repo = SqliteRepository::connect_in_memory().await.unwrap();
-    let p1 = repo.create_project("P1").await.unwrap();
-    let p2 = repo.create_project("P2").await.unwrap();
-    let a = repo.create(new_item(Kind::Note, "shared keyword one", "")).await.unwrap();
-    let b = repo.create(new_item(Kind::Note, "shared keyword two", "")).await.unwrap();
-    repo.update(&a.id, UpdateItem { project_id: Some(p1.id.clone()), ..Default::default() })
-        .await
-        .unwrap();
-    repo.update(&b.id, UpdateItem { project_id: Some(p2.id.clone()), ..Default::default() })
-        .await
-        .unwrap();
-
-    let hits = repo
-        .search("keyword", &ListFilter { project_id: Some(p1.id.clone()), ..Default::default() })
-        .await
-        .unwrap();
-    assert_eq!(hits.len(), 1);
-    assert_eq!(hits[0].id, a.id);
-}
 
 #[tokio::test]
 async fn search_combines_tag_filter() {
@@ -781,59 +585,49 @@ async fn search_forces_archived_exclusion_ignoring_filter() {
 #[tokio::test]
 async fn search_empty_query_falls_back_to_list_with_filter() {
     let repo = SqliteRepository::connect_in_memory().await.unwrap();
-    let proj = repo.create_project("P").await.unwrap();
-    let a = repo.create(new_item(Kind::Note, "a", "")).await.unwrap();
-    repo.update(&a.id, UpdateItem { project_id: Some(proj.id.clone()), ..Default::default() })
-        .await
-        .unwrap();
-    repo.create(new_item(Kind::Note, "b", "")).await.unwrap();
-    // empty query + active filter → list(filter) honors the filter
+    repo.create(new_item(Kind::Task, "a task", "")).await.unwrap();
+    repo.create(new_item(Kind::Note, "a note", "")).await.unwrap();
+    // empty query + active (kind) filter → list(filter) honors the filter
     let hits = repo
-        .search("   ", &ListFilter { project_id: Some(proj.id.clone()), ..Default::default() })
+        .search("   ", &ListFilter { kind: Some(Kind::Task), ..Default::default() })
         .await
         .unwrap();
     assert_eq!(hits.len(), 1);
-    assert_eq!(hits[0].id, a.id);
+    assert_eq!(hits[0].title, "a task");
 }
 
 // ---------------------------------------------------------------------------
-// jira_url + project_id semantics
+// jira_url semantics (project_id is no longer a persisted per-item field)
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn fields_set_on_create_persist() {
+async fn jira_url_set_on_create_persists() {
     let repo = SqliteRepository::connect_in_memory().await.unwrap();
-    let p = repo.create_project("P").await.unwrap();
     let input = NewItem {
-        project_id: Some(p.id.clone()),
         jira_url: Some("https://jira.example.com/ABC-1".into()),
         ..new_item(Kind::Task, "t", "")
     };
     let created = repo.create(input).await.unwrap();
-    assert_eq!(created.project_id, Some(p.id.clone()));
     assert_eq!(created.jira_url.as_deref(), Some("https://jira.example.com/ABC-1"));
-    // round-trips through storage
+    // never persisted in-store
+    assert_eq!(created.project_id, None);
     let fetched = repo.get(&created.id).await.unwrap();
-    assert_eq!(fetched.project_id, Some(p.id));
     assert_eq!(fetched.jira_url.as_deref(), Some("https://jira.example.com/ABC-1"));
 }
 
 #[tokio::test]
-async fn fields_apply_to_notes_too() {
-    // Phase 1 breaks the "notes are metadata-light" pattern: notes carry
-    // project_id + jira_url. Pin this so a future copy-paste guard can't block it.
+async fn jira_url_applies_to_notes_too() {
+    // Notes carry jira_url (the "notes are metadata-light" pattern is broken for
+    // jira_url); pin this so a future copy-paste guard can't block it.
     let repo = SqliteRepository::connect_in_memory().await.unwrap();
-    let p = repo.create_project("P").await.unwrap();
     let note = repo.create(new_item(Kind::Note, "n", "")).await.unwrap();
     let updated = repo
         .update(&note.id, UpdateItem {
-            project_id: Some(p.id.clone()),
             jira_url: Some("https://jira.example.com/N-1".into()),
             ..Default::default()
         })
         .await
         .unwrap();
-    assert_eq!(updated.project_id, Some(p.id));
     assert_eq!(updated.jira_url.as_deref(), Some("https://jira.example.com/N-1"));
     // still a note: no status/priority
     assert_eq!(updated.status, None);
@@ -841,90 +635,54 @@ async fn fields_apply_to_notes_too() {
 }
 
 #[tokio::test]
-async fn fields_clear_via_empty_string() {
+async fn jira_url_clears_via_empty_string() {
     let repo = SqliteRepository::connect_in_memory().await.unwrap();
-    let p = repo.create_project("P").await.unwrap();
     let item = repo
-        .create(NewItem { project_id: Some(p.id.clone()), jira_url: Some("https://x/Y-1".into()), ..new_item(Kind::Task, "t", "") })
+        .create(NewItem { jira_url: Some("https://x/Y-1".into()), ..new_item(Kind::Task, "t", "") })
         .await
         .unwrap();
     let cleared = repo
-        .update(&item.id, UpdateItem { project_id: Some(String::new()), jira_url: Some(String::new()), ..Default::default() })
+        .update(&item.id, UpdateItem { jira_url: Some(String::new()), ..Default::default() })
         .await
         .unwrap();
-    assert_eq!(cleared.project_id, None);
     assert_eq!(cleared.jira_url, None);
 }
 
 #[tokio::test]
-async fn fields_omitted_are_unchanged() {
+async fn jira_url_omitted_is_unchanged() {
     let repo = SqliteRepository::connect_in_memory().await.unwrap();
-    let p = repo.create_project("P").await.unwrap();
     let item = repo
-        .create(NewItem { project_id: Some(p.id.clone()), jira_url: Some("https://x/Y-1".into()), ..new_item(Kind::Task, "t", "") })
+        .create(NewItem { jira_url: Some("https://x/Y-1".into()), ..new_item(Kind::Task, "t", "") })
         .await
         .unwrap();
-    // send an unrelated title patch; both fields must survive
+    // send an unrelated title patch; jira_url must survive
     let after = repo
         .update(&item.id, UpdateItem { title: Some("renamed".into()), ..Default::default() })
         .await
         .unwrap();
-    assert_eq!(after.project_id, Some(p.id));
     assert_eq!(after.jira_url.as_deref(), Some("https://x/Y-1"));
 }
 
 #[tokio::test]
-async fn fields_bump_updated_at() {
+async fn jira_url_change_bumps_updated_at() {
     let repo = SqliteRepository::connect_in_memory().await.unwrap();
-    let p = repo.create_project("P").await.unwrap();
     let item = repo.create(new_item(Kind::Task, "t", "")).await.unwrap();
-    // freeze timestamps to an old value so any bump is detectable
     let old = "2000-01-01T00:00:00+00:00";
     repo.set_timestamps_for_test(&item.id, old, old).await.unwrap();
-
     let a = repo
         .update(&item.id, UpdateItem { jira_url: Some("https://x/Y-1".into()), ..Default::default() })
         .await
         .unwrap();
     assert!(a.updated_at > old.to_string(), "setting jira_url bumps updated_at");
-
-    repo.set_timestamps_for_test(&item.id, old, old).await.unwrap();
-    let b = repo
-        .update(&item.id, UpdateItem { project_id: Some(p.id.clone()), ..Default::default() })
-        .await
-        .unwrap();
-    assert!(b.updated_at > old.to_string(), "setting project_id bumps updated_at");
 }
 
 #[tokio::test]
-async fn nonexistent_project_id_is_invalid_on_create_and_update() {
-    // D2a: assigning a project_id that doesn't exist → clean Invalid, NOT a
-    // leaked raw FOREIGN KEY constraint error.
+async fn pin_and_archive_do_not_bump_updated_at() {
+    // Non-bump regression: pin/archive flips must NOT move updated_at (the
+    // UPDATE column list must not start writing updated_at unconditionally).
     let repo = SqliteRepository::connect_in_memory().await.unwrap();
-    let err = repo
-        .create(NewItem { project_id: Some("ghost".into()), ..new_item(Kind::Task, "t", "") })
-        .await
-        .unwrap_err();
-    let AppError::Invalid(msg) = err else { panic!("expected Invalid, got {err:?}") };
-    assert!(!msg.contains("FOREIGN KEY"), "must not leak raw FK text: {msg}");
-
-    let item = repo.create(new_item(Kind::Task, "t2", "")).await.unwrap();
-    let err2 = repo
-        .update(&item.id, UpdateItem { project_id: Some("ghost".into()), ..Default::default() })
-        .await
-        .unwrap_err();
-    assert!(matches!(err2, AppError::Invalid(_)));
-}
-
-#[tokio::test]
-async fn pin_and_archive_do_not_bump_updated_at_with_new_fields() {
-    // Non-bump regression: after populating the new fields, pin/archive flips
-    // must NOT move updated_at (the extended UPDATE column list must not start
-    // writing updated_at unconditionally).
-    let repo = SqliteRepository::connect_in_memory().await.unwrap();
-    let p = repo.create_project("P").await.unwrap();
     let item = repo
-        .create(NewItem { project_id: Some(p.id.clone()), jira_url: Some("https://x/Y-1".into()), ..new_item(Kind::Task, "t", "") })
+        .create(NewItem { jira_url: Some("https://x/Y-1".into()), ..new_item(Kind::Task, "t", "") })
         .await
         .unwrap();
     let baseline = item.updated_at.clone();
@@ -1009,8 +767,7 @@ async fn jira_url_scheme_allowlist() {
 }
 
 // ---------------------------------------------------------------------------
-// due_at (Phase 4 Track 2 — capture/display is frontend-only; this locks down
-// the existing repository semantics)
+// due_at (task-only; capture/display is frontend-only)
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -1057,13 +814,11 @@ async fn due_at_omitted_patch_leaves_existing_value_unchanged() {
 #[tokio::test]
 async fn due_at_patch_on_a_note_is_silently_ignored() {
     // CLAUDE.md invariant: notes never carry dueAt — a patch attempting to set
-    // it must be silently ignored, not applied and not an error. The due_at
-    // block in `update()` is gated on `item.kind == Kind::Task`; this pins that
-    // gate for notes specifically (previously untested).
+    // it must be silently ignored (the due_at block in update() is gated on
+    // Kind::Task).
     let repo = SqliteRepository::connect_in_memory().await.unwrap();
     let note = repo.create(new_item(Kind::Note, "n", "")).await.unwrap();
     assert_eq!(note.due_at, None);
-
     let after = repo
         .update(&note.id, UpdateItem { due_at: Some("2026-07-20T00:00:00Z".into()), ..Default::default() })
         .await
@@ -1077,7 +832,6 @@ async fn due_at_change_on_task_bumps_updated_at() {
     let task = repo.create(new_item(Kind::Task, "t", "")).await.unwrap();
     let old = "2000-01-01T00:00:00+00:00";
     repo.set_timestamps_for_test(&task.id, old, old).await.unwrap();
-
     let updated = repo
         .update(&task.id, UpdateItem { due_at: Some("2026-07-20T00:00:00Z".into()), ..Default::default() })
         .await
@@ -1086,7 +840,7 @@ async fn due_at_change_on_task_bumps_updated_at() {
 }
 
 // ---------------------------------------------------------------------------
-// ListFilter / Project camelCase IPC shape
+// ListFilter camelCase IPC shape (projectId still selects which store to query)
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
@@ -1107,56 +861,4 @@ async fn list_filter_deserializes_camelcase() {
     assert!(empty.status.is_none());
     assert!(empty.tags.is_none());
     assert!(empty.sort.is_none());
-}
-
-#[tokio::test]
-async fn project_shapes_serialize_camelcase() {
-    let repo = SqliteRepository::connect_in_memory().await.unwrap();
-    let created: Project = repo.create_project("X").await.unwrap();
-    let json = serde_json::to_value(&created).unwrap();
-    assert!(json["id"].is_string());
-    assert_eq!(json["name"], "X");
-    assert!(json["createdAt"].is_string());
-
-    let listed: Vec<ProjectWithCount> = repo.list_projects().await.unwrap();
-    let with_count = listed.iter().find(|p| p.id == created.id).unwrap();
-    let json2 = serde_json::to_value(with_count).unwrap();
-    assert!(json2["id"].is_string());
-    assert_eq!(json2["name"], "X");
-    assert!(json2["createdAt"].is_string());
-    assert!(json2["itemCount"].is_number());
-    assert_eq!(json2["itemCount"], 0);
-}
-
-// ---------------------------------------------------------------------------
-// app_settings key/value store (Phase 4 Track 4 — backs the non-secret JIRA
-// config; secrets never live here)
-// ---------------------------------------------------------------------------
-
-#[tokio::test]
-async fn app_settings_round_trip_and_upsert() {
-    let repo = SqliteRepository::connect_in_memory().await.unwrap();
-
-    // absent key → None
-    assert_eq!(repo.get_setting("jira_config").await.unwrap(), None);
-
-    repo.set_setting("jira_config", "first").await.unwrap();
-    assert_eq!(
-        repo.get_setting("jira_config").await.unwrap().as_deref(),
-        Some("first")
-    );
-
-    // set again on the same key overwrites (upsert), not a PK violation
-    repo.set_setting("jira_config", "second").await.unwrap();
-    assert_eq!(
-        repo.get_setting("jira_config").await.unwrap().as_deref(),
-        Some("second")
-    );
-
-    // distinct keys are independent
-    repo.set_setting("other", "x").await.unwrap();
-    assert_eq!(
-        repo.get_setting("jira_config").await.unwrap().as_deref(),
-        Some("second")
-    );
 }

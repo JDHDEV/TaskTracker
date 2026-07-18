@@ -1,5 +1,6 @@
-import type { Item, Kind, ProjectWithCount, Sort, Status } from "../types";
+import type { Item, Kind, ProjectInfo, Sort, Status } from "../types";
 import { formatDueDate, isOverdue } from "../lib/dueDate";
+import { itemKey } from "../lib/projects";
 import TagFilter from "./TagFilter";
 
 export type KindFilter = "all" | Kind;
@@ -14,7 +15,7 @@ interface Props {
   projectFilter: string;
   statusFilter: StatusFilter;
   sort: Sort;
-  projects: ProjectWithCount[];
+  loaded: ProjectInfo[];
   activeTags: string[];
   onSelect: (id: string) => void;
   onKind: (kind: KindFilter) => void;
@@ -64,7 +65,7 @@ export default function ItemList({
   projectFilter,
   statusFilter,
   sort,
-  projects,
+  loaded,
   activeTags,
   onSelect,
   onKind,
@@ -76,13 +77,18 @@ export default function ItemList({
   onCreate,
 }: Props) {
   const now = new Date(); // one clock read per render; overdue is a same-day check
+  const canCreate = loaded.length > 0;
+  // Show a per-row project label only when more than one project is loaded —
+  // otherwise every row shares the same project and the label is just noise.
+  const showProjectLabels = loaded.length > 1;
+  const projectName = new Map(loaded.map((p) => [p.id, p.name]));
   return (
     <aside className="rail">
       <div className="rail-actions">
-        <button className="btn" onClick={() => onCreate("note")}>
+        <button className="btn" disabled={!canCreate} onClick={() => onCreate("note")}>
           New note
         </button>
-        <button className="btn" onClick={() => onCreate("task")}>
+        <button className="btn" disabled={!canCreate} onClick={() => onCreate("task")}>
           New task
         </button>
       </div>
@@ -122,7 +128,7 @@ export default function ItemList({
         onChange={(e) => onProjectFilter(e.target.value)}
       >
         <option value="">All projects</option>
-        {projects.map((p) => (
+        {loaded.map((p) => (
           <option key={p.id} value={p.id}>
             {p.name}
           </option>
@@ -159,17 +165,23 @@ export default function ItemList({
       <ul className="list">
         {items.length === 0 && (
           <li className="list-empty">
-            {search
-              ? "No matches. Try fewer words."
-              : "Nothing here yet — create your first note."}
+            {!canCreate
+              ? "No projects loaded — open or create one to start."
+              : search
+                ? "No matches. Try fewer words."
+                : "Nothing here yet — create your first note."}
           </li>
         )}
         {items.map((item) => {
           const released = item.kind === "task" && item.status === "done";
           // A finished task is never late; only tasks carry a due date.
           const overdue = !released && isOverdue(item.dueAt, now);
+          const project =
+            showProjectLabels && item.projectId
+              ? projectName.get(item.projectId)
+              : undefined;
           return (
-            <li key={item.id}>
+            <li key={itemKey(item)}>
               <button
                 className={item.id === selectedId ? "row row-on" : "row"}
                 onClick={() => onSelect(item.id)}
@@ -206,6 +218,7 @@ export default function ItemList({
                     {item.tags.map((t) => `#${t}`).join(" ")}
                   </span>
                 )}
+                {project && <span className="row-project">{project}</span>}
               </button>
             </li>
           );

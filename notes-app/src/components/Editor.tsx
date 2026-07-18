@@ -3,7 +3,7 @@ import type {
   Item,
   NewItem,
   Priority,
-  ProjectWithCount,
+  ProjectInfo,
   ProviderId,
   Status,
   UpdateItem,
@@ -20,10 +20,13 @@ import JiraRow from "./JiraRow";
 interface Props {
   item: Item;
   isDraft: boolean;
-  projects: ProjectWithCount[];
+  loaded: ProjectInfo[];
   activeTags: string[];
   onSave: (patch: UpdateItem) => Promise<boolean>;
   onCreate: (input: NewItem) => Promise<boolean>;
+  /** Draft only: report the chosen target project up so App's unload-eviction
+   *  check reflects the live selection (not just the value seeded at creation). */
+  onTargetChange?: (projectId: string) => void;
   onDuplicate: () => void;
   onArchive: (archived: boolean) => void;
   onPin: (pinned: boolean) => void;
@@ -37,10 +40,11 @@ const PRIORITIES: Priority[] = ["low", "normal", "high"];
 export default function Editor({
   item,
   isDraft,
-  projects,
+  loaded,
   activeTags,
   onSave,
   onCreate,
+  onTargetChange,
   onDuplicate,
   onArchive,
   onPin,
@@ -136,6 +140,12 @@ export default function Editor({
     savingRef.current = true;
     setSaving(true);
     try {
+      // A new draft must target a project store before it can be created (items
+      // are created INTO a project — this guard precedes any AI title call).
+      if (isDraft && !projectId) {
+        onError("Choose a project for this item before saving.");
+        return false;
+      }
       const effectiveBody = overrides?.body ?? body;
       const requestedTitle = overrides?.title ?? title;
       const needsGeneration = !requestedTitle.trim();
@@ -179,7 +189,7 @@ export default function Editor({
           priority: isTask ? priority : undefined,
           dueAt: isTask ? fromDateInputValue(dueAt) || undefined : undefined,
           tags,
-          projectId: projectId || undefined,
+          projectId, // the chosen target store (required; guarded above)
           jiraUrl: jiraUrl.trim() || undefined,
         };
         const created = await onCreate(input);
@@ -194,7 +204,7 @@ export default function Editor({
         // "" clears; a task-only field, so notes send undefined (unchanged).
         dueAt: isTask ? (dueAt ? fromDateInputValue(dueAt) : "") : undefined,
         tags,
-        projectId, // "" clears the assignment (D7 UpdateItem semantics)
+        // No projectId: items do not move between projects in v1.
         jiraUrl: jiraUrl.trim(), // "" clears
       });
       if (saved) setDirty(false); // a rejected save stays dirty → "Save", not "Saved"
@@ -419,19 +429,43 @@ export default function Editor({
             />
           </label>
         )}
-        <select
-          className="select"
-          value={projectId}
-          aria-label="Project"
-          onChange={(e) => edit(setProjectId)(e.target.value)}
-        >
-          <option value="">No project</option>
-          {projects.map((p) => (
-            <option key={p.id} value={p.id}>
-              {p.name}
+        {isDraft ? (
+          // A new item is created INTO a project; the target is required and
+          // chosen here (seeded from the rail filter when it names one).
+          <select
+            className="select"
+            value={projectId}
+            aria-label="Project"
+            onChange={(e) => {
+              edit(setProjectId)(e.target.value);
+              onTargetChange?.(e.target.value);
+            }}
+          >
+            <option value="" disabled>
+              Choose a project…
             </option>
-          ))}
-        </select>
+            {loaded.map((p) => (
+              <option key={p.id} value={p.id}>
+                {p.name}
+              </option>
+            ))}
+          </select>
+        ) : (
+          // Items do not move between projects in v1 — read-only indicator.
+          <select
+            className="select"
+            value={projectId}
+            aria-label="Project"
+            disabled
+            title="Items stay in the project they were created in"
+          >
+            {loaded.map((p) => (
+              <option key={p.id} value={p.id}>
+                {p.name}
+              </option>
+            ))}
+          </select>
+        )}
         <EditorTags
           tags={tags}
           activeTags={activeTags}
@@ -537,6 +571,7 @@ export default function Editor({
         busy={aiBusy}
         dirty={dirty}
         generatingTitle={generatingTitle}
+        saveBlocked={isDraft && !projectId}
         onRework={(i, p) => void rework(i, p)}
         onSave={() => void save()}
       />

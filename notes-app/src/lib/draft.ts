@@ -8,8 +8,10 @@ import type { Item, Kind } from "../types";
 
 const EMPTY_TIMESTAMP = "";
 
-/** A blank draft of the given kind. Tasks start todo/normal; notes carry neither. */
-export function newDraft(kind: Kind): Item {
+/** A blank draft of the given kind, targeting `projectId` (the project it will
+ *  be created into — "" when the rail filter is "All projects", so the editor
+ *  must ask for a target before Save). Tasks start todo/normal; notes neither. */
+export function newDraft(kind: Kind, projectId: string = ""): Item {
   return {
     id: "",
     kind,
@@ -23,7 +25,7 @@ export function newDraft(kind: Kind): Item {
     updatedAt: EMPTY_TIMESTAMP,
     archived: false,
     pinned: false,
-    projectId: null,
+    projectId: projectId || null,
     jiraUrl: null,
   };
 }

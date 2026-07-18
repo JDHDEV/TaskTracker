@@ -1,4 +1,4 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use sqlx::sqlite::{Sqlite, SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions};
@@ -6,9 +6,8 @@ use sqlx::types::Json;
 use sqlx::QueryBuilder;
 
 use crate::error::{AppError, Result};
-use crate::models::{
-    Item, Kind, ListFilter, NewItem, Priority, Project, ProjectWithCount, Sort, Status, UpdateItem,
-};
+use crate::models::{Item, Kind, ListFilter, NewItem, Priority, Sort, Status, UpdateItem};
+use crate::store::itemfile;
 
 use super::ItemRepository;
 
@@ -17,32 +16,43 @@ use super::ItemRepository;
 /// equals chronological order when precision is pinned — a latent hazard masked
 /// today by the `rowid` tiebreak (K10). Every timestamp minted here uses the
 /// same width, keeping same-second items lexically comparable.
-fn now_rfc3339() -> String {
+pub(crate) fn now_rfc3339() -> String {
     chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, false)
 }
 
+/// Largest project DB we will open. A DoS guard: `quick_check` reads every
+/// page, so an attacker-supplied multi-gigabyte file must be rejected on size
+/// before it is touched. Generous for a personal notes store.
+const MAX_PROJECT_DB_BYTES: u64 = 512 * 1024 * 1024;
+
+/// The tables a valid, fully-migrated worknotes project DB may contain.
+/// `open_existing` refuses any table outside this set (FTS5 shadow tables
+/// `items_fts*` and `sqlite_*` internals are allowed by prefix).
+const KNOWN_TABLES: &[&str] = &[
+    "items",
+    "projects",
+    "app_settings",
+    "meta",
+    "_sqlx_migrations",
+    "items_fts",
+];
+
+/// The only triggers a worknotes project DB may contain (the FTS sync triggers).
+const KNOWN_TRIGGERS: &[&str] = &["items_after_insert", "items_after_delete", "items_after_update"];
+
+#[derive(Debug)]
 pub struct SqliteRepository {
     pool: SqlitePool,
+    /// When set (a Stage-2 loaded project), every write is mirrored into a
+    /// canonical `<items_dir>/<id>.md` file BEFORE the index row is touched, so
+    /// the git-tracked files are the source of truth and a crash leaves the file
+    /// (rebuilt into the index on next load), never an index row with no file.
+    /// `None` for the in-memory test repo, the legacy-migration copy path, and
+    /// raw stores opened for hardening checks — those are index-only.
+    items_dir: Option<PathBuf>,
 }
 
 impl SqliteRepository {
-    /// Open (or create) the database file and bring the schema up to date.
-    pub async fn connect(db_path: &Path) -> Result<Self> {
-        let options = SqliteConnectOptions::new()
-            .filename(db_path)
-            .create_if_missing(true)
-            .journal_mode(SqliteJournalMode::Wal)
-            .foreign_keys(true);
-
-        let pool = SqlitePoolOptions::new()
-            .max_connections(4)
-            .connect_with(options)
-            .await?;
-
-        sqlx::migrate!("./migrations").run(&pool).await?;
-        Ok(Self { pool })
-    }
-
     /// In-memory database for tests. One connection only: every `:memory:`
     /// connection is its own database, so a pool of them would be N empty DBs.
     pub async fn connect_in_memory() -> Result<Self> {
@@ -53,7 +63,205 @@ impl SqliteRepository {
             .connect_with(options)
             .await?;
         sqlx::migrate!("./migrations").run(&pool).await?;
-        Ok(Self { pool })
+        Ok(Self { pool, items_dir: None })
+    }
+
+    /// Attach a canonical items directory so subsequent writes mirror to files
+    /// (Stage 2). The manager calls this after opening/creating the index and
+    /// before boxing the store to `dyn ItemRepository`. Consuming builder so the
+    /// wrapped `Arc` stays immutable.
+    pub(crate) fn with_items_dir(mut self, items_dir: PathBuf) -> Self {
+        self.items_dir = Some(items_dir);
+        self
+    }
+
+    /// Create a brand-new project DB at `path` and stamp its identity into
+    /// `meta`. The file-CREATION primitive split out from open (Section 4.2):
+    /// it refuses — never truncates or adopts — if a file already exists there.
+    /// WAL sidecars spawn beside `path`, so callers must pass a path inside an
+    /// already-validated project directory.
+    pub async fn create_at(path: &Path, project_id: &str, project_name: &str) -> Result<Self> {
+        if path.exists() {
+            return Err(AppError::Invalid(
+                "a project already exists in that folder".into(),
+            ));
+        }
+        let options = SqliteConnectOptions::new()
+            .filename(path)
+            .create_if_missing(true)
+            .journal_mode(SqliteJournalMode::Wal)
+            .foreign_keys(true);
+        let pool = SqlitePoolOptions::new()
+            .max_connections(4)
+            .connect_with(options)
+            .await
+            .map_err(scrub_open_error)?;
+        sqlx::migrate!("./migrations")
+            .run(&pool)
+            .await
+            .map_err(scrub_migrate_error)?;
+
+        // Stamp identity. schema_version = highest applied migration (read back,
+        // so it stays correct as migrations are added) — informational; foreign
+        // and newer-version detection use application_id + the sqlx migrator. All
+        // four rows commit together so a crash mid-stamp can't leave a
+        // half-identified store that later reads as foreign.
+        let schema_version: i64 =
+            sqlx::query_scalar("SELECT COALESCE(MAX(version), 0) FROM _sqlx_migrations")
+                .fetch_one(&pool)
+                .await
+                .map_err(scrub_open_error)?;
+        let mut tx = pool.begin().await.map_err(scrub_open_error)?;
+        for (key, value) in [
+            ("project_id", project_id.to_string()),
+            ("project_name", project_name.to_string()),
+            ("schema_version", schema_version.to_string()),
+            ("created_at", now_rfc3339()),
+        ] {
+            sqlx::query("INSERT INTO meta (key, value) VALUES (?1, ?2)")
+                .bind(key)
+                .bind(value)
+                .execute(&mut *tx)
+                .await
+                .map_err(scrub_open_error)?;
+        }
+        tx.commit().await.map_err(scrub_open_error)?;
+        Ok(Self { pool, items_dir: None })
+    }
+
+    /// Open an EXISTING project DB, treating the file as untrusted input (it may
+    /// arrive via a shared folder or git clone). Never creates. Before running
+    /// any migration (Section 4.3): enforce a size cap, verify the worknotes
+    /// `application_id`, run `quick_check`, and refuse any unknown trigger /
+    /// view / table — all with `trusted_schema=OFF` and extension loading off
+    /// (sqlx default). Only then migrate; a DB from a NEWER app version surfaces
+    /// a clean message rather than a raw sqlx error.
+    pub async fn open_existing(path: &Path) -> Result<Self> {
+        if !path.exists() {
+            return Err(AppError::Invalid("no project found in that folder".into()));
+        }
+        let len = std::fs::metadata(path)
+            .map_err(|_| AppError::Invalid("could not read that project file".into()))?
+            .len();
+        if len > MAX_PROJECT_DB_BYTES {
+            return Err(AppError::Invalid(
+                "that project file is too large to open".into(),
+            ));
+        }
+
+        let options = SqliteConnectOptions::new()
+            .filename(path)
+            .create_if_missing(false)
+            .journal_mode(SqliteJournalMode::Wal)
+            .foreign_keys(true)
+            .pragma("trusted_schema", "OFF");
+        let pool = SqlitePoolOptions::new()
+            .max_connections(4)
+            .connect_with(options)
+            .await
+            .map_err(scrub_open_error)?;
+
+        // --- Untrusted-input hardening, ALL before migrations ---
+        // application_id: reject any file not stamped as a worknotes store. A
+        // non-SQLite file typically fails this first query with "file is not a
+        // database" — scrubbed to the same clean rejection.
+        let app_id = sqlx::query_scalar::<_, i32>("PRAGMA application_id")
+            .fetch_one(&pool)
+            .await
+            .map_err(|_| foreign_db_error())?;
+        if app_id != super::WORKNOTES_APPLICATION_ID {
+            return Err(foreign_db_error());
+        }
+        // quick_check: reject a corrupt file before migrations touch it.
+        let check: String = sqlx::query_scalar("PRAGMA quick_check")
+            .fetch_one(&pool)
+            .await
+            .map_err(|_| AppError::Invalid("that project file is corrupt".into()))?;
+        if check != "ok" {
+            return Err(AppError::Invalid("that project file is corrupt".into()));
+        }
+        // sqlite_master allowlist: refuse unexpected schema objects. FTS5 shadow
+        // tables (items_fts*) and sqlite internals are allowed by prefix;
+        // indexes are allowed because trusted_schema=OFF neutralizes any
+        // schema-defined function they might reference.
+        let objects = sqlx::query_as::<_, (String, String)>("SELECT type, name FROM sqlite_master")
+            .fetch_all(&pool)
+            .await
+            .map_err(|_| foreign_db_error())?;
+        for (kind, name) in &objects {
+            let allowed = match kind.as_str() {
+                "table" => {
+                    KNOWN_TABLES.contains(&name.as_str())
+                        || name.starts_with("items_fts")
+                        || name.starts_with("sqlite_")
+                }
+                "trigger" => KNOWN_TRIGGERS.contains(&name.as_str()),
+                "index" => true,
+                _ => false, // views (worknotes has none) and anything unknown
+            };
+            if !allowed {
+                return Err(foreign_db_error());
+            }
+        }
+
+        // Only now migrate. A newer-version DB fails here → clean message.
+        sqlx::migrate!("./migrations")
+            .run(&pool)
+            .await
+            .map_err(scrub_migrate_error)?;
+        Ok(Self { pool, items_dir: None })
+    }
+
+    /// Read the `(project_id, project_name)` the store was stamped with at
+    /// creation. The manager calls this right after `open_existing` (before
+    /// boxing to `dyn ItemRepository`) to reconcile the catalog by UUID. A
+    /// worknotes-shaped file with no identity rows is refused as foreign.
+    pub async fn read_meta(&self) -> Result<(String, String)> {
+        match (
+            self.meta_value("project_id").await?,
+            self.meta_value("project_name").await?,
+        ) {
+            (Some(id), Some(name)) => Ok((id, name)),
+            _ => Err(foreign_db_error()),
+        }
+    }
+
+    async fn meta_value(&self, key: &str) -> Result<Option<String>> {
+        let value = sqlx::query_scalar::<_, String>("SELECT value FROM meta WHERE key = ?1")
+            .bind(key)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(scrub_open_error)?;
+        Ok(value)
+    }
+
+    /// Legacy-migration only: copy an existing row into THIS store with its id
+    /// and timestamps intact (unlike `create`, which mints fresh ones).
+    /// `project_id` is forced NULL per Decision 4 — an item's owner is the store
+    /// it lives in. The FTS index syncs via the same triggers as any insert.
+    pub(crate) async fn insert_item_verbatim(&self, item: &Item) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO items \
+             (id, kind, title, body, status, priority, due_at, tags, \
+              created_at, updated_at, archived, pinned, project_id, jira_url) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, NULL, ?13)",
+        )
+        .bind(&item.id)
+        .bind(item.kind)
+        .bind(&item.title)
+        .bind(&item.body)
+        .bind(item.status)
+        .bind(item.priority)
+        .bind(&item.due_at)
+        .bind(&item.tags)
+        .bind(&item.created_at)
+        .bind(&item.updated_at)
+        .bind(item.archived)
+        .bind(item.pinned)
+        .bind(&item.jira_url)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
     async fn fetch(&self, id: &str) -> Result<Item> {
@@ -64,18 +272,69 @@ impl SqliteRepository {
             .ok_or(AppError::NotFound)
     }
 
-    /// Reject a `project_id` that names no existing project with a clean
-    /// `Invalid`, so the raw `FOREIGN KEY constraint failed` DB text never
-    /// leaks past the trait (D2a).
-    async fn ensure_project_exists(&self, project_id: &str) -> Result<()> {
-        let found = sqlx::query_scalar::<_, i64>("SELECT 1 FROM projects WHERE id = ?1")
-            .bind(project_id)
-            .fetch_optional(&self.pool)
+    /// Every row in the index, archived included, ordered deterministically —
+    /// used by the Stage-1→Stage-2 export to write one canonical file per item.
+    pub(crate) async fn all_items(&self) -> Result<Vec<Item>> {
+        let items = sqlx::query_as::<_, Item>("SELECT * FROM items ORDER BY created_at, id")
+            .fetch_all(&self.pool)
             .await?;
-        if found.is_none() {
-            return Err(AppError::Invalid("no such project".into()));
+        Ok(items)
+    }
+
+    /// Rebuild the index from the canonical files (Stage 2 "scan-then-rebuild"):
+    /// clear `items`, re-insert every file that parses, then rebuild the FTS
+    /// index — all in one transaction, so a mid-rebuild failure leaves the prior
+    /// index intact. Files are the source of truth, so anything on disk wins over
+    /// whatever the index held. Returns a `(filename: reason)` warning per file
+    /// that could not be imported (malformed / conflict markers / oversized /
+    /// duplicate id) — partial success, never an abort (plan.6 step 18).
+    pub(crate) async fn rebuild_from_dir(&self, items_dir: &Path) -> Result<Vec<String>> {
+        let outcome = itemfile::scan(items_dir);
+        let mut warnings: Vec<String> =
+            outcome.errors.iter().map(|(name, e)| format!("{name}: {e}")).collect();
+
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("DELETE FROM items").execute(&mut *tx).await?;
+
+        let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for item in &outcome.items {
+            // A duplicate id can only arise from a copied file (same id, new
+            // path); keep the first and report the rest rather than colliding on
+            // the primary key and poisoning the transaction.
+            if !seen.insert(item.id.as_str()) {
+                warnings.push(format!("{}.md: duplicate item id, skipped", item.id));
+                continue;
+            }
+            sqlx::query(
+                "INSERT INTO items \
+                 (id, kind, title, body, status, priority, due_at, tags, \
+                  created_at, updated_at, archived, pinned, project_id, jira_url) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, NULL, ?13)",
+            )
+            .bind(&item.id)
+            .bind(item.kind)
+            .bind(&item.title)
+            .bind(&item.body)
+            .bind(item.status)
+            .bind(item.priority)
+            .bind(&item.due_at)
+            .bind(&item.tags)
+            .bind(&item.created_at)
+            .bind(&item.updated_at)
+            .bind(item.archived)
+            .bind(item.pinned)
+            .bind(&item.jira_url)
+            .execute(&mut *tx)
+            .await?;
         }
-        Ok(())
+        // External-content FTS: the triggers already synced each row above; the
+        // explicit rebuild recomputes the whole index from `items` so any prior
+        // drift (e.g. a stale sidecar) is repaired too.
+        sqlx::query("INSERT INTO items_fts(items_fts) VALUES('rebuild')")
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(warnings)
     }
 }
 
@@ -99,20 +358,41 @@ impl SqliteRepository {
             .await?;
         Ok(())
     }
+
+    /// Force an item's id (mirrors `set_timestamps_for_test`) so the manager's
+    /// cross-store id-collision behavior can be tested deterministically — two
+    /// stores each holding an item with the same forced id. Changing `id` does
+    /// not touch `rowid`, so the external-content FTS index stays consistent.
+    pub async fn set_id_for_test(&self, old_id: &str, new_id: &str) -> Result<()> {
+        sqlx::query("UPDATE items SET id = ?1 WHERE id = ?2")
+            .bind(new_id)
+            .bind(old_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Read back the DB header's `application_id`, so a test can assert the
+    /// migration's stamped literal equals `db::WORKNOTES_APPLICATION_ID`.
+    pub async fn application_id_for_test(&self) -> Result<i32> {
+        let id = sqlx::query_scalar::<_, i32>("PRAGMA application_id")
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(id)
+    }
 }
 
-/// Append the shared `list`/`search` filter predicates (kind, project, status,
+/// Append the shared `list`/`search` filter predicates (kind, status,
 /// OR-matched tags) to a query whose WHERE clause is already open. Deliberately
 /// does NOT emit the `archived` predicate — `list()` honors `filter.archived`
 /// while `search()` hardcodes `archived = 0` (D5a), so each caller supplies its
-/// own. Every value is bound; the tag clause is skipped when the list is empty
-/// to avoid the `IN ()` syntax error (D4).
+/// own. `filter.project_id` is NOT a predicate here: a whole store is one
+/// project, so project scoping is the manager choosing which stores to query.
+/// Every value is bound; the tag clause is skipped when the list is empty to
+/// avoid the `IN ()` syntax error (D4).
 fn push_filters(qb: &mut QueryBuilder<'_, Sqlite>, filter: &ListFilter) {
     if let Some(kind) = filter.kind {
         qb.push(" AND i.kind = ").push_bind(kind);
-    }
-    if let Some(project_id) = &filter.project_id {
-        qb.push(" AND i.project_id = ").push_bind(project_id.clone());
     }
     if let Some(status) = filter.status {
         qb.push(" AND i.status = ").push_bind(status);
@@ -131,8 +411,15 @@ fn push_filters(qb: &mut QueryBuilder<'_, Sqlite>, filter: &ListFilter) {
 
 /// Append the `ORDER BY` for the list sort mode. Sort keys are static SQL
 /// literals chosen by a `match` on the closed `Sort` enum — never user text.
-/// Frame: `pinned DESC` first, `rowid DESC` last; Priority/Status bucket notes
-/// (NULL metric) last before the metric CASE.
+/// Frame: `pinned DESC` first, then `(created_at DESC, id ASC)` last;
+/// Priority/Status bucket notes (NULL metric) last before the metric CASE.
+///
+/// The final tiebreak is `created_at DESC, id ASC`, NOT `rowid DESC`: rowids
+/// collide across per-project files and are reassigned on any future index
+/// rebuild, so they cannot order a merged multi-store set. `created_at` is
+/// minted at fixed millisecond precision and `id` is a UUID, giving a
+/// deterministic, machine-independent total order that the Rust k-way merge
+/// comparator reproduces exactly.
 fn push_sort(qb: &mut QueryBuilder<'_, Sqlite>, sort: Sort) {
     qb.push(" ORDER BY i.pinned DESC");
     match sort {
@@ -157,7 +444,7 @@ fn push_sort(qb: &mut QueryBuilder<'_, Sqlite>, sort: Sort) {
             );
         }
     }
-    qb.push(", i.rowid DESC");
+    qb.push(", i.created_at DESC, i.id ASC");
 }
 
 #[async_trait::async_trait]
@@ -167,8 +454,8 @@ impl ItemRepository for SqliteRepository {
         let mut qb = QueryBuilder::new("SELECT i.* FROM items i WHERE i.archived = ");
         qb.push_bind(filter.archived.unwrap_or(false));
         push_filters(&mut qb, filter);
-        // rowid tiebreak: two saves in the same instant can produce equal
-        // timestamps, and order must never depend on a coin flip.
+        // (created_at, id) tiebreak: two saves in the same instant can produce
+        // equal timestamps, and order must never depend on a coin flip.
         push_sort(&mut qb, filter.sort.unwrap_or(Sort::Updated));
 
         let items = qb.build_query_as::<Item>().fetch_all(&self.pool).await?;
@@ -185,14 +472,12 @@ impl ItemRepository for SqliteRepository {
             return Err(AppError::Invalid("title must not be empty".into()));
         }
 
-        // Empty string clears (→ NULL); project_id/jira_url apply to both kinds.
-        let project_id = input.project_id.filter(|s| !s.is_empty());
+        // Empty string clears jira_url (→ NULL). project_id is NOT persisted:
+        // `input.project_id` is the manager's routing key, and per-store rows
+        // always store NULL (Decision 4) — the manager stamps the owning UUID.
         let jira_url = input.jira_url.filter(|s| !s.is_empty());
         if let Some(url) = &jira_url {
             validate_jira_url(url)?;
-        }
-        if let Some(pid) = &project_id {
-            self.ensure_project_exists(pid).await?;
         }
 
         let now = now_rfc3339();
@@ -216,9 +501,16 @@ impl ItemRepository for SqliteRepository {
             updated_at: now,
             archived: false,
             pinned: false,
-            project_id,
+            // Always NULL in-store; the manager stamps the owning project UUID.
+            project_id: None,
             jira_url,
         };
+
+        // File-then-index (Stage 2): the canonical file is written before the
+        // index row, so the git-tracked store is the source of truth.
+        if let Some(dir) = &self.items_dir {
+            itemfile::write_item(dir, &item).map_err(save_file_error)?;
+        }
 
         sqlx::query(
             "INSERT INTO items \
@@ -241,8 +533,7 @@ impl ItemRepository for SqliteRepository {
         .bind(&item.project_id)
         .bind(&item.jira_url)
         .execute(&self.pool)
-        .await
-        .map_err(map_fk_violation)?;
+        .await?;
 
         Ok(item)
     }
@@ -287,19 +578,10 @@ impl ItemRepository for SqliteRepository {
             item.tags = Json(tags);
             edited = true;
         }
-        // project_id/jira_url are content edits on BOTH notes and tasks (D3), so
-        // they sit outside the task-only gate above. Empty string clears (→ NULL),
-        // a value sets, None leaves unchanged — the due_at template.
-        if let Some(project_id) = patch.project_id {
-            let normalized = if project_id.is_empty() {
-                None
-            } else {
-                self.ensure_project_exists(&project_id).await?;
-                Some(project_id)
-            };
-            item.project_id = normalized;
-            edited = true;
-        }
+        // jira_url is a content edit on BOTH notes and tasks (D3), so it sits
+        // outside the task-only gate above. Empty string clears (→ NULL), a
+        // value sets, None leaves unchanged — the due_at template. (project_id
+        // is no longer patchable: items do not move between stores in v1.)
         if let Some(jira_url) = patch.jira_url {
             item.jira_url = if jira_url.is_empty() {
                 None
@@ -317,6 +599,12 @@ impl ItemRepository for SqliteRepository {
         }
         if edited {
             item.updated_at = now_rfc3339();
+        }
+
+        // File-then-index (Stage 2): mirror the merged item to its canonical file
+        // before updating the index row.
+        if let Some(dir) = &self.items_dir {
+            itemfile::write_item(dir, &item).map_err(save_file_error)?;
         }
 
         sqlx::query(
@@ -338,13 +626,20 @@ impl ItemRepository for SqliteRepository {
         .bind(&item.jira_url)
         .bind(&item.id)
         .execute(&self.pool)
-        .await
-        .map_err(map_fk_violation)?;
+        .await?;
 
         Ok(item)
     }
 
     async fn delete(&self, id: &str) -> Result<()> {
+        // File-then-index (Stage 2): confirm the item exists (so an unknown id is
+        // still a clean NotFound), remove its canonical file, then the index row.
+        // A crash after the file is gone rebuilds an index without it — the file
+        // removal is what "sticks", never a resurrected row.
+        if let Some(dir) = &self.items_dir {
+            self.fetch(id).await?;
+            itemfile::remove_item(dir, id).map_err(save_file_error)?;
+        }
         let result = sqlx::query("DELETE FROM items WHERE id = ?1")
             .bind(id)
             .execute(&self.pool)
@@ -378,118 +673,6 @@ impl ItemRepository for SqliteRepository {
         Ok(items)
     }
 
-    async fn list_projects(&self) -> Result<Vec<ProjectWithCount>> {
-        // COUNT(i.id), not COUNT(*): a LEFT JOIN yields one all-NULL row for a
-        // zero-item project, which COUNT(*) would miscount as 1 (D7). Archived
-        // items are counted too, so this agrees with the delete guard.
-        let projects = sqlx::query_as::<_, ProjectWithCount>(
-            "SELECT p.id, p.name, p.created_at, COUNT(i.id) AS item_count \
-             FROM projects p \
-             LEFT JOIN items i ON i.project_id = p.id \
-             GROUP BY p.id, p.name, p.created_at \
-             ORDER BY p.name",
-        )
-        .fetch_all(&self.pool)
-        .await?;
-        Ok(projects)
-    }
-
-    async fn create_project(&self, name: &str) -> Result<Project> {
-        let name = name.trim();
-        if name.is_empty() {
-            return Err(AppError::Invalid("project name must not be empty".into()));
-        }
-        // Explicit pre-check for a clean message; the UNIQUE constraint is the
-        // backstop and is also mapped to Invalid (D2) so no raw DB text leaks.
-        let clash = sqlx::query_scalar::<_, i64>("SELECT 1 FROM projects WHERE name = ?1")
-            .bind(name)
-            .fetch_optional(&self.pool)
-            .await?;
-        if clash.is_some() {
-            return Err(duplicate_name_error(name));
-        }
-
-        let project = Project {
-            id: uuid::Uuid::new_v4().to_string(),
-            name: name.to_string(),
-            created_at: now_rfc3339(),
-        };
-        sqlx::query("INSERT INTO projects (id, name, created_at) VALUES (?1, ?2, ?3)")
-            .bind(&project.id)
-            .bind(&project.name)
-            .bind(&project.created_at)
-            .execute(&self.pool)
-            .await
-            .map_err(|e| map_unique_violation(e, name))?;
-        Ok(project)
-    }
-
-    async fn rename_project(&self, id: &str, name: &str) -> Result<Project> {
-        let name = name.trim();
-        if name.is_empty() {
-            return Err(AppError::Invalid("project name must not be empty".into()));
-        }
-        // Exclude the row being renamed so renaming to its own name is a no-op
-        // that succeeds rather than a self-collision (D2).
-        let clash = sqlx::query_scalar::<_, i64>(
-            "SELECT 1 FROM projects WHERE name = ?1 AND id <> ?2",
-        )
-        .bind(name)
-        .bind(id)
-        .fetch_optional(&self.pool)
-        .await?;
-        if clash.is_some() {
-            return Err(duplicate_name_error(name));
-        }
-
-        let result = sqlx::query("UPDATE projects SET name = ?1 WHERE id = ?2")
-            .bind(name)
-            .bind(id)
-            .execute(&self.pool)
-            .await
-            .map_err(|e| map_unique_violation(e, name))?;
-        if result.rows_affected() == 0 {
-            return Err(AppError::NotFound);
-        }
-
-        sqlx::query_as::<_, Project>("SELECT id, name, created_at FROM projects WHERE id = ?1")
-            .bind(id)
-            .fetch_one(&self.pool)
-            .await
-            .map_err(AppError::from)
-    }
-
-    async fn delete_project(&self, id: &str) -> Result<()> {
-        // Count-then-delete in one transaction so a concurrent assignment can't
-        // slip an item in between (D6). BEGIN IMMEDIATE takes the write lock up
-        // front, so the COUNT reads under the same lock the DELETE writes under
-        // — no deferred-lock upgrade that could surface as a raw "database is
-        // locked" error. The COUNT guard is authoritative (it carries the
-        // friendly message); the FK is defense-in-depth.
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        // Archived items still reference the project, so count them too.
-        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM items WHERE project_id = ?1")
-            .bind(id)
-            .fetch_one(&mut *tx)
-            .await?;
-        if count > 0 {
-            // Dropping tx rolls back; nothing was deleted.
-            return Err(AppError::Invalid(format!(
-                "project still has {count} items assigned"
-            )));
-        }
-        let result = sqlx::query("DELETE FROM projects WHERE id = ?1")
-            .bind(id)
-            .execute(&mut *tx)
-            .await?;
-        if result.rows_affected() == 0 {
-            // Distinguishes "no such project" from "project with 0 items".
-            return Err(AppError::NotFound);
-        }
-        tx.commit().await?;
-        Ok(())
-    }
-
     async fn list_active_tags(&self) -> Result<Vec<String>> {
         // A tag is live while ≥1 non-archived, non-done-task item carries it.
         // json_each('[]') yields zero rows, so empty tag arrays contribute
@@ -506,56 +689,54 @@ impl ItemRepository for SqliteRepository {
         Ok(tags)
     }
 
-    async fn get_setting(&self, key: &str) -> Result<Option<String>> {
-        let value = sqlx::query_scalar::<_, String>("SELECT value FROM app_settings WHERE key = ?1")
-            .bind(key)
-            .fetch_optional(&self.pool)
+    async fn count_active(&self) -> Result<i64> {
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM items WHERE archived = 0")
+            .fetch_one(&self.pool)
             .await?;
-        Ok(value)
+        Ok(count)
     }
 
-    async fn set_setting(&self, key: &str, value: &str) -> Result<()> {
-        sqlx::query(
-            "INSERT INTO app_settings (key, value) VALUES (?1, ?2) \
-             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-        )
-        .bind(key)
-        .bind(value)
-        .execute(&self.pool)
-        .await?;
-        Ok(())
+    async fn close(&self) {
+        // Wait for checked-out connections to finish, then release the file and
+        // its WAL sidecars so the store can be deleted (Windows locks the file
+        // until every connection is closed).
+        self.pool.close().await;
     }
 }
 
-/// Clean, storage-agnostic duplicate-name error (never leaks the raw SQLite
-/// `UNIQUE constraint failed: projects.name` text).
-fn duplicate_name_error(name: &str) -> AppError {
-    AppError::Invalid(format!("a project named \"{name}\" already exists"))
+/// The single clean rejection for any file that is not a valid worknotes
+/// project store — foreign `application_id`, unknown schema object, missing
+/// identity, or a non-SQLite file whose first PRAGMA fails. Deliberately says
+/// nothing about the internal reason and never echoes the path (Section 4.6).
+fn foreign_db_error() -> AppError {
+    AppError::Invalid("that file is not a worknotes project".into())
 }
 
-/// Map a UNIQUE-constraint DB error to the clean duplicate-name Invalid; pass
-/// anything else through unchanged. Backstops the explicit pre-check against a
-/// TOCTOU race (D2).
-fn map_unique_violation(err: sqlx::Error, name: &str) -> AppError {
-    if let sqlx::Error::Database(db) = &err {
-        if db.is_unique_violation() {
-            return duplicate_name_error(name);
-        }
-    }
-    AppError::from(err)
+/// Scrub a connect/open failure: never echo the raw SQLite text or the
+/// filesystem path into the UI (Section 4.6).
+fn scrub_open_error(_err: sqlx::Error) -> AppError {
+    AppError::Invalid("could not open that project".into())
 }
 
-/// Backstop the `ensure_project_exists` pre-check: if a project is deleted
-/// between the check and the write, the FK fires — map that to the same clean
-/// Invalid rather than leaking raw `FOREIGN KEY constraint failed` (D2a). Pass
-/// any other error through unchanged.
-fn map_fk_violation(err: sqlx::Error) -> AppError {
-    if let sqlx::Error::Database(db) = &err {
-        if db.is_foreign_key_violation() {
-            return AppError::Invalid("no such project".into());
-        }
+/// Map a canonical-file write/remove failure. `ItemFileError`'s message carries
+/// only an `io::ErrorKind` word and field names — never a path or SQLite text —
+/// so it is safe to surface (Section 4.6).
+fn save_file_error(e: itemfile::ItemFileError) -> AppError {
+    AppError::Invalid(format!("couldn't save the item to disk: {e}"))
+}
+
+/// Map a migration failure to a clean message. A DB carrying a migration our
+/// binary doesn't know (`VersionMissing`) or a modified one (`VersionMismatch`)
+/// was written by a newer worknotes; everything else is a generic open failure.
+/// Raw sqlx/SQLite text and paths are never surfaced (Section 4.6).
+fn scrub_migrate_error(err: sqlx::migrate::MigrateError) -> AppError {
+    use sqlx::migrate::MigrateError;
+    match err {
+        MigrateError::VersionMissing(_) | MigrateError::VersionMismatch(_) => AppError::Invalid(
+            "that project was created by a newer version of worknotes".into(),
+        ),
+        _ => AppError::Invalid("could not open that project".into()),
     }
-    AppError::from(err)
 }
 
 /// Allowlist for `jira_url`: accept only an absolute `http`/`https` URL, so a
