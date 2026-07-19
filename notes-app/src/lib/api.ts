@@ -8,13 +8,18 @@ import type {
   JiraConfig,
   ListFilter,
   NewItem,
+  NewPrompt,
   ProjectInfo,
+  Prompt,
+  PromptListFilter,
+  PromptVersion,
   ProviderId,
   RewriteEvent,
   RewriteRequest,
   RewriteStreamRequest,
   TicketMeta,
   UpdateItem,
+  UpdatePrompt,
 } from "../types";
 
 // Every backend capability, in one file. Components import these functions
@@ -103,6 +108,37 @@ export function startupWarnings(): Promise<string[]> {
 
 export function listActiveTags(): Promise<string[]> {
   return invoke("list_active_tags");
+}
+
+// --- Prompts (plan.7). A per-project, versioned prompt library. Prompts are
+// viewed one project at a time, so listPrompts requires a projectId in its
+// filter. Every content edit is captured as an immutable version; the AI
+// "enhance" flow reuses aiRewriteStream and persists an accepted proposal via
+// updatePrompt({ body, source: "aiEnhanced" }). ---
+
+export function listPrompts(filter: PromptListFilter): Promise<Prompt[]> {
+  return invoke("list_prompts", { filter });
+}
+
+export function getPrompt(id: string): Promise<Prompt> {
+  return invoke("get_prompt", { id });
+}
+
+export function createPrompt(input: NewPrompt): Promise<Prompt> {
+  return invoke("create_prompt", { input });
+}
+
+export function updatePrompt(id: string, patch: UpdatePrompt): Promise<Prompt> {
+  return invoke("update_prompt", { id, patch });
+}
+
+/** The full version history for one prompt, newest-first. */
+export function listPromptVersions(promptId: string): Promise<PromptVersion[]> {
+  return invoke("list_prompt_versions", { promptId });
+}
+
+export function deletePrompt(id: string): Promise<void> {
+  return invoke("delete_prompt", { id });
 }
 
 export function aiRewrite(req: RewriteRequest): Promise<string> {

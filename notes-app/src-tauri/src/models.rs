@@ -165,6 +165,99 @@ pub struct JiraConfig {
     pub email: String,
 }
 
+// --- Prompts (plan.7): a per-project, versioned prompt library. A prompt is a
+// NEW entity (not a third item `kind`), and its history lives in the canonical
+// file store. `title`/`body` are the CURRENT version's; `updatedAt` is the
+// current version's `createdAt` (derived, so it can never drift); `projectId` is
+// stamped by the manager on return, never persisted in-file (like items). ---
+
+/// A prompt as the frontend sees it. Assembled by the repository from the index:
+/// the current version (head of `created_at DESC, id ASC`) supplies `title`,
+/// `body`, and `updatedAt`; `versionCount` lets a list row show a `vN` badge
+/// without a full history fetch. Serialized only. Mirror in `src/types.ts`.
+#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
+#[serde(rename_all = "camelCase")]
+pub struct Prompt {
+    pub id: String,
+    pub title: String,
+    pub body: String,
+    pub reusable: bool,
+    pub created_at: String,
+    /// The current version's `created_at` (derived) — not a stored column.
+    pub updated_at: String,
+    pub version_count: i64,
+    /// Stamped by the manager on return (the owning store's UUID); never a
+    /// persisted column, so the query omits it and `FromRow` defaults it to None.
+    #[sqlx(default)]
+    pub project_id: Option<String>,
+}
+
+/// One immutable version in a prompt's history. `promptId` is derived from the
+/// owning store on scan, not persisted in the version file (same principle as
+/// items not storing `project_id`). `source`: `"manual"` | `"aiEnhanced"`.
+/// Serialized only. Mirror in `src/types.ts`.
+#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
+#[serde(rename_all = "camelCase")]
+pub struct PromptVersion {
+    pub id: String,
+    pub prompt_id: String,
+    pub title: String,
+    pub body: String,
+    pub source: String,
+    pub created_at: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NewPrompt {
+    /// REQUIRED: the project this prompt is created into — the manager's routing
+    /// key, consumed to pick the target store and never persisted in-file. An
+    /// empty string is rejected.
+    pub project_id: String,
+    pub title: String,
+    #[serde(default)]
+    pub body: Option<String>,
+    #[serde(default)]
+    pub reusable: Option<bool>,
+    /// Provenance of the FIRST version. Defaults to `"manual"`; the frontend
+    /// sends `"aiEnhanced"` when a brand-new draft's first persisted content is
+    /// an accepted AI-enhance proposal (§12), so history labels it correctly.
+    /// Any value other than `"aiEnhanced"` normalizes to `"manual"`.
+    #[serde(default)]
+    pub source: Option<String>,
+}
+
+/// Partial update. Omitted fields mean "unchanged". A `title`/`body` change
+/// appends a new immutable version (with `source`, defaulting to `"manual"`); a
+/// `reusable`-only change rewrites `prompt.md` and appends NO version and does
+/// NOT move `updatedAt`. `source` is set to `"aiEnhanced"` by the accept-proposal
+/// path; any value other than `"aiEnhanced"` normalizes to `"manual"`.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdatePrompt {
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub body: Option<String>,
+    #[serde(default)]
+    pub reusable: Option<bool>,
+    #[serde(default)]
+    pub source: Option<String>,
+}
+
+/// Which prompts to list. `projectId` selects the store (a whole store is one
+/// project — the manager routes to it; prompts are viewed one project at a time,
+/// so there is no cross-store fan-out). `reusableOnly` is the only prompt filter
+/// in v1 — a bound `WHERE reusable = 1`, never raw SQL.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PromptListFilter {
+    #[serde(default)]
+    pub project_id: Option<String>,
+    #[serde(default)]
+    pub reusable_only: Option<bool>,
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ListFilter {

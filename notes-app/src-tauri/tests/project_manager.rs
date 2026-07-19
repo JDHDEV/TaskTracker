@@ -17,9 +17,13 @@ use std::path::Path;
 
 use notes_app_lib::db::{ItemRepository, SqliteRepository};
 use notes_app_lib::error::AppError;
-use notes_app_lib::models::{Kind, ListFilter, NewItem, ProjectInfo, Status, UpdateItem};
+use notes_app_lib::models::{
+    Kind, ListFilter, NewItem, NewPrompt, ProjectInfo, PromptListFilter, Status, UpdateItem,
+    UpdatePrompt,
+};
 use notes_app_lib::projects::catalog::Catalog;
 use notes_app_lib::projects::ProjectManager;
+use notes_app_lib::store::promptfile;
 
 use tempfile::{tempdir, TempDir};
 
@@ -64,6 +68,16 @@ fn item_with_tags(project_id: &str, kind: Kind, title: &str, tags: &[&str]) -> N
     NewItem {
         tags: Some(tags.iter().map(|t| t.to_string()).collect()),
         ..new_item(project_id, kind, title)
+    }
+}
+
+fn new_prompt(project_id: &str, title: &str, body: &str) -> NewPrompt {
+    NewPrompt {
+        project_id: project_id.into(),
+        title: title.into(),
+        body: Some(body.into()),
+        reusable: None,
+        source: None,
     }
 }
 
@@ -1116,4 +1130,290 @@ async fn reload_reports_conflict_marker_files_and_imports_the_rest() {
     let titles: Vec<String> =
         mgr.list_all(&ListFilter::default()).await.unwrap().into_iter().map(|i| i.title).collect();
     assert_eq!(titles, vec!["clean".to_string()]);
+}
+
+// ---------------------------------------------------------------------------
+// Prompts (plan.7): H1 reopen-after-migrate, routing isolation, reload rebuild
+// + full history from files, synthesized head, conflict-marker skip, and the
+// Delete-files sweep. Prompt REPOSITORY-level invariants (versioning,
+// reusable-toggle, source labeling) live in `tests/repo_prompts.rs`; this
+// section is the manager/file-store integration surface, mirroring the item
+// tests above.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn reopen_after_migration_to_0006_succeeds() {
+    // H1: `open_existing`'s sqlite_master allowlist runs BEFORE `migrate!`, so
+    // the FIRST open after upgrading to 0006 applies the migration (adding
+    // `prompts`/`prompt_versions`), and the SECOND open sees those new tables.
+    // If `KNOWN_TABLES` were not widened, this second open would reject the
+    // whole store as foreign — bricking every existing project.
+    let (mgr, _app) = new_manager().await;
+    let (info, dir) = create_project(&mgr, "Alpha").await;
+
+    mgr.unload(&info.id).await.unwrap();
+    let reopened = mgr.open_project(dir.path().to_str().unwrap()).await.unwrap();
+    assert_eq!(reopened.id, info.id);
+    assert!(reopened.loaded);
+}
+
+#[tokio::test]
+async fn reopen_after_migration_to_0006_keeps_a_created_prompt() {
+    // Same H1 mechanism, but with an actual prompt on disk/in the index —
+    // proves both the allowlist widening AND the prompt rebuild survive a real
+    // close/reopen cycle end to end.
+    let (mgr, _app) = new_manager().await;
+    let (info, dir) = create_project(&mgr, "Alpha").await;
+    let prompt = mgr.create_prompt(new_prompt(&info.id, "t", "b")).await.unwrap();
+
+    mgr.unload(&info.id).await.unwrap();
+    let reopened = mgr.open_project(dir.path().to_str().unwrap()).await.unwrap();
+    assert_eq!(reopened.id, info.id);
+
+    let listed = mgr
+        .list_prompts(&PromptListFilter { project_id: Some(reopened.id.clone()), ..Default::default() })
+        .await
+        .unwrap();
+    assert_eq!(listed.len(), 1, "the prompt created before unload survives the reopen");
+    assert_eq!(listed[0].id, prompt.id);
+    assert_eq!(listed[0].title, "t");
+}
+
+#[tokio::test]
+async fn create_prompt_lands_only_in_target_store() {
+    let (mgr, _app) = new_manager().await;
+    let (a, _dir_a) = create_project(&mgr, "Alpha").await;
+    let (b, _dir_b) = create_project(&mgr, "Beta").await;
+
+    let prompt_a = mgr.create_prompt(new_prompt(&a.id, "in alpha", "body")).await.unwrap();
+    assert_eq!(prompt_a.project_id.as_deref(), Some(a.id.as_str()));
+
+    let only_a = mgr
+        .list_prompts(&PromptListFilter { project_id: Some(a.id.clone()), ..Default::default() })
+        .await
+        .unwrap();
+    assert_eq!(only_a.len(), 1);
+    assert_eq!(only_a[0].id, prompt_a.id);
+
+    let only_b = mgr
+        .list_prompts(&PromptListFilter { project_id: Some(b.id.clone()), ..Default::default() })
+        .await
+        .unwrap();
+    assert!(only_b.is_empty(), "a prompt created into A must never appear when scoped to B");
+}
+
+#[tokio::test]
+async fn list_prompts_without_a_project_id_is_invalid() {
+    // Prompts have no cross-store "all projects" fan-out (unlike items); an
+    // empty/blank projectId is rejected rather than silently returning nothing
+    // or every loaded store's prompts.
+    let (mgr, _app) = new_manager().await;
+    let (_a, _dir_a) = create_project(&mgr, "Alpha").await;
+
+    assert!(matches!(
+        mgr.list_prompts(&PromptListFilter::default()).await.unwrap_err(),
+        AppError::Invalid(_)
+    ));
+    assert!(matches!(
+        mgr.list_prompts(&PromptListFilter { project_id: Some("   ".into()), ..Default::default() })
+            .await
+            .unwrap_err(),
+        AppError::Invalid(_)
+    ));
+}
+
+#[tokio::test]
+async fn reload_rebuilds_prompts_and_full_history_from_files_out_of_band() {
+    // Post-`git pull` for prompts (H3): a new prompt's files appear, another
+    // prompt's directory vanishes; reload rebuilds the prompt index — WITH
+    // full version history — from what's on disk. Mirrors
+    // `reload_picks_up_files_added_and_removed_out_of_band` for items.
+    let (mgr, _app) = new_manager().await;
+    let (info, dir) = create_project(&mgr, "Alpha").await;
+    let prompts_dir = dir.path().join("prompts");
+
+    let kept = mgr.create_prompt(new_prompt(&info.id, "kept", "v1 body")).await.unwrap();
+    mgr.update_prompt(&kept.id, UpdatePrompt { body: Some("v2 body".into()), ..Default::default() })
+        .await
+        .unwrap();
+    let removed = mgr.create_prompt(new_prompt(&info.id, "removed", "bye")).await.unwrap();
+
+    // Simulate a pull: a new prompt's files appear directly on disk...
+    let pulled_id = "11111111-1111-1111-1111-111111111111";
+    let pulled_version_id = "22222222-2222-2222-2222-222222222222";
+    let ts = "2026-07-14T00:00:00.000+00:00";
+    promptfile::write_prompt(
+        &prompts_dir,
+        &promptfile::PromptRecord { id: pulled_id.into(), reusable: false, created_at: ts.into() },
+    )
+    .unwrap();
+    promptfile::write_version(
+        &prompts_dir,
+        &promptfile::PromptVersionRecord {
+            id: pulled_version_id.into(),
+            prompt_id: pulled_id.into(),
+            title: "pulled in".into(),
+            body: "pulled body".into(),
+            source: "manual".into(),
+            created_at: ts.into(),
+        },
+    )
+    .unwrap();
+    // ...and a prompt's directory is removed (deleted on another clone).
+    std::fs::remove_dir_all(prompts_dir.join(removed.id.as_str())).unwrap();
+
+    let warnings = mgr.reload(&info.id).await.unwrap();
+    assert!(warnings.is_empty(), "clean files reload without warnings: {warnings:?}");
+
+    let listed = mgr
+        .list_prompts(&PromptListFilter { project_id: Some(info.id.clone()), ..Default::default() })
+        .await
+        .unwrap();
+    let titles: Vec<&str> = listed.iter().map(|p| p.title.as_str()).collect();
+    assert_eq!(listed.len(), 2, "removed prompt is gone; kept + pulled-in remain");
+    assert!(titles.contains(&"kept"), "an untouched prompt survives reload");
+    assert!(titles.contains(&"pulled in"), "a pulled-in prompt appears after reload");
+    assert!(!titles.contains(&"removed"), "a deleted prompt dir is gone after reload");
+
+    // The kept prompt's FULL two-version history survives the rebuild.
+    let hist = mgr.prompt_versions(&kept.id).await.unwrap();
+    assert_eq!(hist.len(), 2, "the multi-version prompt's full history survives the rebuild");
+    let bodies: Vec<&str> = hist.iter().map(|v| v.body.as_str()).collect();
+    assert!(bodies.contains(&"v1 body") && bodies.contains(&"v2 body"));
+}
+
+#[tokio::test]
+async fn missing_prompt_md_is_synthesized_with_all_versions_intact() {
+    // A prompt dir carrying version files but no `prompt.md` is synthesized on
+    // scan (reusable=false) rather than dropped — versions must never be
+    // orphaned (H2/plan.7 Section 5). Mirrors
+    // `a_git_clone_with_only_item_files_builds_a_fresh_index_on_open` for items.
+    let (mgr, _app) = new_manager().await;
+    let dir = tempdir().unwrap();
+    let items_dir = dir.path().join("items");
+    std::fs::create_dir_all(&items_dir).unwrap();
+    std::fs::write(
+        items_dir.join("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa.md"),
+        note_md("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", "an item"),
+    )
+    .unwrap();
+
+    let prompts_dir = dir.path().join("prompts");
+    let pid = "33333333-3333-3333-3333-333333333333";
+    let v1 = "44444444-4444-4444-4444-444444444444";
+    let v2 = "55555555-5555-5555-5555-555555555555";
+    let ts1 = "2026-07-14T00:00:00.000+00:00";
+    let ts2 = "2026-07-14T01:00:00.000+00:00";
+    promptfile::write_version(
+        &prompts_dir,
+        &promptfile::PromptVersionRecord {
+            id: v1.into(),
+            prompt_id: pid.into(),
+            title: "orphan v1".into(),
+            body: "b1".into(),
+            source: "manual".into(),
+            created_at: ts1.into(),
+        },
+    )
+    .unwrap();
+    promptfile::write_version(
+        &prompts_dir,
+        &promptfile::PromptVersionRecord {
+            id: v2.into(),
+            prompt_id: pid.into(),
+            title: "orphan v2".into(),
+            body: "b2".into(),
+            source: "manual".into(),
+            created_at: ts2.into(),
+        },
+    )
+    .unwrap();
+    // No prompt.md written at all — an orphaned-version case.
+
+    let info = mgr.open_project(dir.path().to_str().unwrap()).await.unwrap();
+
+    let listed = mgr
+        .list_prompts(&PromptListFilter { project_id: Some(info.id.clone()), ..Default::default() })
+        .await
+        .unwrap();
+    assert_eq!(listed.len(), 1, "the version-only prompt dir is synthesized into a prompt row");
+    assert_eq!(listed[0].id, pid);
+    assert!(!listed[0].reusable, "a synthesized prompt defaults to reusable=false");
+    assert_eq!(listed[0].title, "orphan v2", "current version = newest by created_at");
+
+    let hist = mgr.prompt_versions(pid).await.unwrap();
+    assert_eq!(hist.len(), 2, "both versions are intact under the synthesized prompt");
+}
+
+#[tokio::test]
+async fn reload_reports_a_conflict_marker_prompt_version_and_imports_the_rest() {
+    // Per-file partial success for prompt versions: a file with unresolved git
+    // conflict markers is skipped and reported; its clean sibling version
+    // (same prompt) and an unrelated clean prompt still import. Mirrors
+    // `reload_reports_conflict_marker_files_and_imports_the_rest` for items.
+    let (mgr, _app) = new_manager().await;
+    let (info, dir) = create_project(&mgr, "Alpha").await;
+    let prompts_dir = dir.path().join("prompts");
+
+    mgr.create_prompt(new_prompt(&info.id, "clean prompt", "body")).await.unwrap();
+
+    let pid2 = "66666666-6666-6666-6666-666666666666";
+    let good_version = "77777777-7777-7777-7777-777777777777";
+    let bad_version = "88888888-8888-8888-8888-888888888888";
+    let ts = "2026-07-14T00:00:00.000+00:00";
+    promptfile::write_prompt(
+        &prompts_dir,
+        &promptfile::PromptRecord { id: pid2.into(), reusable: false, created_at: ts.into() },
+    )
+    .unwrap();
+    promptfile::write_version(
+        &prompts_dir,
+        &promptfile::PromptVersionRecord {
+            id: good_version.into(),
+            prompt_id: pid2.into(),
+            title: "surviving version".into(),
+            body: "b".into(),
+            source: "manual".into(),
+            created_at: ts.into(),
+        },
+    )
+    .unwrap();
+    let bad_file_name = format!("{bad_version}.md");
+    std::fs::write(
+        prompts_dir.join(pid2).join(&bad_file_name),
+        format!(
+            "---\nid: {bad_version}\nsource: manual\ncreated_at: {ts}\ntitle: \"x\"\n\
+             <<<<<<< HEAD\nfoo\n=======\nbar\n>>>>>>> branch\n---\nbody\n"
+        ),
+    )
+    .unwrap();
+
+    let warnings = mgr.reload(&info.id).await.unwrap();
+    assert_eq!(warnings.len(), 1, "the one conflicted version file is reported: {warnings:?}");
+    assert!(warnings[0].contains(&bad_file_name), "the warning names the offending file");
+    assert!(warnings[0].to_lowercase().contains("conflict"), "the warning explains why");
+
+    let listed = mgr
+        .list_prompts(&PromptListFilter { project_id: Some(info.id.clone()), ..Default::default() })
+        .await
+        .unwrap();
+    let titles: Vec<&str> = listed.iter().map(|p| p.title.as_str()).collect();
+    assert_eq!(listed.len(), 2, "the clean prompt AND the prompt with a surviving version both import");
+    assert!(titles.contains(&"clean prompt"));
+    assert!(titles.contains(&"surviving version"), "the non-conflicted sibling version imports");
+}
+
+#[tokio::test]
+async fn delete_files_also_removes_the_prompts_directory() {
+    // H3: destructive Delete-files must sweep prompts/ too, or sensitive prompt
+    // bodies would remain on disk after the user asked for them gone.
+    let (mgr, _app) = new_manager().await;
+    let (info, dir) = create_project(&mgr, "Alpha").await;
+    mgr.create_prompt(new_prompt(&info.id, "t", "b")).await.unwrap();
+    assert!(dir.path().join("prompts").is_dir(), "creating a prompt makes the prompts/ dir");
+
+    mgr.unload(&info.id).await.unwrap();
+    mgr.delete_files(&info.id).await.unwrap();
+
+    assert!(!dir.path().join("prompts").exists(), "delete_files removes the canonical prompts/ dir");
 }

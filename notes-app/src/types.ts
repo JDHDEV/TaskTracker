@@ -68,6 +68,62 @@ export interface ListFilter {
   sort?: Sort;
 }
 
+// --- Prompts (plan.7): a per-project, versioned prompt library. Mirrors
+// src-tauri/src/models.rs. A prompt's title/body are its CURRENT version's;
+// updatedAt is the current version's createdAt (derived); every content edit is
+// captured as an immutable version, so the original is never lost. ---
+
+export type PromptSource = "manual" | "aiEnhanced";
+
+export interface Prompt {
+  id: string;
+  title: string;
+  body: string;
+  reusable: boolean;
+  createdAt: string; // RFC 3339
+  updatedAt: string; // RFC 3339 — the current version's createdAt (derived)
+  versionCount: number;
+  projectId: string | null; // stamped by the manager on return
+}
+
+export interface PromptVersion {
+  id: string;
+  promptId: string;
+  title: string;
+  body: string;
+  source: PromptSource;
+  createdAt: string; // RFC 3339
+}
+
+export interface NewPrompt {
+  /** Required: the project this prompt is created into (the routing target). */
+  projectId: string;
+  title: string;
+  body?: string;
+  reusable?: boolean;
+  /** Provenance of the first version. Defaults to "manual"; sent as
+   *  "aiEnhanced" when a new draft's first persisted content is an accepted AI
+   *  enhance proposal, so history labels it correctly. */
+  source?: PromptSource;
+}
+
+/** Omitted fields are left unchanged. A title/body change appends a version;
+ *  a reusable-only change appends none and does not move updatedAt. `source`
+ *  defaults to "manual"; the accept-proposal path sends "aiEnhanced". */
+export interface UpdatePrompt {
+  title?: string;
+  body?: string;
+  reusable?: boolean;
+  source?: PromptSource;
+}
+
+/** projectId selects the store (prompts are viewed one project at a time — the
+ *  manager requires it). reusableOnly is the only prompt filter in v1. */
+export interface PromptListFilter {
+  projectId?: string;
+  reusableOnly?: boolean;
+}
+
 export type ProviderId = "anthropic" | "openai";
 
 export interface RewriteRequest {

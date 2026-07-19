@@ -14,9 +14,12 @@ use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 
-use crate::db::{ItemRepository, SqliteRepository};
+use crate::db::{ItemRepository, PromptRepository, SqliteRepository};
 use crate::error::{AppError, Result};
-use crate::models::{Item, Kind, ListFilter, NewItem, Priority, ProjectInfo, Sort, Status, UpdateItem};
+use crate::models::{
+    Item, Kind, ListFilter, NewItem, NewPrompt, Priority, ProjectInfo, Prompt, PromptListFilter,
+    PromptVersion, Sort, Status, UpdateItem, UpdatePrompt,
+};
 use crate::store::itemfile;
 
 use catalog::Catalog;
@@ -39,6 +42,12 @@ const LEGACY_DB_FILE: &str = "project.db";
 /// the one-time export from the DB — so a store that has index rows but no files
 /// is never "rebuilt" from an empty directory (which would erase it).
 const ITEMS_DIR: &str = "items";
+
+/// The canonical prompt-file subtree (plan.7), a sibling of `items/`. Unlike
+/// `items/` it is NOT pre-created — the first prompt write makes it, and a scan
+/// of a missing `prompts/` is empty. It is git-tracked (canonical), never listed
+/// in `GITIGNORE`.
+const PROMPTS_DIR: &str = "prompts";
 
 /// The retired Stage-1 store, kept after an upgrade. Ignored by git, never
 /// deleted by the upgrade (only by an explicit Delete-files).
@@ -74,9 +83,14 @@ const LEGACY_GITIGNORE: &str = "# worknotes keeps the SQLite store and its WAL s
 /// A currently-loaded project: its catalog name and the open store. Keyed in the
 /// manager by the project's UUID. The directory path is the catalog's authority,
 /// not duplicated here.
+///
+/// `repo` and `prompts` are two trait views of the SAME `SqliteRepository`
+/// instance (one pool, one `close()`): items go through `ItemRepository`, prompts
+/// through `PromptRepository`. Closing either view closes the shared pool.
 struct LoadedProject {
     name: String,
     repo: Arc<dyn ItemRepository>,
+    prompts: Arc<dyn PromptRepository>,
 }
 
 pub struct ProjectManager {
@@ -167,18 +181,20 @@ impl ProjectManager {
         }
         let index_path = canonical.join(INDEX_DB_FILE);
         let items_dir = canonical.join(ITEMS_DIR);
+        let prompts_dir = canonical.join(PROMPTS_DIR);
         let project_id = uuid::Uuid::new_v4().to_string();
         let path_str = path_to_string(&canonical);
 
         // Create the empty index and the canonical items/ dir; the store is
         // file-backed from its first write. items/ starts empty, so no rebuild.
+        // prompts/ is created lazily on the first prompt write.
         let repo = SqliteRepository::create_at(&index_path, &project_id, name).await?;
         if std::fs::create_dir_all(&items_dir).is_err() {
             repo.close().await;
             let _ = remove_store_files(&canonical);
             return Err(AppError::Invalid("couldn't prepare the project folder".into()));
         }
-        let repo = repo.with_items_dir(items_dir);
+        let repo = repo.with_items_dir(items_dir).with_prompts_dir(prompts_dir);
 
         // Write the git-portable identity so a clone keeps this project's id, and
         // a `.gitignore` — never clobbering a user's own existing one.
@@ -195,10 +211,10 @@ impl ProjectManager {
             return Err(e);
         }
 
-        self.loaded.write().unwrap().insert(
-            project_id.clone(),
-            LoadedProject { name: name.to_string(), repo: Arc::new(repo) },
-        );
+        self.loaded
+            .write()
+            .unwrap()
+            .insert(project_id.clone(), loaded_project(name.to_string(), repo));
         self.project_info(&project_id).await
     }
 
@@ -264,10 +280,10 @@ impl ProjectManager {
         }
 
         self.catalog.set_loaded(&pid, true).await?;
-        self.loaded.write().unwrap().insert(
-            pid.clone(),
-            LoadedProject { name: pname, repo: Arc::new(repo) },
-        );
+        self.loaded
+            .write()
+            .unwrap()
+            .insert(pid.clone(), loaded_project(pname, repo));
         self.project_info(&pid).await
     }
 
@@ -304,10 +320,10 @@ impl ProjectManager {
             ));
         }
         self.catalog.set_loaded(id, true).await?;
-        self.loaded.write().unwrap().insert(
-            id.to_string(),
-            LoadedProject { name: pname, repo: Arc::new(repo) },
-        );
+        self.loaded
+            .write()
+            .unwrap()
+            .insert(id.to_string(), loaded_project(pname, repo));
         let info = self.project_info(id).await?;
         Ok((info, warnings))
     }
@@ -402,6 +418,69 @@ impl ProjectManager {
 
     pub async fn delete(&self, id: &str) -> Result<()> {
         let (_pid, repo) = self.owner(id).await?;
+        repo.delete(id).await
+    }
+
+    // --- Prompt routing (plan.7) ------------------------------------------
+    // Prompts are viewed ONE project at a time (no cross-store fan-out), so
+    // `list_prompts` requires a `projectId`. `get`/`update`/`delete`/`versions`
+    // locate the owning store by id (mirroring `owner()` for items) and stamp the
+    // owning project on the returned prompt.
+
+    /// Create a prompt into the project named by `input.project_id` (the routing
+    /// key). Rejects an empty or not-loaded target. Stamps the owning UUID.
+    pub async fn create_prompt(&self, input: NewPrompt) -> Result<Prompt> {
+        let target = input.project_id.trim().to_string();
+        if target.is_empty() {
+            return Err(AppError::Invalid("choose a project for this prompt".into()));
+        }
+        let repo = self
+            .prompts_for(&target)
+            .map_err(|_| AppError::Invalid("that project isn't loaded".into()))?;
+        let mut prompt = repo.create(input).await?;
+        prompt.project_id = Some(target);
+        Ok(prompt)
+    }
+
+    /// List prompts in ONE project (required `projectId`), stamping ownership.
+    pub async fn list_prompts(&self, filter: &PromptListFilter) -> Result<Vec<Prompt>> {
+        let target = filter
+            .project_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| AppError::Invalid("choose a project to see its prompts".into()))?;
+        let repo = self
+            .prompts_for(target)
+            .map_err(|_| AppError::Invalid("that project isn't loaded".into()))?;
+        let mut prompts = repo.list(filter).await?;
+        for p in &mut prompts {
+            p.project_id = Some(target.to_string());
+        }
+        Ok(prompts)
+    }
+
+    pub async fn get_prompt(&self, id: &str) -> Result<Prompt> {
+        let (pid, repo) = self.prompt_owner(id).await?;
+        let mut prompt = repo.get(id).await?;
+        prompt.project_id = Some(pid);
+        Ok(prompt)
+    }
+
+    pub async fn update_prompt(&self, id: &str, patch: UpdatePrompt) -> Result<Prompt> {
+        let (pid, repo) = self.prompt_owner(id).await?;
+        let mut prompt = repo.update(id, patch).await?;
+        prompt.project_id = Some(pid);
+        Ok(prompt)
+    }
+
+    pub async fn prompt_versions(&self, prompt_id: &str) -> Result<Vec<PromptVersion>> {
+        let (_pid, repo) = self.prompt_owner(prompt_id).await?;
+        repo.versions(prompt_id).await
+    }
+
+    pub async fn delete_prompt(&self, id: &str) -> Result<()> {
+        let (_pid, repo) = self.prompt_owner(id).await?;
         repo.delete(id).await
     }
 
@@ -555,6 +634,48 @@ impl ProjectManager {
         found.ok_or(AppError::NotFound)
     }
 
+    /// The prompt view of a loaded store (plan.7), or `NotFound`.
+    fn prompts_for(&self, id: &str) -> Result<Arc<dyn PromptRepository>> {
+        self.loaded
+            .read()
+            .unwrap()
+            .get(id)
+            .map(|lp| lp.prompts.clone())
+            .ok_or(AppError::NotFound)
+    }
+
+    /// Snapshot every loaded (id, prompt repo) so the lock is released before any
+    /// `.await` (mirrors `snapshot`).
+    fn prompt_snapshot(&self) -> Vec<(String, Arc<dyn PromptRepository>)> {
+        self.loaded
+            .read()
+            .unwrap()
+            .iter()
+            .map(|(pid, lp)| (pid.clone(), lp.prompts.clone()))
+            .collect()
+    }
+
+    /// Locate the loaded store owning prompt `id`, probing EVERY loaded store so
+    /// an id present in two stores is refused (mirrors `owner()` for items).
+    async fn prompt_owner(&self, id: &str) -> Result<(String, Arc<dyn PromptRepository>)> {
+        let mut found: Option<(String, Arc<dyn PromptRepository>)> = None;
+        for (pid, repo) in self.prompt_snapshot() {
+            match repo.get(id).await {
+                Ok(_) => {
+                    if found.is_some() {
+                        return Err(AppError::Invalid(
+                            "that prompt exists in more than one loaded project".into(),
+                        ));
+                    }
+                    found = Some((pid, repo));
+                }
+                Err(AppError::NotFound) => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        found.ok_or(AppError::NotFound)
+    }
+
     async fn project_info(&self, id: &str) -> Result<ProjectInfo> {
         let row = self.catalog.get(id).await?.ok_or(AppError::NotFound)?;
         let (loaded, item_count) = match self.repo_for(id).ok() {
@@ -669,6 +790,7 @@ async fn open_store(
     name_hint: &str,
 ) -> Result<(SqliteRepository, String, String, Vec<String>)> {
     let items_dir = dir.join(ITEMS_DIR);
+    let prompts_dir = dir.join(PROMPTS_DIR);
     let index_path = dir.join(INDEX_DB_FILE);
 
     // No canonical files yet → derive them ONCE from the DB (never rebuild from
@@ -694,9 +816,19 @@ async fn open_store(
     let (uuid, name) = repo.read_meta().await?;
     // Publish the identity so a clone of this dir keeps it (write-if-absent).
     ensure_identity_file(dir, &uuid, &name);
-    let repo = repo.with_items_dir(items_dir.clone());
-    let warnings = repo.rebuild_from_dir(&items_dir).await?;
+    let repo = repo.with_items_dir(items_dir.clone()).with_prompts_dir(prompts_dir.clone());
+    // Rebuild items AND prompts from their canonical files in one pass (plan.7
+    // H3): a Reload after a `git pull` reflects both item and prompt files.
+    let warnings = repo.rebuild_from_dir(&items_dir, &prompts_dir).await?;
     Ok((repo, uuid, name, warnings))
+}
+
+/// Wrap an opened store as a `LoadedProject`: two trait views (items + prompts)
+/// over ONE `Arc<SqliteRepository>` — one pool, one `close()`. The
+/// `Arc<SqliteRepository>` coerces to each trait object at the field assignment.
+fn loaded_project(name: String, repo: SqliteRepository) -> LoadedProject {
+    let repo = Arc::new(repo);
+    LoadedProject { name, repo: repo.clone(), prompts: repo }
 }
 
 /// One-time conversion of a directory that has DB rows but no canonical files
@@ -821,6 +953,9 @@ fn remove_store_files(dir: &Path) -> Result<()> {
     let _ = std::fs::remove_file(dir.join(IDENTITY_FILE));
     let _ = remove_dir_retrying(&dir.join(ITEMS_STAGING));
     remove_dir_retrying(&dir.join(ITEMS_DIR)).map_err(|_| locked())?;
+    // Sweep the canonical prompt subtree too (plan.7 H3), or destructive
+    // "Delete files" would leave sensitive prompt bodies on disk (data remanence).
+    remove_dir_retrying(&dir.join(PROMPTS_DIR)).map_err(|_| locked())?;
     let gitignore = dir.join(".gitignore");
     if let Ok(contents) = std::fs::read_to_string(&gitignore) {
         if contents == GITIGNORE || contents == LEGACY_GITIGNORE {

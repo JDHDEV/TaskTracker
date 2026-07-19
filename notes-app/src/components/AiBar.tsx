@@ -11,15 +11,26 @@ interface Props {
   /** A new draft with no project chosen yet — Save is blocked until one is
    *  picked (a new item must be created into a specific project store). */
   saveBlocked: boolean;
+  /** Which preset instruction chips to show. Items keep their original four;
+   *  prompts (plan.7) get a prompt-engineering-flavored set. Defaults "item"
+   *  so every existing caller is unaffected. */
+  variant?: "item" | "prompt";
   onRework: (instruction: string, provider: ProviderId) => void;
   onSave: () => void;
 }
 
-const PRESETS = [
+const ITEM_PRESETS = [
   "Tighten this up",
   "Fix grammar and spelling",
   "Make it more professional",
   "Turn into bullet points",
+];
+
+const PROMPT_PRESETS = [
+  "Make it more specific",
+  "Add clear constraints",
+  "Clarify the ask",
+  "Tighten this up",
 ];
 
 const PROVIDERS: { id: ProviderId; label: string }[] = [
@@ -32,11 +43,13 @@ export default function AiBar({
   dirty,
   generatingTitle,
   saveBlocked,
+  variant = "item",
   onRework,
   onSave,
 }: Props) {
   const [provider, setProvider] = useState<ProviderId>(getPreferredProvider);
   const [custom, setCustom] = useState("");
+  const presets = variant === "prompt" ? PROMPT_PRESETS : ITEM_PRESETS;
 
   function pickProvider(next: ProviderId) {
     setProvider(next);
@@ -66,7 +79,7 @@ export default function AiBar({
         ))}
       </select>
 
-      {PRESETS.map((preset) => (
+      {presets.map((preset) => (
         <button key={preset} className="chip" onClick={() => setCustom(preset)}>
           {preset}
         </button>

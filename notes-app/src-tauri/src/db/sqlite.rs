@@ -6,10 +6,13 @@ use sqlx::types::Json;
 use sqlx::QueryBuilder;
 
 use crate::error::{AppError, Result};
-use crate::models::{Item, Kind, ListFilter, NewItem, Priority, Sort, Status, UpdateItem};
-use crate::store::itemfile;
+use crate::models::{
+    Item, Kind, ListFilter, NewItem, NewPrompt, Priority, Prompt, PromptListFilter, PromptVersion,
+    Sort, Status, UpdateItem, UpdatePrompt,
+};
+use crate::store::{itemfile, promptfile};
 
-use super::ItemRepository;
+use super::{ItemRepository, PromptRepository};
 
 /// Mint an RFC 3339 timestamp with fixed millisecond precision. `to_rfc3339()`
 /// trims trailing fractional zeros (variable digit count), so lexical order only
@@ -28,6 +31,12 @@ const MAX_PROJECT_DB_BYTES: u64 = 512 * 1024 * 1024;
 /// The tables a valid, fully-migrated worknotes project DB may contain.
 /// `open_existing` refuses any table outside this set (FTS5 shadow tables
 /// `items_fts*` and `sqlite_*` internals are allowed by prefix).
+///
+/// `prompts` + `prompt_versions` are added here IN THE SAME CHANGE as migration
+/// `0006_prompts.sql` (plan.7 H1): this allowlist check runs BEFORE `migrate!`,
+/// so the first open after upgrading applies 0006, and without these two names
+/// the NEXT open would see the new tables and reject the whole store as foreign,
+/// bricking every existing project. No `prompts_fts` arm — v1 ships no prompt FTS.
 const KNOWN_TABLES: &[&str] = &[
     "items",
     "projects",
@@ -35,6 +44,8 @@ const KNOWN_TABLES: &[&str] = &[
     "meta",
     "_sqlx_migrations",
     "items_fts",
+    "prompts",
+    "prompt_versions",
 ];
 
 /// The only triggers a worknotes project DB may contain (the FTS sync triggers).
@@ -50,6 +61,11 @@ pub struct SqliteRepository {
     /// `None` for the in-memory test repo, the legacy-migration copy path, and
     /// raw stores opened for hardening checks — those are index-only.
     items_dir: Option<PathBuf>,
+    /// The canonical `prompts/` subtree (plan.7). Set alongside `items_dir` for a
+    /// loaded Stage-2 project so every prompt/version write is mirrored to a file
+    /// BEFORE its index row. `None` (index-only) for the same paths `items_dir`
+    /// is `None`; the in-memory test repo drives prompts through the index alone.
+    prompts_dir: Option<PathBuf>,
 }
 
 impl SqliteRepository {
@@ -63,7 +79,7 @@ impl SqliteRepository {
             .connect_with(options)
             .await?;
         sqlx::migrate!("./migrations").run(&pool).await?;
-        Ok(Self { pool, items_dir: None })
+        Ok(Self { pool, items_dir: None, prompts_dir: None })
     }
 
     /// Attach a canonical items directory so subsequent writes mirror to files
@@ -72,6 +88,15 @@ impl SqliteRepository {
     /// wrapped `Arc` stays immutable.
     pub(crate) fn with_items_dir(mut self, items_dir: PathBuf) -> Self {
         self.items_dir = Some(items_dir);
+        self
+    }
+
+    /// Attach a canonical `prompts/` directory so prompt/version writes mirror to
+    /// files (plan.7). The dir need not exist yet — the first write creates it,
+    /// and a scan of a missing dir is empty. Consuming builder, like
+    /// `with_items_dir`; the manager calls both before boxing the store.
+    pub(crate) fn with_prompts_dir(mut self, prompts_dir: PathBuf) -> Self {
+        self.prompts_dir = Some(prompts_dir);
         self
     }
 
@@ -126,7 +151,7 @@ impl SqliteRepository {
                 .map_err(scrub_open_error)?;
         }
         tx.commit().await.map_err(scrub_open_error)?;
-        Ok(Self { pool, items_dir: None })
+        Ok(Self { pool, items_dir: None, prompts_dir: None })
     }
 
     /// Open an EXISTING project DB, treating the file as untrusted input (it may
@@ -209,7 +234,7 @@ impl SqliteRepository {
             .run(&pool)
             .await
             .map_err(scrub_migrate_error)?;
-        Ok(Self { pool, items_dir: None })
+        Ok(Self { pool, items_dir: None, prompts_dir: None })
     }
 
     /// Read the `(project_id, project_name)` the store was stamped with at
@@ -282,16 +307,28 @@ impl SqliteRepository {
     }
 
     /// Rebuild the index from the canonical files (Stage 2 "scan-then-rebuild"):
-    /// clear `items`, re-insert every file that parses, then rebuild the FTS
-    /// index — all in one transaction, so a mid-rebuild failure leaves the prior
-    /// index intact. Files are the source of truth, so anything on disk wins over
-    /// whatever the index held. Returns a `(filename: reason)` warning per file
-    /// that could not be imported (malformed / conflict markers / oversized /
-    /// duplicate id) — partial success, never an abort (plan.6 step 18).
-    pub(crate) async fn rebuild_from_dir(&self, items_dir: &Path) -> Result<Vec<String>> {
+    /// clear `items` + the prompt tables, re-insert every file that parses, then
+    /// rebuild the FTS index — all in one transaction, so a mid-rebuild failure
+    /// leaves the prior index intact. Files are the source of truth, so anything
+    /// on disk wins over whatever the index held. Returns a `(filename: reason)`
+    /// warning per file that could not be imported (malformed / conflict markers /
+    /// oversized / duplicate id) — partial success, never an abort (plan.6 step 18).
+    ///
+    /// `prompts_dir` is a second explicit arg symmetric with `items_dir` (the call
+    /// site passes both). Prompts are cleared + repopulated in the SAME
+    /// transaction, parent rows before child rows (plan.7 H3): a Reload after a
+    /// `git pull` therefore reflects the prompt files, never stale/empty prompts.
+    /// A missing `prompts/` yields an empty prompt scan (no error).
+    pub(crate) async fn rebuild_from_dir(
+        &self,
+        items_dir: &Path,
+        prompts_dir: &Path,
+    ) -> Result<Vec<String>> {
         let outcome = itemfile::scan(items_dir);
+        let prompt_outcome = promptfile::scan(prompts_dir);
         let mut warnings: Vec<String> =
             outcome.errors.iter().map(|(name, e)| format!("{name}: {e}")).collect();
+        warnings.extend(prompt_outcome.errors.iter().map(|(name, e)| format!("{name}: {e}")));
 
         let mut tx = self.pool.begin().await?;
         sqlx::query("DELETE FROM items").execute(&mut *tx).await?;
@@ -333,6 +370,64 @@ impl SqliteRepository {
         sqlx::query("INSERT INTO items_fts(items_fts) VALUES('rebuild')")
             .execute(&mut *tx)
             .await?;
+
+        // Prompts (plan.7 H3): clear children then parents, then repopulate
+        // parents before children so the FK never dangles inside the txn. Version
+        // ids are globally unique (PRIMARY KEY), so a copied version file (same id
+        // under two prompt dirs) is kept-first-and-reported rather than poisoning
+        // the transaction — mirroring the item de-dup above.
+        sqlx::query("DELETE FROM prompt_versions").execute(&mut *tx).await?;
+        sqlx::query("DELETE FROM prompts").execute(&mut *tx).await?;
+        let mut seen_versions: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for scanned in &prompt_outcome.prompts {
+            // Which versions survive the global id de-dup. Compute FIRST so a
+            // prompt whose every version was a cross-prompt duplicate does not
+            // leave a childless parent row the current-version JOIN could never
+            // surface (§12 — reachable only via hand-copied UUID-named files).
+            let fresh: Vec<&promptfile::PromptVersionRecord> = scanned
+                .versions
+                .iter()
+                .filter(|version| {
+                    if seen_versions.insert(version.id.as_str()) {
+                        true
+                    } else {
+                        warnings.push(format!(
+                            "{}.md: duplicate prompt version id, skipped",
+                            version.id
+                        ));
+                        false
+                    }
+                })
+                .collect();
+            if fresh.is_empty() {
+                warnings.push(format!(
+                    "{}: prompt has no unique versions, skipped",
+                    scanned.prompt.id
+                ));
+                continue;
+            }
+            sqlx::query("INSERT INTO prompts (id, reusable, created_at) VALUES (?1, ?2, ?3)")
+                .bind(&scanned.prompt.id)
+                .bind(scanned.prompt.reusable)
+                .bind(&scanned.prompt.created_at)
+                .execute(&mut *tx)
+                .await?;
+            for version in fresh {
+                sqlx::query(
+                    "INSERT INTO prompt_versions \
+                     (id, prompt_id, title, body, source, created_at) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                )
+                .bind(&version.id)
+                .bind(&version.prompt_id)
+                .bind(&version.title)
+                .bind(&version.body)
+                .bind(&version.source)
+                .bind(&version.created_at)
+                .execute(&mut *tx)
+                .await?;
+            }
+        }
         tx.commit().await?;
         Ok(warnings)
     }
@@ -379,6 +474,32 @@ impl SqliteRepository {
             .fetch_one(&self.pool)
             .await?;
         Ok(id)
+    }
+
+    /// Force a prompt version's `created_at` so the `(created_at DESC, id ASC)`
+    /// history ordering can be tested against equal timestamps deterministically.
+    pub async fn set_prompt_version_timestamp_for_test(
+        &self,
+        version_id: &str,
+        created_at: &str,
+    ) -> Result<()> {
+        sqlx::query("UPDATE prompt_versions SET created_at = ?1 WHERE id = ?2")
+            .bind(created_at)
+            .bind(version_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Force a prompt version's id (mirrors `set_id_for_test`) so the `id ASC`
+    /// tiebreak in the history ordering can be tested with known ids.
+    pub async fn set_prompt_version_id_for_test(&self, old_id: &str, new_id: &str) -> Result<()> {
+        sqlx::query("UPDATE prompt_versions SET id = ?1 WHERE id = ?2")
+            .bind(new_id)
+            .bind(old_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
     }
 }
 
@@ -653,8 +774,9 @@ impl ItemRepository for SqliteRepository {
     async fn search(&self, query: &str, filter: &ListFilter) -> Result<Vec<Item>> {
         let fts = fts_query(query);
         if fts.is_empty() {
-            // A cleared search box still respects an active filter.
-            return self.list(filter).await;
+            // A cleared search box still respects an active filter. Disambiguated:
+            // `SqliteRepository` now implements two traits, each with a `list`.
+            return ItemRepository::list(self, filter).await;
         }
 
         let mut qb = QueryBuilder::new(
@@ -704,6 +826,257 @@ impl ItemRepository for SqliteRepository {
     }
 }
 
+impl SqliteRepository {
+    /// Compose a `Prompt` from the index: the prompt head plus its CURRENT
+    /// version (head of `created_at DESC, id ASC`), which supplies title/body and
+    /// the derived `updatedAt`, plus a `versionCount`. `NotFound` when the id has
+    /// no prompt row (or, degenerate, no versions). The `ranked` CTE is filtered
+    /// to the one prompt so the window runs over just its versions; `?1` is reused
+    /// (bound once). `project_id` is not selected — the manager stamps it.
+    async fn fetch_prompt(&self, id: &str) -> Result<Prompt> {
+        sqlx::query_as::<_, Prompt>(
+            "WITH ranked AS ( \
+                 SELECT pv.prompt_id, pv.title, pv.body, pv.created_at, \
+                        ROW_NUMBER() OVER (PARTITION BY pv.prompt_id \
+                            ORDER BY pv.created_at DESC, pv.id ASC) AS rn, \
+                        COUNT(*) OVER (PARTITION BY pv.prompt_id) AS n \
+                 FROM prompt_versions pv WHERE pv.prompt_id = ?1 \
+             ) \
+             SELECT p.id, r.title, r.body, p.reusable, p.created_at, \
+                    r.created_at AS updated_at, r.n AS version_count \
+             FROM prompts p JOIN ranked r ON r.prompt_id = p.id AND r.rn = 1 \
+             WHERE p.id = ?1",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?
+        .ok_or(AppError::NotFound)
+    }
+}
+
+#[async_trait::async_trait]
+impl PromptRepository for SqliteRepository {
+    async fn list(&self, filter: &PromptListFilter) -> Result<Vec<Prompt>> {
+        // The `ranked` CTE selects each prompt's current version; the outer query
+        // joins it to the prompt head. List order mirrors items' "updated"
+        // default: current version recency, then id ASC as a deterministic
+        // tiebreak. `reusable_only` is a static SQL literal (never user text).
+        let reusable_only = filter.reusable_only.unwrap_or(false);
+        let mut qb = QueryBuilder::new(
+            "WITH ranked AS ( \
+                 SELECT pv.prompt_id, pv.title, pv.body, pv.created_at, \
+                        ROW_NUMBER() OVER (PARTITION BY pv.prompt_id \
+                            ORDER BY pv.created_at DESC, pv.id ASC) AS rn, \
+                        COUNT(*) OVER (PARTITION BY pv.prompt_id) AS n \
+                 FROM prompt_versions pv",
+        );
+        if reusable_only {
+            // Restrict the window to versions of reusable prompts BEFORE ranking,
+            // so the `idx_prompts_reusable` partial index drives the scan instead
+            // of ranking every version of every prompt (§12). The outer join to
+            // `prompts` then yields only those prompts — no separate outer filter
+            // needed (a non-reusable prompt has no `ranked` row to join).
+            qb.push(" WHERE pv.prompt_id IN (SELECT id FROM prompts WHERE reusable = 1)");
+        }
+        qb.push(
+            " ) \
+             SELECT p.id, r.title, r.body, p.reusable, p.created_at, \
+                    r.created_at AS updated_at, r.n AS version_count \
+             FROM prompts p JOIN ranked r ON r.prompt_id = p.id AND r.rn = 1 \
+             ORDER BY r.created_at DESC, p.id ASC",
+        );
+        let prompts = qb.build_query_as::<Prompt>().fetch_all(&self.pool).await?;
+        Ok(prompts)
+    }
+
+    async fn get(&self, id: &str) -> Result<Prompt> {
+        self.fetch_prompt(id).await
+    }
+
+    async fn create(&self, input: NewPrompt) -> Result<Prompt> {
+        let title = input.title.trim();
+        if title.is_empty() {
+            return Err(AppError::Invalid("prompt title must not be empty".into()));
+        }
+        let title = title.to_string();
+        let body = input.body.unwrap_or_default();
+        let reusable = input.reusable.unwrap_or(false);
+        // Provenance of the first version (§12): normally "manual", but the
+        // frontend sends "aiEnhanced" when a new draft's first persisted content
+        // is an accepted AI-enhance proposal. Normalized to the closed set.
+        let source = normalize_prompt_source(input.source.as_deref());
+
+        // Backend-owned ids + timestamp (H2): never client-supplied. The prompt
+        // and its first version share `created_at` so the derived `updatedAt`
+        // equals the creation time on a brand-new prompt.
+        let now = now_rfc3339();
+        let prompt_id = uuid::Uuid::new_v4().to_string();
+        let version_id = uuid::Uuid::new_v4().to_string();
+
+        let head = promptfile::PromptRecord {
+            id: prompt_id.clone(),
+            reusable,
+            created_at: now.clone(),
+        };
+        let version = promptfile::PromptVersionRecord {
+            id: version_id.clone(),
+            prompt_id: prompt_id.clone(),
+            title: title.clone(),
+            body: body.clone(),
+            source: source.to_string(),
+            created_at: now.clone(),
+        };
+
+        // File-then-index: write `prompt.md` and the first version file before
+        // the index rows, so the git-tracked store is the source of truth.
+        if let Some(dir) = &self.prompts_dir {
+            promptfile::write_prompt(dir, &head).map_err(save_prompt_file_error)?;
+            promptfile::write_version(dir, &version).map_err(save_prompt_file_error)?;
+        }
+
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("INSERT INTO prompts (id, reusable, created_at) VALUES (?1, ?2, ?3)")
+            .bind(&prompt_id)
+            .bind(reusable)
+            .bind(&now)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query(
+            "INSERT INTO prompt_versions (id, prompt_id, title, body, source, created_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        )
+        .bind(&version_id)
+        .bind(&prompt_id)
+        .bind(&title)
+        .bind(&body)
+        .bind(source)
+        .bind(&now)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+
+        self.fetch_prompt(&prompt_id).await
+    }
+
+    async fn update(&self, id: &str, patch: UpdatePrompt) -> Result<Prompt> {
+        let current = self.fetch_prompt(id).await?; // NotFound if absent
+
+        // Resolve the new content. A title/body change (against the CURRENT
+        // version) appends a new immutable version; an identical save appends
+        // none, so history never bloats with duplicates.
+        let new_title = match patch.title {
+            Some(t) => {
+                let t = t.trim().to_string();
+                if t.is_empty() {
+                    return Err(AppError::Invalid("prompt title must not be empty".into()));
+                }
+                t
+            }
+            None => current.title.clone(),
+        };
+        let new_body = patch.body.unwrap_or_else(|| current.body.clone());
+        let content_changed = new_title != current.title || new_body != current.body;
+
+        let new_reusable = patch.reusable.unwrap_or(current.reusable);
+        let reusable_changed = new_reusable != current.reusable;
+
+        // Normalize `source` to the closed set — the accept-proposal path sends
+        // "aiEnhanced"; anything else (incl. a manual save) is "manual".
+        let source = normalize_prompt_source(patch.source.as_deref());
+
+        // Files first (append the version, rewrite the head), then the index rows
+        // in one transaction. An existing version file is NEVER touched (H2).
+        let now = now_rfc3339();
+        let version_id = uuid::Uuid::new_v4().to_string();
+        if let Some(dir) = &self.prompts_dir {
+            if content_changed {
+                let version = promptfile::PromptVersionRecord {
+                    id: version_id.clone(),
+                    prompt_id: id.to_string(),
+                    title: new_title.clone(),
+                    body: new_body.clone(),
+                    source: source.to_string(),
+                    created_at: now.clone(),
+                };
+                promptfile::write_version(dir, &version).map_err(save_prompt_file_error)?;
+            }
+            if reusable_changed {
+                let head = promptfile::PromptRecord {
+                    id: id.to_string(),
+                    reusable: new_reusable,
+                    created_at: current.created_at.clone(),
+                };
+                promptfile::write_prompt(dir, &head).map_err(save_prompt_file_error)?;
+            }
+        }
+
+        let mut tx = self.pool.begin().await?;
+        if content_changed {
+            sqlx::query(
+                "INSERT INTO prompt_versions (id, prompt_id, title, body, source, created_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            )
+            .bind(&version_id)
+            .bind(id)
+            .bind(&new_title)
+            .bind(&new_body)
+            .bind(source)
+            .bind(&now)
+            .execute(&mut *tx)
+            .await?;
+        }
+        if reusable_changed {
+            sqlx::query("UPDATE prompts SET reusable = ?1 WHERE id = ?2")
+                .bind(new_reusable)
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+
+        self.fetch_prompt(id).await
+    }
+
+    async fn versions(&self, prompt_id: &str) -> Result<Vec<PromptVersion>> {
+        let versions = sqlx::query_as::<_, PromptVersion>(
+            "SELECT id, prompt_id, title, body, source, created_at \
+             FROM prompt_versions WHERE prompt_id = ?1 \
+             ORDER BY created_at DESC, id ASC",
+        )
+        .bind(prompt_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(versions)
+    }
+
+    async fn delete(&self, id: &str) -> Result<()> {
+        // Confirm existence for a clean NotFound, remove the canonical dir, then
+        // the index rows. Children then parent EXPLICITLY, so it works whether or
+        // not the pool has `foreign_keys` ON (the in-memory test pool does not).
+        let exists: Option<i64> = sqlx::query_scalar("SELECT 1 FROM prompts WHERE id = ?1")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?;
+        if exists.is_none() {
+            return Err(AppError::NotFound);
+        }
+        if let Some(dir) = &self.prompts_dir {
+            promptfile::remove_prompt(dir, id).map_err(save_prompt_file_error)?;
+        }
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("DELETE FROM prompt_versions WHERE prompt_id = ?1")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM prompts WHERE id = ?1")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+}
+
 /// The single clean rejection for any file that is not a valid worknotes
 /// project store — foreign `application_id`, unknown schema object, missing
 /// identity, or a non-SQLite file whose first PRAGMA fails. Deliberately says
@@ -723,6 +1096,26 @@ fn scrub_open_error(_err: sqlx::Error) -> AppError {
 /// so it is safe to surface (Section 4.6).
 fn save_file_error(e: itemfile::ItemFileError) -> AppError {
     AppError::Invalid(format!("couldn't save the item to disk: {e}"))
+}
+
+/// Map a prompt/version file write/remove failure. Like `PromptFileError`'s
+/// `Display`, it carries only an `io::ErrorKind` word and field names — never a
+/// path, prompt body, or SQLite text — so it is safe to surface (Section 4.6/M3).
+fn save_prompt_file_error(e: promptfile::PromptFileError) -> AppError {
+    AppError::Invalid(format!("couldn't save the prompt to disk: {e}"))
+}
+
+/// Normalize a client-supplied prompt `source` to the closed set: anything but
+/// the exact `"aiEnhanced"` marker (including `None`/absent, or a garbage value)
+/// is `"manual"`. Shared by `create` (first-version provenance) and `update`
+/// (new-version provenance), mirroring `promptfile`'s parse-time normalization
+/// so the index and the files can never disagree on a version's source.
+fn normalize_prompt_source(source: Option<&str>) -> &'static str {
+    if source == Some("aiEnhanced") {
+        "aiEnhanced"
+    } else {
+        "manual"
+    }
 }
 
 /// Map a migration failure to a clean message. A DB carrying a migration our

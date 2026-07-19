@@ -73,8 +73,9 @@ pub fn file_name(id: &str) -> Result<String, ItemFileError> {
 }
 
 /// A 8-4-4-4-12 hex UUID (any version/variant). We only ever mint v4, but any
-/// canonical UUID is a safe, separator-free file stem.
-fn is_uuid(s: &str) -> bool {
+/// canonical UUID is a safe, separator-free file stem. Exposed to `promptfile`,
+/// which derives its prompt-dir and version-file names from the same UUID check.
+pub(crate) fn is_uuid(s: &str) -> bool {
     let groups = [8usize, 4, 4, 4, 12];
     let parts: Vec<&str> = s.split('-').collect();
     parts.len() == groups.len()
@@ -254,8 +255,9 @@ pub fn parse(text: &str) -> Result<Item, ItemFileError> {
 /// Read a file into a string, reading AT MOST `MAX_ITEM_FILE_BYTES + 1` bytes so
 /// a file grown past the cap since its `metadata` check can't be slurped whole
 /// (a TOCTOU guard). `Ok(None)` means it exceeded the cap; `Ok(Some(_))` is the
-/// content.
-fn read_capped(path: &Path) -> std::io::Result<Option<String>> {
+/// content. Shared with `promptfile` so prompt/version files get the same
+/// bounded, TOCTOU-safe read against `MAX_ITEM_FILE_BYTES`.
+pub(crate) fn read_capped(path: &Path) -> std::io::Result<Option<String>> {
     use std::io::Read;
     let file = std::fs::File::open(path)?;
     let mut buf = String::new();
@@ -364,8 +366,9 @@ pub fn scan(items_dir: &Path) -> ScanOutcome {
 /// that merely contains a lone `<<<<<<<` or `>>>>>>>` line (a pasted snippet, a
 /// row of equals signs) is not a conflict and must still round-trip. This keeps
 /// a single such line from permanently blocking a whole project's import while
-/// still catching real, resolvable conflicts.
-fn has_conflict_markers(text: &str) -> bool {
+/// still catching real, resolvable conflicts. Shared with `promptfile`, which
+/// rejects a conflicted prompt/version file the same way.
+pub(crate) fn has_conflict_markers(text: &str) -> bool {
     let mut opened = false;
     let mut closed = false;
     for line in text.lines() {
@@ -421,8 +424,9 @@ fn split_field(raw: &str) -> Option<(&str, &str)> {
 
 /// Double-quote a scalar and escape what would break a single line. Applied to
 /// free-text values (title, tags, jira_url); enum/bool/timestamp values are
-/// bareword-safe and written unquoted.
-fn quote(s: &str) -> String {
+/// bareword-safe and written unquoted. Shared with `promptfile` for its quoted
+/// title/body-carrying fields.
+pub(crate) fn quote(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('"');
     for c in s.chars() {
@@ -439,7 +443,7 @@ fn quote(s: &str) -> String {
     out
 }
 
-fn unquote(s: &str) -> Result<String, ItemFileError> {
+pub(crate) fn unquote(s: &str) -> Result<String, ItemFileError> {
     let bytes = s.as_bytes();
     if bytes.len() < 2 || bytes[0] != b'"' || bytes[bytes.len() - 1] != b'"' {
         return Err(ItemFileError::Malformed(format!("unquoted value: {s}")));

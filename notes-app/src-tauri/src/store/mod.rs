@@ -5,3 +5,4 @@
 //! write into a file and rebuilds the index from files on load.
 
 pub mod itemfile;
+pub mod promptfile;

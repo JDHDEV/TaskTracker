@@ -169,6 +169,28 @@ fn strip_wrapping_quotes(s: &str) -> &str {
     }
 }
 
+/// The single generic message every scrubbed rewrite/enhance error collapses to.
+/// Shared by `ai_rewrite` and the `ai_rewrite_stream` terminal (plan.7 M2) so
+/// neither leaks a raw upstream response body.
+pub const REWRITE_GENERIC_ERROR: &str = "couldn't rework the text — try again";
+
+/// The title path's generic message (kept distinct so the copy reads naturally).
+const TITLE_GENERIC_ERROR: &str = "couldn't generate a title — try again";
+
+/// Scrub a provider/HTTP error so a raw upstream response body (which the vendor
+/// impls embed as `"…API returned {status}: {body}"`) never reaches the UI. The
+/// distinct `MissingKey` case passes through UNCHANGED — its actionable "add one
+/// in Settings" copy is safe and useful; every other error collapses to
+/// `generic`. Single-sourced here and called by the title, rewrite, and
+/// streaming-rewrite paths (plan.7 M2 — the enhance flow rides the same stream,
+/// so scrubbing it fixes the pre-existing rewrite leak too).
+pub fn scrub_provider_error(err: AppError, generic: &str) -> AppError {
+    match err {
+        AppError::MissingKey(_) => err,
+        _ => AppError::Provider(generic.into()),
+    }
+}
+
 /// Core of the `ai_generate_title` command, factored out so integration tests
 /// can drive it with a fake `AiProvider` (the `#[tauri::command]` wrapper needs
 /// `State<AppState>` and cannot run outside a live Tauri app — see
@@ -190,15 +212,10 @@ pub async fn generate_title(
     let raw = provider
         .rewrite(http, text, TITLE_INSTRUCTION)
         .await
-        .map_err(|err| match err {
-            AppError::MissingKey(_) => err,
-            _ => AppError::Provider("couldn't generate a title — try again".into()),
-        })?;
+        .map_err(|err| scrub_provider_error(err, TITLE_GENERIC_ERROR))?;
     let title = sanitize_title(&raw);
     if title.is_empty() {
-        return Err(AppError::Provider(
-            "couldn't generate a title — try again".into(),
-        ));
+        return Err(AppError::Provider(TITLE_GENERIC_ERROR.into()));
     }
     Ok(title)
 }
@@ -225,7 +242,33 @@ pub(crate) fn take_lines(buf: &mut Vec<u8>, flush: bool) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{sanitize_title, take_lines};
+    use super::{sanitize_title, scrub_provider_error, take_lines, REWRITE_GENERIC_ERROR};
+    use crate::error::AppError;
+
+    #[test]
+    fn scrub_provider_error_collapses_a_raw_body_but_preserves_missing_key() {
+        // A provider error embedding a raw upstream body (the exact shape the
+        // vendor impls build) must collapse to the generic copy — no leak (M2).
+        let leaked = AppError::Provider(
+            "Anthropic API returned 401: {\"error\":\"invalid_api_key sk-secret-leak\"}".into(),
+        );
+        let scrubbed = scrub_provider_error(leaked, REWRITE_GENERIC_ERROR);
+        assert_eq!(scrubbed.to_string(), REWRITE_GENERIC_ERROR);
+        assert!(!scrubbed.to_string().contains("sk-secret-leak"), "raw upstream body must not leak");
+
+        // A network error also collapses (no reqwest detail leaks). A real
+        // `reqwest::Error` is built offline from an unparseable URL.
+        let http_err = reqwest::Client::new().get("not a url").build().unwrap_err();
+        assert_eq!(
+            scrub_provider_error(AppError::Http(http_err), REWRITE_GENERIC_ERROR).to_string(),
+            REWRITE_GENERIC_ERROR
+        );
+
+        // MissingKey passes through UNCHANGED — its actionable copy is preserved.
+        let mk = scrub_provider_error(AppError::MissingKey("anthropic".into()), REWRITE_GENERIC_ERROR);
+        assert!(matches!(mk, AppError::MissingKey(_)));
+        assert!(mk.to_string().contains("add one in Settings"));
+    }
 
     #[test]
     fn sanitize_title_passes_a_clean_one_line_title_through_trimmed() {

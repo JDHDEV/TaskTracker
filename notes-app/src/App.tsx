@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState, type KeyboardEvent } from "react";
 import type {
   Item,
   Kind,
@@ -16,6 +16,9 @@ import ItemList, { KindFilter, StatusFilter } from "./components/ItemList";
 import Editor from "./components/Editor";
 import SettingsDialog from "./components/SettingsDialog";
 import ManageProjectsDialog from "./components/ManageProjectsDialog";
+import PromptsPage from "./components/PromptsPage";
+
+type Page = "worknotes" | "prompts";
 
 export default function App() {
   const [items, setItems] = useState<Item[]>([]);
@@ -49,6 +52,11 @@ export default function App() {
   const [theme, setTheme] = useState<"light" | "dark">(() =>
     localStorage.getItem("theme") === "dark" ? "dark" : "light",
   );
+
+  // Router-free page toggle (Worknotes / Prompts). Both pages stay mounted
+  // (the inactive one is hidden, not unmounted — see the `hidden` wrappers
+  // below), so switching never discards an in-progress edit on either page.
+  const [page, setPage] = useState<Page>("worknotes");
 
   // Monotonic request token: a slow listItems that resolves after a newer load
   // (or after an unload closed a store) must not repopulate the list. Only the
@@ -248,10 +256,48 @@ export default function App() {
     }
   }
 
+  // Roving-tab-index page tablist: Left/Right moves to (and activates) the
+  // other tab and moves focus there, matching standard WAI-ARIA tab behavior.
+  function onPageTabKeyDown(e: KeyboardEvent<HTMLButtonElement>) {
+    if (e.key !== "ArrowLeft" && e.key !== "ArrowRight") return;
+    e.preventDefault();
+    const next: Page = page === "worknotes" ? "prompts" : "worknotes";
+    setPage(next);
+    document
+      .getElementById(next === "worknotes" ? "tab-worknotes" : "tab-prompts")
+      ?.focus();
+  }
+
   return (
     <div className="app">
       <header className="topbar">
         <span className="wordmark">worknotes</span>
+        <div className="page-tabs" role="tablist" aria-label="Pages">
+          <button
+            id="tab-worknotes"
+            role="tab"
+            aria-selected={page === "worknotes"}
+            aria-controls="panel-worknotes"
+            tabIndex={page === "worknotes" ? 0 : -1}
+            className={page === "worknotes" ? "page-tab page-tab-on" : "page-tab"}
+            onClick={() => setPage("worknotes")}
+            onKeyDown={onPageTabKeyDown}
+          >
+            Worknotes
+          </button>
+          <button
+            id="tab-prompts"
+            role="tab"
+            aria-selected={page === "prompts"}
+            aria-controls="panel-prompts"
+            tabIndex={page === "prompts" ? 0 : -1}
+            className={page === "prompts" ? "page-tab page-tab-on" : "page-tab"}
+            onClick={() => setPage("prompts")}
+            onKeyDown={onPageTabKeyDown}
+          >
+            Prompts
+          </button>
+        </div>
         <span className="meta-spring" />
         <button
           className="btn btn-quiet"
@@ -285,6 +331,13 @@ export default function App() {
         </div>
       )}
 
+      <div
+        className="page-body"
+        role="tabpanel"
+        id="panel-worknotes"
+        aria-labelledby="tab-worknotes"
+        hidden={page !== "worknotes"}
+      >
       <div className="panes">
         <ItemList
           items={items}
@@ -353,6 +406,17 @@ export default function App() {
             </p>
           </section>
         )}
+      </div>
+      </div>
+
+      <div
+        className="page-body"
+        role="tabpanel"
+        id="panel-prompts"
+        aria-labelledby="tab-prompts"
+        hidden={page !== "prompts"}
+      >
+        <PromptsPage loaded={loaded} onError={setError} />
       </div>
 
       {showProjects && (

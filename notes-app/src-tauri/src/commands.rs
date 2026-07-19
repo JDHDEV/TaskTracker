@@ -9,7 +9,10 @@ use tauri::State;
 use crate::ai::{self, keys, ChunkSink, RewriteErrorCode, RewriteEvent};
 use crate::error::{AppError, Result};
 use crate::jira;
-use crate::models::{Item, JiraConfig, ListFilter, NewItem, ProjectInfo, TicketMeta, UpdateItem};
+use crate::models::{
+    Item, JiraConfig, ListFilter, NewItem, NewPrompt, ProjectInfo, Prompt, PromptListFilter,
+    PromptVersion, TicketMeta, UpdateItem, UpdatePrompt,
+};
 use crate::projects::ProjectManager;
 
 /// Everything commands are allowed to touch. Commands depend only on the
@@ -68,6 +71,56 @@ pub async fn search_items(
 #[tauri::command]
 pub async fn list_active_tags(state: State<'_, AppState>) -> Result<Vec<String>> {
     state.manager.active_tags_union().await
+}
+
+// --- Prompts (plan.7) ------------------------------------------------------
+// Thin wrappers over the manager, mirroring the item commands. Prompts are
+// viewed one project at a time, so `list_prompts` requires a `projectId` in its
+// filter; the manager rejects an empty/absent one. All prompt/model text reaches
+// the frontend as plain strings rendered in text nodes (no HTML — M4).
+
+#[tauri::command]
+pub async fn list_prompts(
+    state: State<'_, AppState>,
+    filter: Option<PromptListFilter>,
+) -> Result<Vec<Prompt>> {
+    state.manager.list_prompts(&filter.unwrap_or_default()).await
+}
+
+#[tauri::command]
+pub async fn get_prompt(state: State<'_, AppState>, id: String) -> Result<Prompt> {
+    state.manager.get_prompt(&id).await
+}
+
+#[tauri::command]
+pub async fn create_prompt(state: State<'_, AppState>, input: NewPrompt) -> Result<Prompt> {
+    state.manager.create_prompt(input).await
+}
+
+/// Patch a prompt. A `title`/`body` change appends a new version (with `source`,
+/// defaulting to `"manual"`; the accept-proposal path sends `"aiEnhanced"`); a
+/// `reusable`-only change appends no version and does not move `updatedAt`.
+#[tauri::command]
+pub async fn update_prompt(
+    state: State<'_, AppState>,
+    id: String,
+    patch: UpdatePrompt,
+) -> Result<Prompt> {
+    state.manager.update_prompt(&id, patch).await
+}
+
+/// The full version history for one prompt, newest-first.
+#[tauri::command]
+pub async fn list_prompt_versions(
+    state: State<'_, AppState>,
+    prompt_id: String,
+) -> Result<Vec<PromptVersion>> {
+    state.manager.prompt_versions(&prompt_id).await
+}
+
+#[tauri::command]
+pub async fn delete_prompt(state: State<'_, AppState>, id: String) -> Result<()> {
+    state.manager.delete_prompt(&id).await
 }
 
 // --- Project lifecycle -----------------------------------------------------
@@ -160,14 +213,19 @@ pub struct RewriteRequest {
 
 /// Runs the text through the chosen provider and returns the rewrite.
 /// The frontend decides whether to apply it — the backend never silently
-/// overwrites the user's words.
+/// overwrites the user's words. Provider/HTTP errors are scrubbed (plan.7 M2) so
+/// a raw upstream response body never surfaces; only the distinct `MissingKey`
+/// case keeps its actionable copy.
 #[tauri::command]
 pub async fn ai_rewrite(state: State<'_, AppState>, req: RewriteRequest) -> Result<String> {
     if req.text.trim().is_empty() {
         return Err(AppError::Invalid("there is no text to rework".into()));
     }
     let provider = ai::provider_for(&req.provider)?;
-    provider.rewrite(&state.http, &req.text, &req.instruction).await
+    provider
+        .rewrite(&state.http, &req.text, &req.instruction)
+        .await
+        .map_err(|e| ai::scrub_provider_error(e, ai::REWRITE_GENERIC_ERROR))
 }
 
 #[derive(Debug, Deserialize)]
@@ -278,10 +336,15 @@ pub async fn ai_rewrite_stream(
     } else {
         match result {
             Ok(text) => RewriteEvent::Done { text },
-            Err(err) => RewriteEvent::Error {
-                code: error_code_for(&err),
-                message: err.to_string(),
-            },
+            Err(err) => {
+                // Preserve the code semantics (Network vs Provider vs Invalid)
+                // from the ORIGINAL error, but scrub the MESSAGE so a raw upstream
+                // response body never reaches the toast (plan.7 M2). The distinct
+                // MissingKey copy is preserved by the scrubber.
+                let code = error_code_for(&err);
+                let message = ai::scrub_provider_error(err, ai::REWRITE_GENERIC_ERROR).to_string();
+                RewriteEvent::Error { code, message }
+            }
         }
     };
     let _ = on_event.send(terminal);

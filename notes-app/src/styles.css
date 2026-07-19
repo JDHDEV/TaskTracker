@@ -91,6 +91,49 @@ textarea {
   letter-spacing: 0.08em;
 }
 
+/* Page-switch tabs (Worknotes / Prompts). The active indicator is an ink
+   bottom-border underline, never the signature yellow — that stays reserved
+   for the AI review card. */
+.page-tabs {
+  display: flex;
+  gap: 4px;
+  margin-left: 4px;
+}
+
+.page-tab {
+  padding: 6px 4px;
+  border: none;
+  border-bottom: 2px solid transparent;
+  background: transparent;
+  color: var(--muted);
+  font-family: var(--font-meta);
+  font-size: 12px;
+  letter-spacing: 0.06em;
+  cursor: pointer;
+}
+
+.page-tab:hover {
+  color: var(--ink);
+}
+
+.page-tab-on {
+  color: var(--ink);
+  border-bottom-color: var(--ink);
+  font-weight: 600;
+}
+
+/* Both pages stay mounted (so switching preserves in-progress edits); the
+   inactive one is hidden entirely via the `hidden` attribute rather than
+   unmounted. `display: contents` keeps `.panes` a direct flex child of `.app`
+   when visible, so its `flex: 1` sizing is unaffected by this wrapper. */
+.page-body {
+  display: contents;
+}
+
+.page-body[hidden] {
+  display: none;
+}
+
 .toast {
   display: flex;
   align-items: center;
@@ -251,6 +294,14 @@ textarea {
   font-family: var(--font-meta);
   font-size: 11px;
   letter-spacing: 0.08em;
+  color: var(--muted);
+}
+
+/* Prompt list row's version-count badge, and its editor-meta-row twin. */
+.row-version,
+.prompt-version {
+  font-family: var(--font-meta);
+  font-size: 11px;
   color: var(--muted);
 }
 
@@ -520,6 +571,14 @@ textarea {
   background: var(--mark-soft);
   border-color: var(--mark);
   color: var(--mark-ink);
+}
+
+/* Reusable-prompt toggle, "on" state — green like the reusable pill and the
+   loaded-project chip; yellow stays reserved for AI review moments. */
+.btn-reusable-on {
+  background: transparent;
+  border-color: var(--done);
+  color: var(--done);
 }
 
 .btn-save {
@@ -947,6 +1006,56 @@ textarea {
   margin-top: 4px;
   padding-top: 12px;
   border-top: 1px solid var(--line);
+}
+
+/* Prompt version history dialog */
+.dialog-history {
+  width: min(560px, calc(100vw - 32px));
+}
+
+.version-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  max-height: 60vh;
+  overflow-y: auto;
+}
+
+.version-row {
+  padding: 10px 0;
+  border-top: 1px solid var(--line);
+}
+
+.version-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 4px;
+}
+
+.version-when {
+  font-family: var(--font-meta);
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.version-title {
+  font-weight: 600;
+  margin-bottom: 4px;
+}
+
+.version-body {
+  margin: 0;
+  padding: 8px 10px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--bg);
+  font-family: var(--font-ui);
+  font-size: 13px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  max-height: 160px;
+  overflow-y: auto;
 }
 
 @media (prefers-reduced-motion: no-preference) {
