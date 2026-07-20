@@ -72,4 +72,24 @@ pub trait PromptRepository: Send + Sync {
     async fn versions(&self, prompt_id: &str) -> Result<Vec<PromptVersion>>;
     /// Remove the prompt and all its versions (files + index rows).
     async fn delete(&self, id: &str) -> Result<()>;
+    /// Count of prompts in this store (for the project prompt-count chip) — a
+    /// cheap `COUNT(*)` over `prompts`, mirroring `count_active` for items. Counts
+    /// prompts, not versions; the reusable flag does not filter it.
+    async fn count_prompts(&self) -> Result<i64>;
+    /// Import a prompt with its FULL version history VERBATIM (plan.8 move).
+    /// Unlike `create` (which mints fresh ids and a single first version), this
+    /// preserves the prompt `id`/`reusable`/`created_at` and EACH version's
+    /// `id`/`title`/`body`/`source`/`created_at` (the user chose an id-preserving
+    /// move — byte-identical history). Writes `prompt.md` + one immutable version
+    /// file per version into this store, then inserts the index rows in one
+    /// transaction (files-then-index, parent-before-child). Modeled on
+    /// `insert_item_verbatim`. Callers (`ProjectManager::move_prompt`) verify the
+    /// imported history against the source before deleting the source.
+    async fn import_prompt(
+        &self,
+        prompt_id: &str,
+        reusable: bool,
+        prompt_created_at: &str,
+        versions: &[PromptVersion],
+    ) -> Result<Prompt>;
 }

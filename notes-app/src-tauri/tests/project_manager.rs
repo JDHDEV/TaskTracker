@@ -1417,3 +1417,254 @@ async fn delete_files_also_removes_the_prompts_directory() {
 
     assert!(!dir.path().join("prompts").exists(), "delete_files removes the canonical prompts/ dir");
 }
+
+// ---------------------------------------------------------------------------
+// Move a prompt between projects (plan.8) — the app's first cross-store
+// mutation. The user chose the ID-PRESERVING move, so these assert id EQUALITY
+// (target id == source id) and full content/provenance preservation. Ordering
+// (copy-all → verify → delete-source-last) is exercised end to end against real
+// on-disk stores.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn move_prompt_relocates_the_prompt_with_full_history_preserved() {
+    let (mgr, _app) = new_manager().await;
+    let (a, dir_a) = create_project(&mgr, "Alpha").await;
+    let (b, dir_b) = create_project(&mgr, "Beta").await;
+
+    // A prompt in A with two versions of different provenance.
+    let p = mgr.create_prompt(new_prompt(&a.id, "release email", "v1 body")).await.unwrap();
+    mgr.update_prompt(
+        &p.id,
+        UpdatePrompt { body: Some("v2 body".into()), source: Some("aiEnhanced".into()), ..Default::default() },
+    )
+    .await
+    .unwrap();
+    let before = mgr.prompt_versions(&p.id).await.unwrap();
+    assert_eq!(before.len(), 2);
+
+    let moved = mgr.move_prompt(&p.id, &b.id).await.unwrap();
+
+    // The id is PRESERVED (id-preserving move) and stamped with the target.
+    assert_eq!(moved.id, p.id, "the prompt id is preserved across the move");
+    assert_eq!(moved.project_id.as_deref(), Some(b.id.as_str()));
+
+    // Source subtree gone; target has the same-id subtree with prompt.md + one
+    // immutable file per version.
+    assert!(!dir_a.path().join("prompts").join(&p.id).exists(), "the source prompt dir is gone");
+    let tgt_dir = dir_b.path().join("prompts").join(&p.id);
+    assert!(tgt_dir.join("prompt.md").is_file(), "the target has prompt.md");
+    let version_files = std::fs::read_dir(&tgt_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            let name = e.file_name();
+            let name = name.to_string_lossy();
+            name.ends_with(".md") && name != "prompt.md"
+        })
+        .count();
+    assert_eq!(version_files, 2, "one immutable version file per source version");
+
+    // Full history preserved (content + provenance + order), re-read from target.
+    let after = mgr.prompt_versions(&p.id).await.unwrap();
+    assert_eq!(after.len(), before.len());
+    for (x, y) in before.iter().zip(after.iter()) {
+        assert_eq!(x.id, y.id, "version id preserved");
+        assert_eq!(x.title, y.title);
+        assert_eq!(x.body, y.body);
+        assert_eq!(x.source, y.source, "provenance preserved");
+        assert_eq!(x.created_at, y.created_at);
+    }
+
+    // get routes to the target now (prompt_owner sees a single owner — no error);
+    // list scoping reflects the move.
+    assert_eq!(mgr.get_prompt(&p.id).await.unwrap().project_id.as_deref(), Some(b.id.as_str()));
+    let in_a = mgr
+        .list_prompts(&PromptListFilter { project_id: Some(a.id.clone()), ..Default::default() })
+        .await
+        .unwrap();
+    assert!(in_a.is_empty(), "the source project no longer lists the prompt");
+    let in_b = mgr
+        .list_prompts(&PromptListFilter { project_id: Some(b.id.clone()), ..Default::default() })
+        .await
+        .unwrap();
+    assert_eq!(in_b.len(), 1);
+    assert_eq!(in_b[0].id, p.id);
+}
+
+#[tokio::test]
+async fn move_prompt_survives_reload_of_both_projects() {
+    // Proves the FILES (not just the index) reflect the move: after reload, the
+    // rebuilt index of both projects matches — source empty, target full history.
+    let (mgr, _app) = new_manager().await;
+    let (a, _dir_a) = create_project(&mgr, "Alpha").await;
+    let (b, _dir_b) = create_project(&mgr, "Beta").await;
+    let p = mgr.create_prompt(new_prompt(&a.id, "t", "v1")).await.unwrap();
+    mgr.update_prompt(&p.id, UpdatePrompt { body: Some("v2".into()), ..Default::default() }).await.unwrap();
+    mgr.move_prompt(&p.id, &b.id).await.unwrap();
+
+    mgr.reload(&a.id).await.unwrap();
+    mgr.reload(&b.id).await.unwrap();
+
+    let in_a = mgr
+        .list_prompts(&PromptListFilter { project_id: Some(a.id.clone()), ..Default::default() })
+        .await
+        .unwrap();
+    assert!(in_a.is_empty(), "after reload the source has no prompt files → empty");
+    let in_b = mgr
+        .list_prompts(&PromptListFilter { project_id: Some(b.id.clone()), ..Default::default() })
+        .await
+        .unwrap();
+    assert_eq!(in_b.len(), 1);
+    let hist = mgr.prompt_versions(&p.id).await.unwrap();
+    assert_eq!(hist.len(), 2, "the full history rebuilds from the target's files");
+}
+
+#[tokio::test]
+async fn move_prompt_to_same_project_is_rejected_and_leaves_the_source_unchanged() {
+    let (mgr, _app) = new_manager().await;
+    let (a, _dir_a) = create_project(&mgr, "Alpha").await;
+    let p = mgr.create_prompt(new_prompt(&a.id, "t", "b")).await.unwrap();
+    assert!(matches!(mgr.move_prompt(&p.id, &a.id).await.unwrap_err(), AppError::Invalid(_)));
+    // Still exactly one copy, untouched.
+    let in_a = mgr
+        .list_prompts(&PromptListFilter { project_id: Some(a.id.clone()), ..Default::default() })
+        .await
+        .unwrap();
+    assert_eq!(in_a.len(), 1);
+    assert_eq!(mgr.get_prompt(&p.id).await.unwrap().id, p.id);
+}
+
+#[tokio::test]
+async fn move_prompt_requires_a_loaded_target_and_an_existing_prompt() {
+    let (mgr, _app) = new_manager().await;
+    let (a, _dir_a) = create_project(&mgr, "Alpha").await;
+    let (b, _dir_b) = create_project(&mgr, "Beta").await;
+    let p = mgr.create_prompt(new_prompt(&a.id, "t", "b")).await.unwrap();
+
+    // Unknown target id → Invalid (not loaded); empty target → Invalid.
+    assert!(matches!(mgr.move_prompt(&p.id, "no-such-project").await.unwrap_err(), AppError::Invalid(_)));
+    assert!(matches!(mgr.move_prompt(&p.id, "   ").await.unwrap_err(), AppError::Invalid(_)));
+
+    // Unload B → a move to B is Invalid (target not loaded), NOT a panic.
+    mgr.unload(&b.id).await.unwrap();
+    assert!(matches!(mgr.move_prompt(&p.id, &b.id).await.unwrap_err(), AppError::Invalid(_)));
+
+    // The source is untouched after every failed move.
+    assert_eq!(mgr.get_prompt(&p.id).await.unwrap().id, p.id);
+
+    // An unknown prompt id → NotFound.
+    assert!(matches!(mgr.move_prompt("no-such-prompt", &a.id).await.unwrap_err(), AppError::NotFound));
+}
+
+#[tokio::test]
+async fn move_prompt_preserves_reusable_updated_at_and_version_count() {
+    // The test most likely to catch a naive delete+recreate that re-stamps
+    // timestamps: the derived updatedAt (= newest version created_at) must be
+    // byte-identical after the move, and the reusable head must travel.
+    let (mgr, _app) = new_manager().await;
+    let (a, _dir_a) = create_project(&mgr, "Alpha").await;
+    let (b, _dir_b) = create_project(&mgr, "Beta").await;
+    let p = mgr
+        .create_prompt(NewPrompt { reusable: Some(true), ..new_prompt(&a.id, "t", "v1") })
+        .await
+        .unwrap();
+    mgr.update_prompt(&p.id, UpdatePrompt { body: Some("v2".into()), ..Default::default() }).await.unwrap();
+    let before = mgr.get_prompt(&p.id).await.unwrap();
+
+    let moved = mgr.move_prompt(&p.id, &b.id).await.unwrap();
+    assert!(moved.reusable, "the reusable flag travels with the prompt head");
+    assert_eq!(moved.version_count, before.version_count, "the version count is unchanged");
+    assert_eq!(moved.updated_at, before.updated_at, "the derived updatedAt is preserved (not re-stamped)");
+    assert_eq!(moved.created_at, before.created_at, "the prompt created_at is preserved");
+}
+
+#[tokio::test]
+async fn move_prompt_updates_the_prompt_count_on_both_projects() {
+    // Also exercises prompt_count end to end (loaded-only, M3).
+    let (mgr, _app) = new_manager().await;
+    let (a, _dir_a) = create_project(&mgr, "Alpha").await;
+    let (b, _dir_b) = create_project(&mgr, "Beta").await;
+    let p = mgr.create_prompt(new_prompt(&a.id, "t", "b")).await.unwrap();
+    mgr.create_prompt(new_prompt(&a.id, "t2", "b2")).await.unwrap();
+
+    let before = mgr.list_projects().await.unwrap();
+    assert_eq!(before.iter().find(|i| i.id == a.id).unwrap().prompt_count, Some(2));
+    assert_eq!(before.iter().find(|i| i.id == b.id).unwrap().prompt_count, Some(0));
+
+    mgr.move_prompt(&p.id, &b.id).await.unwrap();
+
+    let after = mgr.list_projects().await.unwrap();
+    assert_eq!(after.iter().find(|i| i.id == a.id).unwrap().prompt_count, Some(1), "source count −1");
+    assert_eq!(after.iter().find(|i| i.id == b.id).unwrap().prompt_count, Some(1), "target count +1");
+}
+
+#[tokio::test]
+async fn deleting_source_files_after_a_move_does_not_touch_the_target_copy() {
+    let (mgr, _app) = new_manager().await;
+    let (a, _dir_a) = create_project(&mgr, "Alpha").await;
+    let (b, dir_b) = create_project(&mgr, "Beta").await;
+    let p = mgr.create_prompt(new_prompt(&a.id, "t", "b")).await.unwrap();
+    mgr.move_prompt(&p.id, &b.id).await.unwrap();
+
+    // Delete the SOURCE project's files entirely; the target's copy is unaffected.
+    mgr.unload(&a.id).await.unwrap();
+    mgr.delete_files(&a.id).await.unwrap();
+
+    let in_b = mgr
+        .list_prompts(&PromptListFilter { project_id: Some(b.id.clone()), ..Default::default() })
+        .await
+        .unwrap();
+    assert_eq!(in_b.len(), 1, "the moved prompt survives deleting the source project");
+    assert!(dir_b.path().join("prompts").join(&p.id).is_dir());
+
+    // Deleting the TARGET files removes it (H3 sweep correct post-move).
+    mgr.unload(&b.id).await.unwrap();
+    mgr.delete_files(&b.id).await.unwrap();
+    assert!(!dir_b.path().join("prompts").join(&p.id).exists());
+}
+
+#[tokio::test]
+#[ignore = "code-inspection (plan.8 §8/§12): a failed move never leaves an orphan in the target. \
+            (a) import_prompt is atomic — on ANY failure (partial file write, failed commit, or the \
+            post-commit read) discard_partial_import removes the files AND any committed rows, so the \
+            move_prompt `?` returns Err with the source untouched and nothing phantom in the target. \
+            (b) If the post-import verify (target.versions count == source count) fails OR errors, \
+            move_prompt rolls back via target.delete and aborts, source untouched. Both paths need I/O \
+            fault injection the public API does not expose; covered by reading the assertions."]
+async fn move_prompt_rollback_leaves_source_untouched_on_import_or_verify_failure() {}
+
+#[tokio::test]
+#[ignore = "code-inspection (plan.8 §8): move_prompt never uses a cross-store fs::rename. import_prompt \
+            writes each target file with promptfile::write_version (same-dir temp-then-rename inside the \
+            target prompts_dir, same volume), and the source is deleted only after the target import \
+            verifies — so the move is correct across arbitrary volumes without a cross-volume rename. A \
+            true multi-volume harness isn't available in CI."]
+async fn move_prompt_never_relies_on_a_cross_volume_rename() {}
+
+// ---------------------------------------------------------------------------
+// Capability-guard regression (plan.8 §4 H1): the webview must never be granted
+// an opener path/reveal permission. "Open folder" is a Rust command keyed by id.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn capabilities_default_grants_no_opener_path_or_reveal_permission() {
+    let capabilities = std::fs::read_to_string(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("capabilities")
+            .join("default.json"),
+    )
+    .expect("capabilities/default.json is readable");
+    for forbidden in [
+        "opener:allow-open-path",
+        "opener:allow-reveal-item-in-dir",
+        "allow-open-path",
+        "allow-reveal-item-in-dir",
+    ] {
+        assert!(
+            !capabilities.contains(forbidden),
+            "capabilities/default.json must never grant `{forbidden}` — that would hand the webview an \
+             OS-open surface that can execute a file or reveal an unscoped path (plan.8 §4 H1)"
+        );
+    }
+}

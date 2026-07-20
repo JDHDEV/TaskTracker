@@ -63,10 +63,11 @@ pub struct Item {
 }
 
 /// A known project for the frontend: catalog identity (id, name, directory
-/// path) plus whether it is currently loaded, and a live item count for loaded
-/// projects only (`None` when unloaded — a closed store is not opened just to
-/// count). Serialized only (assembled by the `ProjectManager`); the id is the
-/// UUID from the store's `meta` table. Mirror in `src/types.ts`.
+/// path) plus whether it is currently loaded, and live item + prompt counts for
+/// loaded projects only (`None` when unloaded — a closed store is never opened
+/// just to count, which would re-run the foreign-DB hardening gate and take a
+/// file lock; plan.8 M3). Serialized only (assembled by the `ProjectManager`);
+/// the id is the UUID from the store's `meta` table. Mirror in `src/types.ts`.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProjectInfo {
@@ -76,6 +77,8 @@ pub struct ProjectInfo {
     pub loaded: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub item_count: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_count: Option<i64>,
 }
 
 #[derive(Debug, Clone, Deserialize)]

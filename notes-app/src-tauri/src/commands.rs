@@ -123,6 +123,19 @@ pub async fn delete_prompt(state: State<'_, AppState>, id: String) -> Result<()>
     state.manager.delete_prompt(&id).await
 }
 
+/// Move a prompt (with its full version history) to another loaded project
+/// (plan.8). Thin wrapper: the manager owns the resolve → export → import →
+/// verify → delete-source-last ordering and every validation (same-project /
+/// unloaded / unknown target). Returns the moved prompt, stamped with the target.
+#[tauri::command]
+pub async fn move_prompt(
+    state: State<'_, AppState>,
+    prompt_id: String,
+    target_project_id: String,
+) -> Result<Prompt> {
+    state.manager.move_prompt(&prompt_id, &target_project_id).await
+}
+
 // --- Project lifecycle -----------------------------------------------------
 
 /// Every known project (loaded or not) with a loaded flag and a live item count
@@ -181,6 +194,31 @@ pub async fn forget_project(state: State<'_, AppState>, id: String) -> Result<()
 #[tauri::command]
 pub async fn delete_project_files(state: State<'_, AppState>, id: String) -> Result<()> {
     state.manager.delete_files(&id).await
+}
+
+/// Open a project's folder in the OS file manager (plan.8 §4 H1). SECURITY: the
+/// webview passes ONLY the project `id` — never a path. The directory is resolved
+/// server-side from the catalog, re-verified to be an existing directory (the
+/// `is_dir()` check closes the "open_path on a file executes it" gap should the
+/// stored path now point at a file), and handed to the opener plugin's RUST API
+/// (`app.opener().open_path`), which is Rust-to-Rust and NOT ACL-gated. No opener
+/// path/reveal permission is granted to the webview in `capabilities/default.json`
+/// — its OS-open surface stays exactly at the http/https URL grant.
+#[tauri::command]
+pub async fn reveal_project_folder(
+    id: String,
+    app: tauri::AppHandle,
+    state: State<'_, AppState>,
+) -> Result<()> {
+    use tauri_plugin_opener::OpenerExt;
+    let dir = state.manager.project_dir(&id).await?;
+    let is_dir = std::fs::metadata(&dir).map(|m| m.is_dir()).unwrap_or(false);
+    if !is_dir {
+        return Err(AppError::Invalid("that project folder no longer exists".into()));
+    }
+    app.opener()
+        .open_path(dir.to_string_lossy().to_string(), None::<&str>)
+        .map_err(|_| AppError::Invalid("couldn't open that folder".into()))
 }
 
 /// Non-fatal per-project warnings gathered at startup (moved/corrupt/newer

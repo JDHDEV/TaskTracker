@@ -801,6 +801,19 @@ textarea {
   width: 240px;
 }
 
+/* Move-to-project popover (plan.8). The trigger sits toward the right of the
+   editor meta row, so the panel right-aligns to avoid overflowing off-screen. */
+.move-popover {
+  position: relative;
+  display: inline-flex;
+}
+
+.popover-move {
+  left: auto;
+  right: 0;
+  width: 220px;
+}
+
 .popover-pills {
   display: flex;
   flex-wrap: wrap;
@@ -927,7 +940,9 @@ textarea {
 
 /* Manage projects dialog */
 .dialog-projects {
-  width: min(560px, calc(100vw - 32px));
+  /* 600px (was 560) so the widened create field + the two create/open buttons
+     still fit on one row (plan.8 wider-input). */
+  width: min(600px, calc(100vw - 32px));
 }
 
 .project-row {
@@ -938,9 +953,20 @@ textarea {
   border-top: 1px solid var(--line);
 }
 
+/* Per-row controls, grouped so they wrap as a unit when a row is tight rather
+   than overflowing the non-wrapping .project-row (plan.8 adds a 5th button). */
+.project-actions {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+}
+
 .project-name {
   flex: 1;
-  min-width: 0;
+  /* Widened (plan.8): the create field was crushed between the two full-length
+     buttons; a floor keeps it comfortably typeable. */
+  min-width: 220px;
   padding: 6px 10px;
   border: 1px solid var(--line);
   border-radius: 6px;

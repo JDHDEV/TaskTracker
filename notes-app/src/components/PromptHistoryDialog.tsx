@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import type { PromptVersion } from "../types";
 import * as api from "../lib/api";
-import { formatWhen, sourceLabel } from "../lib/prompts";
+import { displayTitle, formatWhen, sourceLabel } from "../lib/prompts";
 
 interface Props {
   promptId: string;
@@ -70,7 +70,7 @@ export default function PromptHistoryDialog({ promptId, onClose, onError }: Prop
                   </span>
                   <span className="version-when">{formatWhen(v.createdAt, now)}</span>
                 </div>
-                <div className="version-title">{v.title}</div>
+                <div className="version-title">{displayTitle(v.title, v.body)}</div>
                 <pre className="version-body">{v.body}</pre>
               </li>
             ))}

@@ -22,14 +22,15 @@ export interface Item {
   jiraUrl: string | null;
 }
 
-/** A known project: catalog identity + whether it is loaded, plus a live item
- *  count for loaded projects only (undefined when unloaded). */
+/** A known project: catalog identity + whether it is loaded, plus live item and
+ *  prompt counts for loaded projects only (undefined when unloaded). */
 export interface ProjectInfo {
   id: string;
   name: string;
   path: string;
   loaded: boolean;
   itemCount?: number;
+  promptCount?: number;
 }
 
 export interface NewItem {

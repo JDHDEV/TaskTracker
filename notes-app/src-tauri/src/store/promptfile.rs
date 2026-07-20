@@ -592,6 +592,18 @@ mod tests {
     }
 
     #[test]
+    fn empty_title_round_trips() {
+        // The title is optional (plan.8): an empty title must survive the file
+        // format — the `title:` line is still written (as an empty quoted value)
+        // and parses back to "" (distinct from a MISSING title line, which is
+        // still malformed).
+        let v = version(VID, "", "a body", "manual", TS);
+        let parsed = parse_version(&serialize_version(&v), PID).unwrap();
+        assert_eq!(parsed.title, "");
+        assert_eq!(parsed.body, "a body");
+    }
+
+    #[test]
     fn title_with_quotes_and_colons_round_trips() {
         let v = version(VID, r#"weird: "quoted" title: 2"#, "b", "manual", TS);
         let parsed = parse_version(&serialize_version(&v), PID).unwrap();

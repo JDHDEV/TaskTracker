@@ -852,6 +852,94 @@ impl SqliteRepository {
         .await?
         .ok_or(AppError::NotFound)
     }
+
+    /// The write-then-index body of `import_prompt`, factored out so the trait
+    /// method can roll a PARTIAL import back on failure. Writes `prompt.md` + one
+    /// immutable version file per version (via `promptfile`, never a raw
+    /// `fs::copy`; filenames derive only from the UUID ids), then inserts the
+    /// index rows in one transaction, parent before children (so the FK never
+    /// dangles). Ids/timestamps/source are preserved VERBATIM from the source —
+    /// the id-preserving move (byte-identical history). Because the ids are the
+    /// source's (not freshly minted), a retry of the documented crash-recovery
+    /// path can legitimately rewrite the same version file — harmlessly, since the
+    /// content is byte-identical.
+    async fn import_prompt_committed(
+        &self,
+        prompt_id: &str,
+        reusable: bool,
+        prompt_created_at: &str,
+        versions: &[PromptVersion],
+    ) -> Result<Prompt> {
+        if let Some(dir) = &self.prompts_dir {
+            let head = promptfile::PromptRecord {
+                id: prompt_id.to_string(),
+                reusable,
+                created_at: prompt_created_at.to_string(),
+            };
+            promptfile::write_prompt(dir, &head).map_err(save_prompt_file_error)?;
+            for v in versions {
+                let record = promptfile::PromptVersionRecord {
+                    id: v.id.clone(),
+                    prompt_id: prompt_id.to_string(),
+                    title: v.title.clone(),
+                    body: v.body.clone(),
+                    source: v.source.clone(),
+                    created_at: v.created_at.clone(),
+                };
+                promptfile::write_version(dir, &record).map_err(save_prompt_file_error)?;
+            }
+        }
+
+        let mut tx = self.pool.begin().await?;
+        sqlx::query("INSERT INTO prompts (id, reusable, created_at) VALUES (?1, ?2, ?3)")
+            .bind(prompt_id)
+            .bind(reusable)
+            .bind(prompt_created_at)
+            .execute(&mut *tx)
+            .await?;
+        for v in versions {
+            sqlx::query(
+                "INSERT INTO prompt_versions (id, prompt_id, title, body, source, created_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            )
+            .bind(&v.id)
+            .bind(prompt_id)
+            .bind(&v.title)
+            .bind(&v.body)
+            // Normalize to the closed set, mirroring create/update, so a stray
+            // source value can never enter the index.
+            .bind(normalize_prompt_source(Some(v.source.as_str())))
+            .bind(&v.created_at)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+
+        self.fetch_prompt(prompt_id).await
+    }
+
+    /// Best-effort removal of everything an `import_prompt` attempt may have
+    /// written for `prompt_id` — the canonical files AND any committed index rows
+    /// — so a FAILED import leaves nothing phantom behind (§12). Ignores its own
+    /// errors (there is nothing better to do mid-failure) and is safe when nothing
+    /// was written (a missing dir / absent rows are no-ops). Only ever called on
+    /// the import TARGET, for an id this import owns — `move_prompt` resolves the
+    /// source via `prompt_owner` first, so a pre-existing same-id target prompt
+    /// aborts the move before any import, and this can never delete an unrelated
+    /// prompt.
+    async fn discard_partial_import(&self, prompt_id: &str) {
+        if let Some(dir) = &self.prompts_dir {
+            let _ = promptfile::remove_prompt(dir, prompt_id);
+        }
+        let _ = sqlx::query("DELETE FROM prompt_versions WHERE prompt_id = ?1")
+            .bind(prompt_id)
+            .execute(&self.pool)
+            .await;
+        let _ = sqlx::query("DELETE FROM prompts WHERE id = ?1")
+            .bind(prompt_id)
+            .execute(&self.pool)
+            .await;
+    }
 }
 
 #[async_trait::async_trait]
@@ -894,12 +982,14 @@ impl PromptRepository for SqliteRepository {
     }
 
     async fn create(&self, input: NewPrompt) -> Result<Prompt> {
-        let title = input.title.trim();
-        if title.is_empty() {
-            return Err(AppError::Invalid("prompt title must not be empty".into()));
-        }
-        let title = title.to_string();
+        // The title is optional (plan.8): trimmed but empty is allowed — a prompt
+        // is often just a body. The both-empty guard below (Decision B) is the
+        // only content floor.
+        let title = input.title.trim().to_string();
         let body = input.body.unwrap_or_default();
+        if title.is_empty() && body.trim().is_empty() {
+            return Err(AppError::Invalid("a prompt needs a title or some text".into()));
+        }
         let reusable = input.reusable.unwrap_or(false);
         // Provenance of the first version (§12): normally "manual", but the
         // frontend sends "aiEnhanced" when a new draft's first persisted content
@@ -964,17 +1054,18 @@ impl PromptRepository for SqliteRepository {
         // Resolve the new content. A title/body change (against the CURRENT
         // version) appends a new immutable version; an identical save appends
         // none, so history never bloats with duplicates.
+        // Title is optional (plan.8): a patched title is trimmed but may be empty.
         let new_title = match patch.title {
-            Some(t) => {
-                let t = t.trim().to_string();
-                if t.is_empty() {
-                    return Err(AppError::Invalid("prompt title must not be empty".into()));
-                }
-                t
-            }
+            Some(t) => t.trim().to_string(),
             None => current.title.clone(),
         };
         let new_body = patch.body.unwrap_or_else(|| current.body.clone());
+        // Both-empty guard (Decision B) on the RESOLVED current version — clearing
+        // the title while the body is also empty leaves nothing to show, so it is
+        // rejected. Trim only for the test; stored values are never mutated.
+        if new_title.is_empty() && new_body.trim().is_empty() {
+            return Err(AppError::Invalid("a prompt needs a title or some text".into()));
+        }
         let content_changed = new_title != current.title || new_body != current.body;
 
         let new_reusable = patch.reusable.unwrap_or(current.reusable);
@@ -1074,6 +1165,49 @@ impl PromptRepository for SqliteRepository {
             .await?;
         tx.commit().await?;
         Ok(())
+    }
+
+    async fn count_prompts(&self) -> Result<i64> {
+        // Count prompts, not versions: every indexed prompt has ≥1 version, and
+        // contentless prompts are skipped by scan/rebuild, so this is the prompt
+        // inventory. Mirrors `count_active` for items; the reusable flag is not a
+        // predicate here.
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM prompts")
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(count)
+    }
+
+    async fn import_prompt(
+        &self,
+        prompt_id: &str,
+        reusable: bool,
+        prompt_created_at: &str,
+        versions: &[PromptVersion],
+    ) -> Result<Prompt> {
+        if versions.is_empty() {
+            // A prompt row requires ≥1 version; an empty import would leave a
+            // childless parent (invisible to the current-version JOIN).
+            return Err(AppError::Invalid("a prompt must have at least one version".into()));
+        }
+        // Atomic import (§12): the write+index work either fully succeeds or
+        // leaves NOTHING behind. On ANY failure — a partial file write, a failed
+        // index commit, or the post-commit read — every trace this import may have
+        // written (the files AND any committed rows) is removed, so a failed
+        // import can never leave a phantom/partial prompt that `scan` would
+        // resurrect on the next reload, nor a complete copy the caller was told
+        // failed. The SOURCE store is never touched here — that ordering
+        // (delete-source-last) lives in `ProjectManager::move_prompt`.
+        match self
+            .import_prompt_committed(prompt_id, reusable, prompt_created_at, versions)
+            .await
+        {
+            Ok(prompt) => Ok(prompt),
+            Err(e) => {
+                self.discard_partial_import(prompt_id).await;
+                Err(e)
+            }
+        }
     }
 }
 

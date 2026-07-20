@@ -1,5 +1,5 @@
 import type { ProjectInfo, Prompt } from "../types";
-import { formatWhen } from "../lib/prompts";
+import { displayTitle, formatWhen } from "../lib/prompts";
 
 interface Props {
   prompts: Prompt[];
@@ -82,7 +82,7 @@ export default function PromptList({
               onClick={() => onSelect(p.id)}
             >
               <span className="row-top">
-                <span className="row-title">{p.title}</span>
+                <span className="row-title">{displayTitle(p.title, p.body)}</span>
                 {p.reusable && <span className="pill pill-on">REUSABLE</span>}
                 <span className="row-when">{formatWhen(p.updatedAt, now)}</span>
               </span>

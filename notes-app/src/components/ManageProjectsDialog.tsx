@@ -8,6 +8,7 @@ import {
   loadProject,
   openProject,
   pickProjectFolder,
+  revealProjectFolder,
 } from "../lib/api";
 
 interface Props {
@@ -87,6 +88,15 @@ export default function ManageProjectsDialog({
     }, null);
   }
 
+  function handleOpenFolder(p: ProjectInfo) {
+    // Reveal-only: no catalog change, so no onChanged() refresh. Errors (a stale
+    // path that no longer exists) surface through onError. Restores focus itself
+    // is unnecessary — no dialog is opened.
+    void withBusy(async () => {
+      await revealProjectFolder(p.id);
+    }, null);
+  }
+
   function handleForget(p: ProjectInfo) {
     void withBusy(async () => {
       await forgetProject(p.id);
@@ -137,6 +147,7 @@ export default function ManageProjectsDialog({
         <ul className="project-list">
           {projects.map((p) => {
             const count = p.itemCount ?? 0;
+            const promptCount = p.promptCount ?? 0;
             return (
               <li key={p.id} className="project-row">
                 <div className="project-ident">
@@ -146,56 +157,75 @@ export default function ManageProjectsDialog({
                   </span>
                 </div>
                 <span className={p.loaded ? "project-state project-state-on" : "project-state"}>
-                  {p.loaded ? `${count} ITEM${count === 1 ? "" : "S"}` : "UNLOADED"}
+                  {p.loaded
+                    ? `${count} ITEM${count === 1 ? "" : "S"} · ${promptCount} PROMPT${
+                        promptCount === 1 ? "" : "S"
+                      }`
+                    : "UNLOADED"}
                 </span>
-                {p.loaded ? (
-                  <>
-                    <button
-                      className="btn btn-quiet"
-                      disabled={busy}
-                      title="Re-read this project's files from disk (after a git pull / sync)"
-                      aria-label={`Reload ${p.name}`}
-                      onClick={() => void withBusy(() => onReload(p), null)}
-                    >
-                      Reload
-                    </button>
-                    <button
-                      className="btn btn-quiet"
-                      disabled={busy}
-                      aria-label={`Unload ${p.name}`}
-                      onClick={() => void withBusy(() => onUnload(p), null)}
-                    >
-                      Unload
-                    </button>
-                  </>
-                ) : (
+                <div className="project-actions">
+                  {/* Open the project's folder in the OS file manager. Available
+                      regardless of loaded state (revealing a folder needs no open
+                      store); the id-keyed Rust command resolves + is_dir()-checks
+                      the path server-side (plan.8 H1). */}
                   <button
-                    className="btn"
+                    className="btn btn-quiet"
                     disabled={busy}
-                    aria-label={`Load ${p.name}`}
-                    onClick={() => handleLoad(p)}
+                    aria-label={`Open folder for ${p.name}`}
+                    title="Open this project's folder"
+                    onClick={() => handleOpenFolder(p)}
                   >
-                    Load
+                    Open folder
                   </button>
-                )}
-                <button
-                  className="btn btn-quiet btn-forget"
-                  disabled={busy || p.loaded}
-                  title={p.loaded ? "Unload the project first" : "Remove from this list; files kept"}
-                  aria-label={`Forget ${p.name}`}
-                  onClick={() => handleForget(p)}
-                >
-                  Forget
-                </button>
-                <button
-                  className="btn btn-danger"
-                  disabled={busy || p.loaded}
-                  title={p.loaded ? "Unload the project first" : "Delete the project's files permanently"}
-                  aria-label={`Delete files for ${p.name}`}
-                  onClick={() => handleDeleteFiles(p)}
-                >
-                  Delete files
-                </button>
+                  {p.loaded ? (
+                    <>
+                      <button
+                        className="btn btn-quiet"
+                        disabled={busy}
+                        title="Re-read this project's files from disk (after a git pull / sync)"
+                        aria-label={`Reload ${p.name}`}
+                        onClick={() => void withBusy(() => onReload(p), null)}
+                      >
+                        Reload
+                      </button>
+                      <button
+                        className="btn btn-quiet"
+                        disabled={busy}
+                        aria-label={`Unload ${p.name}`}
+                        onClick={() => void withBusy(() => onUnload(p), null)}
+                      >
+                        Unload
+                      </button>
+                    </>
+                  ) : (
+                    <button
+                      className="btn"
+                      disabled={busy}
+                      aria-label={`Load ${p.name}`}
+                      onClick={() => handleLoad(p)}
+                    >
+                      Load
+                    </button>
+                  )}
+                  <button
+                    className="btn btn-quiet btn-forget"
+                    disabled={busy || p.loaded}
+                    title={p.loaded ? "Unload the project first" : "Remove from this list; files kept"}
+                    aria-label={`Forget ${p.name}`}
+                    onClick={() => handleForget(p)}
+                  >
+                    Forget
+                  </button>
+                  <button
+                    className="btn btn-danger"
+                    disabled={busy || p.loaded}
+                    title={p.loaded ? "Unload the project first" : "Delete the project's files permanently"}
+                    aria-label={`Delete files for ${p.name}`}
+                    onClick={() => handleDeleteFiles(p)}
+                  >
+                    Delete files
+                  </button>
+                </div>
               </li>
             );
           })}

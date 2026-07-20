@@ -273,3 +273,55 @@ fn no_exported_prompt_file_contains_secret_material() {
         assert!(!version_text.contains(forbidden), "a version file must never contain {forbidden}");
     }
 }
+
+#[test]
+fn relocating_a_prompt_dir_preserves_every_version_and_clears_the_source() {
+    // Format-level acceptance for the move (plan.8): writing a prompt's exported
+    // head + every version into a SECOND `prompts_dir` via the public write
+    // primitives reproduces the full history (structural equality on
+    // source/created_at/title/body, ids preserved), and `remove_prompt` clears
+    // the source dir — the two file-store halves the manager's `move_prompt`
+    // composes (copy-all → delete-source-last), exercised without the DB layer.
+    let source = tempdir().unwrap();
+    let target = tempdir().unwrap();
+
+    // A source prompt with two distinct versions (different provenance/content).
+    promptfile::write_prompt(source.path(), &prompt_head()).unwrap();
+    let v1 = "aaaaaaaa-1111-2222-3333-444444444444";
+    let v2 = "bbbbbbbb-1111-2222-3333-444444444444";
+    let mut version_two = prompt_version(v2, "second", "second body");
+    version_two.source = "aiEnhanced".into();
+    version_two.created_at = "2026-07-15T00:00:00.000+00:00".into();
+    promptfile::write_version(source.path(), &prompt_version(v1, "first", "first body")).unwrap();
+    promptfile::write_version(source.path(), &version_two).unwrap();
+
+    let exported = promptfile::scan(source.path());
+    assert_eq!(exported.prompts.len(), 1);
+    let src_prompt = &exported.prompts[0];
+
+    // Relocate: write the head + every version into the target verbatim.
+    promptfile::write_prompt(target.path(), &src_prompt.prompt).unwrap();
+    for v in &src_prompt.versions {
+        promptfile::write_version(target.path(), v).unwrap();
+    }
+
+    // The target reproduces the FULL history, ids and provenance intact.
+    let imported = promptfile::scan(target.path());
+    assert!(imported.errors.is_empty(), "clean relocation scans without errors: {:?}", imported.errors);
+    assert_eq!(imported.prompts.len(), 1);
+    let tgt_prompt = &imported.prompts[0];
+    assert_eq!(tgt_prompt.prompt, src_prompt.prompt, "the prompt head (id/reusable/created_at) is preserved");
+    let mut src_versions = src_prompt.versions.clone();
+    let mut tgt_versions = tgt_prompt.versions.clone();
+    src_versions.sort_by(|a, b| a.id.cmp(&b.id));
+    tgt_versions.sort_by(|a, b| a.id.cmp(&b.id));
+    assert_eq!(src_versions, tgt_versions, "every version's id/source/created_at/title/body is preserved");
+
+    // Delete-source-last: remove_prompt clears the source dir entirely.
+    promptfile::remove_prompt(source.path(), PROMPT_ID).unwrap();
+    assert!(!source.path().join(PROMPT_ID).exists(), "the source prompt dir is gone after remove_prompt");
+    // The target copy is untouched by the source removal.
+    let after = promptfile::scan(target.path());
+    assert_eq!(after.prompts.len(), 1, "the relocated prompt survives the source delete");
+    assert_eq!(after.prompts[0].versions.len(), 2);
+}

@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { formatWhen, sourceLabel } from "./prompts";
+import { displayTitle, formatWhen, sourceLabel } from "./prompts";
 
 describe("sourceLabel", () => {
   it("labels a manual version", () => {
@@ -8,6 +8,38 @@ describe("sourceLabel", () => {
 
   it("labels an AI-enhanced version", () => {
     expect(sourceLabel("aiEnhanced")).toBe("AI enhanced");
+  });
+});
+
+describe("displayTitle", () => {
+  it("passes a non-empty title through", () => {
+    expect(displayTitle("My prompt", "some body")).toBe("My prompt");
+  });
+
+  it("trims a title before returning it", () => {
+    expect(displayTitle("  Spaced  ", "body")).toBe("Spaced");
+  });
+
+  it("falls back to the first non-blank body line when the title is empty", () => {
+    expect(displayTitle("", "first line\nsecond line")).toBe("first line");
+  });
+
+  it("treats a whitespace-only title as empty and derives from the body", () => {
+    expect(displayTitle("   ", "derive me")).toBe("derive me");
+  });
+
+  it("skips leading blank lines in the body (not a naive split)", () => {
+    expect(displayTitle("", "\n\n   \nreal first line")).toBe("real first line");
+  });
+
+  it("truncates a long derived line to 60 chars", () => {
+    const long = "x".repeat(100);
+    expect(displayTitle("", long)).toBe("x".repeat(60));
+  });
+
+  it("returns 'Untitled' when both title and body are empty", () => {
+    expect(displayTitle("", "")).toBe("Untitled");
+    expect(displayTitle("   ", "   \n  ")).toBe("Untitled");
   });
 });
 

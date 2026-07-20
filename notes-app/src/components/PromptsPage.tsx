@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import type { NewPrompt, ProjectInfo, Prompt, UpdatePrompt } from "../types";
 import * as api from "../lib/api";
 import { nextToken, shouldCommit } from "../lib/projects";
+import { displayTitle } from "../lib/prompts";
 import PromptList from "./PromptList";
 import PromptEditor from "./PromptEditor";
 
@@ -10,6 +11,11 @@ interface Props {
    *  computes for Worknotes. Prompts are viewed one project at a time (the
    *  backend requires a projectId), so there is no "All projects" option. */
   loaded: ProjectInfo[];
+  /** Ask App to re-fetch the project catalog after a prompt mutation, so the
+   *  Manage-projects prompt counts stay current (a create/delete changes one
+   *  project's count; a move changes two). Mirrors how the item side refreshes
+   *  the catalog through App's mutate. */
+  onProjectsChanged: () => void;
   onError: (message: string) => void;
 }
 
@@ -29,7 +35,7 @@ function newDraft(projectId: string): Prompt {
   };
 }
 
-export default function PromptsPage({ loaded, onError }: Props) {
+export default function PromptsPage({ loaded, onProjectsChanged, onError }: Props) {
   const [projectId, setProjectId] = useState("");
   const [reusableOnly, setReusableOnly] = useState(false);
   const [prompts, setPrompts] = useState<Prompt[]>([]);
@@ -79,6 +85,9 @@ export default function PromptsPage({ loaded, onError }: Props) {
     try {
       await action();
       await loadPrompts();
+      // Keep the Manage-projects prompt counts current (a delete/move changes
+      // them). Cheap COUNT(*)s; harmless when the count didn't change.
+      onProjectsChanged();
       return true;
     } catch (err) {
       onError(String(err));
@@ -103,6 +112,7 @@ export default function PromptsPage({ loaded, onError }: Props) {
       const created = await api.createPrompt(input);
       setDraft(null);
       await loadPrompts();
+      onProjectsChanged(); // a new prompt bumps this project's count
       setSelectedId(created.id);
       return true;
     } catch (err) {
@@ -130,6 +140,7 @@ export default function PromptsPage({ loaded, onError }: Props) {
           key={draft ? `draft-${draftSeq}` : selected.id}
           prompt={selected}
           isDraft={draft !== null}
+          loaded={loaded}
           onSave={(patch: UpdatePrompt) =>
             mutate(() => api.updatePrompt(selected.id, patch))
           }
@@ -139,11 +150,28 @@ export default function PromptsPage({ loaded, onError }: Props) {
               ? setDraft((d) => (d ? { ...d, reusable: next } : d))
               : void mutate(() => api.updatePrompt(selected.id, { reusable: next }))
           }
+          onMove={(targetProjectId) => {
+            void (async () => {
+              const target = loaded.find((p) => p.id === targetProjectId);
+              if (
+                !(await api.confirmDialog(
+                  `Move "${displayTitle(selected.title, selected.body)}" to "${
+                    target?.name ?? "another project"
+                  }"? Its full version history moves with it.`,
+                ))
+              )
+                return;
+              await mutate(async () => {
+                await api.movePrompt(selected.id, targetProjectId);
+                setSelectedId(null);
+              });
+            })();
+          }}
           onDelete={() => {
             void (async () => {
               if (
                 !(await api.confirmDialog(
-                  `Delete "${selected.title}"? This cannot be undone.`,
+                  `Delete "${displayTitle(selected.title, selected.body)}"? This cannot be undone.`,
                 ))
               )
                 return;

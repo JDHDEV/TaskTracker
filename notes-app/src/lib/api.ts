@@ -96,6 +96,19 @@ export function deleteProjectFiles(id: string): Promise<void> {
   return invoke("delete_project_files", { id });
 }
 
+/**
+ * Open a project's folder in the OS file manager (plan.8). The webview passes
+ * ONLY the project id — never a path: the Rust command looks the directory up in
+ * the catalog, verifies it is a directory (`is_dir()`), and calls the opener
+ * plugin server-side. No `opener:allow-open-path`/`reveal` capability is granted
+ * to the webview (a bare path grant is either non-functional or unscoped, and
+ * open_path on a file would execute it — plan.8 §4 H1). Rejects if the stored
+ * path is now missing or not a directory.
+ */
+export function revealProjectFolder(id: string): Promise<void> {
+  return invoke("reveal_project_folder", { id });
+}
+
 /** Show the native folder picker; resolves to the chosen path or null. */
 export function pickProjectFolder(): Promise<string | null> {
   return invoke("pick_project_folder");
@@ -139,6 +152,13 @@ export function listPromptVersions(promptId: string): Promise<PromptVersion[]> {
 
 export function deletePrompt(id: string): Promise<void> {
   return invoke("delete_prompt", { id });
+}
+
+/** Move a prompt (with its full version history) to another loaded project
+ *  (plan.8). Resolves to the moved prompt, stamped with the target project. The
+ *  backend copies the full history, verifies it, then deletes the source last. */
+export function movePrompt(id: string, targetProjectId: string): Promise<Prompt> {
+  return invoke("move_prompt", { promptId: id, targetProjectId });
 }
 
 export function aiRewrite(req: RewriteRequest): Promise<string> {
@@ -259,6 +279,23 @@ export async function openExternal(url: string): Promise<void> {
     throw new Error("Refusing to open a non-http(s) URL.");
   }
   await openUrl(url);
+}
+
+/**
+ * Copy plain text to the OS clipboard (plan.8). A frontend-only touchpoint (no
+ * Tauri command) using the Web `navigator.clipboard` API, which the secure
+ * WebView2 context permits from a user click; the CSP (`default-src 'self'`)
+ * does not restrict it (a Web API, not a network surface). Routed through api.ts
+ * like `openExternal` so the OS surface stays greppable. Plain text only — no
+ * rich/HTML format. NOTE (§4 L1): the text lands on the shared OS clipboard,
+ * readable by any process and captured by Windows Clipboard History; this is
+ * user-initiated and expected. Rejects if the clipboard API is unavailable.
+ */
+export async function copyToClipboard(text: string): Promise<void> {
+  if (!navigator.clipboard) {
+    throw new Error("The clipboard is unavailable.");
+  }
+  await navigator.clipboard.writeText(text);
 }
 
 /**

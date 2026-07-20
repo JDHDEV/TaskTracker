@@ -7,7 +7,7 @@
 
 use notes_app_lib::db::{PromptRepository, SqliteRepository};
 use notes_app_lib::error::AppError;
-use notes_app_lib::models::{NewPrompt, PromptListFilter, UpdatePrompt};
+use notes_app_lib::models::{NewPrompt, PromptListFilter, PromptVersion, UpdatePrompt};
 
 fn new_prompt(title: &str, body: &str) -> NewPrompt {
     NewPrompt {
@@ -34,8 +34,12 @@ async fn prompt_create_owns_id_timestamps_and_a_first_version() {
     assert_eq!(p.updated_at, p.created_at, "a fresh prompt's updatedAt equals its createdAt");
     assert_eq!(p.project_id, None, "the store never stamps project_id (the manager does)");
 
-    // An empty/whitespace title is rejected on create.
-    assert!(matches!(prompts.create(new_prompt("   ", "b")).await.unwrap_err(), AppError::Invalid(_)));
+    // The title is optional (plan.8): a whitespace-only title is trimmed to
+    // empty and ACCEPTED (the body carries the prompt) — flipped from the old
+    // reject-empty-title behavior.
+    let blank = prompts.create(new_prompt("   ", "b")).await.unwrap();
+    assert_eq!(blank.title, "", "a whitespace-only title is trimmed to empty and accepted");
+    assert_eq!(blank.body, "b");
 }
 
 #[tokio::test]
@@ -46,11 +50,15 @@ async fn prompt_get_update_delete_round_trip_and_second_delete_is_not_found() {
     let p = prompts.create(new_prompt("t", "b")).await.unwrap();
     assert_eq!(prompts.get(&p.id).await.unwrap().title, "t");
 
-    // An empty-title patch is rejected (mirrors the item update check).
-    assert!(matches!(
-        prompts.update(&p.id, UpdatePrompt { title: Some("  ".into()), ..Default::default() }).await.unwrap_err(),
-        AppError::Invalid(_)
-    ));
+    // A whitespace-only title patch now SUCCEEDS (title optional, plan.8): the
+    // body ("b") keeps the prompt non-blank, so the both-empty guard passes.
+    // Flipped from the old reject-empty-title behavior.
+    let cleared = prompts
+        .update(&p.id, UpdatePrompt { title: Some("  ".into()), ..Default::default() })
+        .await
+        .unwrap();
+    assert_eq!(cleared.title, "", "the title is cleared to empty and stored");
+    assert_eq!(cleared.body, "b", "body unchanged");
 
     prompts.delete(&p.id).await.unwrap();
     assert!(matches!(prompts.get(&p.id).await.unwrap_err(), AppError::NotFound));
@@ -267,4 +275,164 @@ async fn prompt_and_version_serialize_to_camelcase_shape() {
     assert_eq!(parsed.project_id, "p1");
     assert!(parsed.body.is_none());
     assert!(serde_json::from_str::<NewPrompt>(r#"{"title":"x"}"#).is_err(), "projectId is required");
+}
+
+// --- Optional title + both-empty guard (plan.8) ----------------------------
+
+#[tokio::test]
+async fn prompt_optional_title_allows_each_non_degenerate_combo() {
+    let repo = SqliteRepository::connect_in_memory().await.unwrap();
+    let prompts: &dyn PromptRepository = &repo;
+
+    // Empty title + real body: allowed (a prompt is often just a body).
+    let a = prompts.create(new_prompt("", "just a body")).await.unwrap();
+    assert_eq!(a.title, "");
+    assert_eq!(a.body, "just a body");
+
+    // Real title + empty body: allowed.
+    let b = prompts.create(new_prompt("just a title", "")).await.unwrap();
+    assert_eq!(b.title, "just a title");
+    assert_eq!(b.body, "");
+}
+
+#[tokio::test]
+async fn prompt_both_empty_is_rejected_on_create_and_update() {
+    let repo = SqliteRepository::connect_in_memory().await.unwrap();
+    let prompts: &dyn PromptRepository = &repo;
+
+    // Both empty (whitespace counts as empty) → rejected on create (Decision B).
+    assert!(matches!(
+        prompts.create(new_prompt("   ", "  ")).await.unwrap_err(),
+        AppError::Invalid(_)
+    ));
+
+    // On update the guard uses the RESOLVED current version: clearing the title
+    // while the body is also being cleared is caught.
+    let p = prompts.create(new_prompt("", "has body")).await.unwrap();
+    assert!(matches!(
+        prompts
+            .update(
+                &p.id,
+                UpdatePrompt { title: Some("".into()), body: Some("   ".into()), ..Default::default() },
+            )
+            .await
+            .unwrap_err(),
+        AppError::Invalid(_)
+    ));
+    // The rejected update left the current version untouched.
+    assert_eq!(prompts.get(&p.id).await.unwrap().body, "has body");
+
+    // Clearing only the body while a real title remains is fine.
+    let ok = prompts
+        .update(
+            &p.id,
+            UpdatePrompt { title: Some("now titled".into()), body: Some("".into()), ..Default::default() },
+        )
+        .await
+        .unwrap();
+    assert_eq!(ok.title, "now titled");
+    assert_eq!(ok.body, "");
+}
+
+#[tokio::test]
+async fn prompt_clearing_the_title_appends_exactly_one_version() {
+    let repo = SqliteRepository::connect_in_memory().await.unwrap();
+    let prompts: &dyn PromptRepository = &repo;
+    let p = prompts.create(new_prompt("has title", "body")).await.unwrap();
+    let after = prompts
+        .update(&p.id, UpdatePrompt { title: Some("".into()), ..Default::default() })
+        .await
+        .unwrap();
+    assert_eq!(after.title, "", "the title clears to empty");
+    assert_eq!(after.version_count, 2, "clearing the title is a content change → one new version");
+}
+
+// --- count_prompts (plan.8) ------------------------------------------------
+
+#[tokio::test]
+async fn count_prompts_reflects_creates_and_deletes() {
+    let repo = SqliteRepository::connect_in_memory().await.unwrap();
+    let prompts: &dyn PromptRepository = &repo;
+    assert_eq!(prompts.count_prompts().await.unwrap(), 0, "an empty store counts zero, not an error");
+    let a = prompts.create(new_prompt("a", "b")).await.unwrap();
+    prompts.create(new_prompt("c", "d")).await.unwrap();
+    assert_eq!(prompts.count_prompts().await.unwrap(), 2);
+    prompts.delete(&a.id).await.unwrap();
+    assert_eq!(prompts.count_prompts().await.unwrap(), 1);
+}
+
+#[tokio::test]
+async fn count_prompts_counts_prompts_not_versions_and_ignores_reusable() {
+    let repo = SqliteRepository::connect_in_memory().await.unwrap();
+    let prompts: &dyn PromptRepository = &repo;
+    let plain = prompts.create(new_prompt("plain", "b")).await.unwrap();
+    prompts.create(NewPrompt { reusable: Some(true), ..new_prompt("reusable", "b") }).await.unwrap();
+    assert_eq!(prompts.count_prompts().await.unwrap(), 2, "counts all prompts, reusable or not");
+    // Adding versions to a prompt must NOT inflate the prompt count.
+    prompts
+        .update(&plain.id, UpdatePrompt { body: Some("v2".into()), ..Default::default() })
+        .await
+        .unwrap();
+    assert_eq!(prompts.count_prompts().await.unwrap(), 2, "versions don't inflate the prompt count");
+}
+
+// --- import_prompt (plan.8 move; id-preserving) ----------------------------
+
+#[tokio::test]
+async fn import_prompt_preserves_ids_history_and_provenance() {
+    // The move copies a prompt into another store VERBATIM: same prompt id, same
+    // version ids/titles/bodies/sources/created_at, same reusable flag and
+    // derived updatedAt. (Index-level here; the file store is covered in
+    // tests/project_manager.rs and tests/export_import.rs.)
+    let repo = SqliteRepository::connect_in_memory().await.unwrap();
+    let prompts: &dyn PromptRepository = &repo;
+    let src = prompts.create(NewPrompt { reusable: Some(true), ..new_prompt("t1", "b1") }).await.unwrap();
+    prompts
+        .update(
+            &src.id,
+            UpdatePrompt { body: Some("b2".into()), source: Some("aiEnhanced".into()), ..Default::default() },
+        )
+        .await
+        .unwrap();
+    let source_versions: Vec<PromptVersion> = prompts.versions(&src.id).await.unwrap();
+    let head = prompts.get(&src.id).await.unwrap();
+
+    let repo2 = SqliteRepository::connect_in_memory().await.unwrap();
+    let prompts2: &dyn PromptRepository = &repo2;
+    let imported = prompts2
+        .import_prompt(&src.id, head.reusable, &head.created_at, &source_versions)
+        .await
+        .unwrap();
+
+    assert_eq!(imported.id, src.id, "the prompt id is preserved verbatim");
+    assert!(imported.reusable, "the reusable flag travels");
+    assert_eq!(imported.version_count, 2);
+    assert_eq!(imported.created_at, head.created_at, "the prompt created_at is preserved");
+    assert_eq!(
+        imported.updated_at, head.updated_at,
+        "derived updatedAt preserved (the newest version's created_at travels)"
+    );
+
+    let imported_versions = prompts2.versions(&src.id).await.unwrap();
+    assert_eq!(imported_versions.len(), source_versions.len());
+    for (a, b) in source_versions.iter().zip(imported_versions.iter()) {
+        assert_eq!(a.id, b.id, "version id preserved");
+        assert_eq!(a.title, b.title);
+        assert_eq!(a.body, b.body);
+        assert_eq!(a.source, b.source, "provenance preserved");
+        assert_eq!(a.created_at, b.created_at);
+    }
+}
+
+#[tokio::test]
+async fn import_prompt_rejects_an_empty_version_list() {
+    let repo = SqliteRepository::connect_in_memory().await.unwrap();
+    let prompts: &dyn PromptRepository = &repo;
+    assert!(matches!(
+        prompts
+            .import_prompt("id", false, "2026-07-19T00:00:00.000+00:00", &[])
+            .await
+            .unwrap_err(),
+        AppError::Invalid(_)
+    ));
 }

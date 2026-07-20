@@ -383,6 +383,18 @@ impl ProjectManager {
         self.catalog.remove(id).await
     }
 
+    /// Resolve a known project's directory from the catalog by id (plan.8 §4 H1).
+    /// `reveal_project_folder` needs this because `AppState` exposes only the
+    /// `manager` and the `catalog` field is private — there is no other
+    /// single-project path accessor (`list_projects` fetches every row plus a
+    /// count per loaded store, wrong for one lookup). Models the `row.path`
+    /// lookup already used by `delete_files`/`project_info`. Does NOT verify the
+    /// path exists on disk — the caller re-checks `is_dir()` before any OS open.
+    pub async fn project_dir(&self, id: &str) -> Result<PathBuf> {
+        let row = self.catalog.get(id).await?.ok_or(AppError::NotFound)?;
+        Ok(PathBuf::from(row.path))
+    }
+
     // --- Item routing -----------------------------------------------------
 
     /// Create an item into the project named by `input.project_id` (the routing
@@ -484,6 +496,75 @@ impl ProjectManager {
         repo.delete(id).await
     }
 
+    /// Move a prompt — with its FULL version history — from its current loaded
+    /// project to another loaded project (plan.8; the app's first cross-store
+    /// mutation). Ordering is load-bearing (§4 H2/M1/M2):
+    ///
+    /// 1. Locate the source via `prompt_owner` (loaded stores only); resolve the
+    ///    target via `prompts_for` (a loaded catalog store) — NEVER a caller path.
+    ///    Reject an empty/unknown/unloaded target and a same-project move
+    ///    (Decision E) with a clear `Invalid`.
+    /// 2. Export the head (`get`) + ALL versions (`versions`) from the source,
+    ///    preserving each version's `source`/`created_at`/`title`/`body` and the
+    ///    prompt's `reusable`/`created_at`.
+    /// 3. `target.import_prompt(...)` — files-then-index, ids preserved verbatim
+    ///    (the user chose the id-preserving move).
+    /// 4. VERIFY by re-reading `target.versions(id)` (an O(1) indexed read) and
+    ///    asserting the count equals the source's; on mismatch roll back via
+    ///    `target.delete(id)` (atomically removes the target files AND rows) and
+    ///    abort with the SOURCE UNTOUCHED.
+    /// 5. Only THEN `source.delete(id)` — deleting the source LAST, so a crash
+    ///    between import and delete leaves the prompt still present in the source
+    ///    (recoverable), never lost. (Because ids are preserved, such a crash also
+    ///    leaves the SAME id in both loaded stores — `prompt_owner` then errors for
+    ///    that id until a human unloads a project; the accepted trade of the
+    ///    id-preserving choice.)
+    ///
+    /// Returns the imported prompt, stamped with the target project.
+    pub async fn move_prompt(&self, prompt_id: &str, target_project_id: &str) -> Result<Prompt> {
+        let target_id = target_project_id.trim();
+        if target_id.is_empty() {
+            return Err(AppError::Invalid("choose a project to move this prompt to".into()));
+        }
+        let (source_pid, source) = self.prompt_owner(prompt_id).await?;
+        if source_pid == target_id {
+            return Err(AppError::Invalid("that prompt is already in that project".into()));
+        }
+        let target = self
+            .prompts_for(target_id)
+            .map_err(|_| AppError::Invalid("that project isn't loaded".into()))?;
+
+        // Export head + full history from the source.
+        let head = source.get(prompt_id).await?;
+        let versions = source.versions(prompt_id).await?;
+        let expected = versions.len();
+
+        // Import into the target (files-then-index, atomic), ids preserved.
+        let imported = target
+            .import_prompt(prompt_id, head.reusable, &head.created_at, &versions)
+            .await?;
+
+        // Verify BEFORE deleting the source: re-read the target's history and
+        // confirm the count matches. A failed re-read OR a count mismatch both
+        // roll the target back (atomic — files + rows) and abort with the source
+        // untouched — so a verify-time error never leaves an orphan target copy
+        // alongside the still-present source (§12).
+        let verified = matches!(target.versions(prompt_id).await, Ok(v) if v.len() == expected);
+        if !verified {
+            let _ = target.delete(prompt_id).await;
+            return Err(AppError::Invalid(
+                "couldn't move the prompt — its history didn't copy completely".into(),
+            ));
+        }
+
+        // Only now remove the source (LAST).
+        source.delete(prompt_id).await?;
+
+        let mut moved = imported;
+        moved.project_id = Some(target_id.to_string());
+        Ok(moved)
+    }
+
     // --- Fan-out reads ----------------------------------------------------
 
     /// Merged list across the selected stores (a single project when
@@ -541,11 +622,22 @@ impl ProjectManager {
         let rows = self.catalog.list().await?;
         let mut out = Vec::with_capacity(rows.len());
         for row in rows {
-            let (loaded, item_count) = match self.repo_for(&row.id).ok() {
-                Some(repo) => (true, Some(repo.count_active().await?)),
-                None => (false, None),
+            let (loaded, item_count, prompt_count) = match self.loaded_views(&row.id) {
+                Some((repo, prompts)) => (
+                    true,
+                    Some(repo.count_active().await?),
+                    Some(prompts.count_prompts().await?),
+                ),
+                None => (false, None, None),
             };
-            out.push(ProjectInfo { id: row.id, name: row.name, path: row.path, loaded, item_count });
+            out.push(ProjectInfo {
+                id: row.id,
+                name: row.name,
+                path: row.path,
+                loaded,
+                item_count,
+                prompt_count,
+            });
         }
         Ok(out)
     }
@@ -644,6 +736,18 @@ impl ProjectManager {
             .ok_or(AppError::NotFound)
     }
 
+    /// Both trait views of one loaded store from a SINGLE lock acquisition — used
+    /// when a caller needs the item AND prompt counts for the same project
+    /// (`list_projects`/`project_info`), avoiding two separate `read()` locks per
+    /// project per call. `None` when the project is not loaded.
+    fn loaded_views(&self, id: &str) -> Option<(Arc<dyn ItemRepository>, Arc<dyn PromptRepository>)> {
+        self.loaded
+            .read()
+            .unwrap()
+            .get(id)
+            .map(|lp| (lp.repo.clone(), lp.prompts.clone()))
+    }
+
     /// Snapshot every loaded (id, prompt repo) so the lock is released before any
     /// `.await` (mirrors `snapshot`).
     fn prompt_snapshot(&self) -> Vec<(String, Arc<dyn PromptRepository>)> {
@@ -678,11 +782,22 @@ impl ProjectManager {
 
     async fn project_info(&self, id: &str) -> Result<ProjectInfo> {
         let row = self.catalog.get(id).await?.ok_or(AppError::NotFound)?;
-        let (loaded, item_count) = match self.repo_for(id).ok() {
-            Some(repo) => (true, Some(repo.count_active().await?)),
-            None => (false, None),
+        let (loaded, item_count, prompt_count) = match self.loaded_views(id) {
+            Some((repo, prompts)) => (
+                true,
+                Some(repo.count_active().await?),
+                Some(prompts.count_prompts().await?),
+            ),
+            None => (false, None, None),
         };
-        Ok(ProjectInfo { id: row.id, name: row.name, path: row.path, loaded, item_count })
+        Ok(ProjectInfo {
+            id: row.id,
+            name: row.name,
+            path: row.path,
+            loaded,
+            item_count,
+            prompt_count,
+        })
     }
 }
 

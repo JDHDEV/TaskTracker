@@ -416,7 +416,11 @@ export default function App() {
         aria-labelledby="tab-prompts"
         hidden={page !== "prompts"}
       >
-        <PromptsPage loaded={loaded} onError={setError} />
+        <PromptsPage
+          loaded={loaded}
+          onProjectsChanged={() => void loadMeta()}
+          onError={setError}
+        />
       </div>
 
       {showProjects && (

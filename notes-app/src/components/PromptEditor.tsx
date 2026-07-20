@@ -1,12 +1,23 @@
 import { useEffect, useRef, useState } from "react";
-import type { NewPrompt, Prompt, PromptSource, ProviderId, UpdatePrompt } from "../types";
-import { aiRewriteStream } from "../lib/api";
+import type {
+  NewPrompt,
+  ProjectInfo,
+  Prompt,
+  PromptSource,
+  ProviderId,
+  UpdatePrompt,
+} from "../types";
+import { aiRewriteStream, copyToClipboard } from "../lib/api";
+import { usePopover } from "../hooks/usePopover";
 import AiBar from "./AiBar";
 import PromptHistoryDialog from "./PromptHistoryDialog";
 
 interface Props {
   prompt: Prompt;
   isDraft: boolean;
+  /** The loaded project catalog (from PromptsPage) — the move-target choices are
+   *  the loaded projects other than this prompt's own. */
+  loaded: ProjectInfo[];
   onSave: (patch: UpdatePrompt) => Promise<boolean>;
   onCreate: (input: NewPrompt) => Promise<boolean>;
   /** Persists immediately (no version, no dirty state) — the reusable flag is
@@ -14,6 +25,9 @@ interface Props {
    *  local draft object (PromptsPage decides which). */
   onToggleReusable: (reusable: boolean) => void;
   onDelete: () => void;
+  /** Move this prompt to another loaded project. PromptsPage confirms, mutates,
+   *  and clears the selection (mirroring onDelete). */
+  onMove: (targetProjectId: string) => void;
   onError: (message: string) => void;
 }
 
@@ -24,10 +38,12 @@ interface Props {
 export default function PromptEditor({
   prompt,
   isDraft,
+  loaded,
   onSave,
   onCreate,
   onToggleReusable,
   onDelete,
+  onMove,
   onError,
 }: Props) {
   const [title, setTitle] = useState(prompt.title);
@@ -38,6 +54,22 @@ export default function PromptEditor({
   const [aiBusy, setAiBusy] = useState(false);
   const [saving, setSaving] = useState(false);
   const [showHistory, setShowHistory] = useState(false);
+  // Inline "Copied" feedback (plan.8), self-reverting; the timer is cleared on
+  // unmount / prompt change so a stale revert never fires on a newer prompt.
+  const [copied, setCopied] = useState(false);
+  const copiedTimer = useRef<number | null>(null);
+  // Move-to-project popover (plan.8), reusing the shared popover discipline.
+  const [showMove, setShowMove] = useState(false);
+  const moveWrapper = useRef<HTMLSpanElement>(null);
+  const movePanel = useRef<HTMLDivElement>(null);
+  const moveTrigger = useRef<HTMLButtonElement>(null);
+  usePopover(showMove, () => setShowMove(false), {
+    wrapper: moveWrapper,
+    panel: movePanel,
+    trigger: moveTrigger,
+  });
+  // Move targets: every loaded project except this prompt's own.
+  const otherLoaded = loaded.filter((p) => p.id !== prompt.projectId);
   // Backend-cancel handle for the in-flight stream (null when none).
   const stopRef = useRef<(() => void) | null>(null);
   // Blocks save re-entry (a second Ctrl+S while a save is in flight).
@@ -54,12 +86,32 @@ export default function PromptEditor({
     setStreaming(false);
     setAiBusy(false);
     setSaving(false);
+    setCopied(false);
+    setShowMove(false);
     savingRef.current = false;
     return () => {
       stopRef.current?.();
       stopRef.current = null;
+      if (copiedTimer.current !== null) {
+        window.clearTimeout(copiedTimer.current);
+        copiedTimer.current = null;
+      }
     };
   }, [prompt.id, isDraft]);
+
+  async function copyBody() {
+    try {
+      await copyToClipboard(body);
+      setCopied(true);
+      if (copiedTimer.current !== null) window.clearTimeout(copiedTimer.current);
+      copiedTimer.current = window.setTimeout(() => {
+        setCopied(false);
+        copiedTimer.current = null;
+      }, 1500);
+    } catch (err) {
+      onError(String(err));
+    }
+  }
 
   // The single persistence path. Accepts an override so an accept can pass the
   // fresh proposal rather than rely on a not-yet-committed setState.
@@ -71,10 +123,9 @@ export default function PromptEditor({
     savingRef.current = true;
     setSaving(true);
     try {
-      if (!title.trim()) {
-        onError("Give it a title before saving.");
-        return false;
-      }
+      // No title guard (plan.8): the title is optional. The repository rejects a
+      // fully-blank prompt (empty title AND empty body) and that error surfaces
+      // through onError like any other save failure.
       const effectiveBody = overrides?.body ?? body;
       if (isDraft) {
         const input: NewPrompt = {
@@ -197,9 +248,51 @@ export default function PromptEditor({
           {prompt.reusable ? "Unmark reusable" : "Mark reusable"}
         </button>
         {!isDraft && <span className="prompt-version">v{prompt.versionCount}</span>}
+        <button className="btn btn-quiet" onClick={() => void copyBody()}>
+          {copied ? "Copied" : "Copy to clipboard"}
+        </button>
+        <span className="sr-only" role="status" aria-live="polite">
+          {copied ? "Copied to clipboard" : ""}
+        </span>
         <span className="meta-spring" />
         {!isDraft && (
           <>
+            <span className="move-popover" ref={moveWrapper}>
+              <button
+                className="btn btn-quiet"
+                ref={moveTrigger}
+                aria-haspopup="true"
+                aria-expanded={showMove}
+                disabled={otherLoaded.length === 0}
+                title={
+                  otherLoaded.length === 0
+                    ? "Load another project to move this prompt into"
+                    : undefined
+                }
+                onClick={() => setShowMove((o) => !o)}
+              >
+                Move to project…
+              </button>
+              {showMove && (
+                <div className="popover popover-move" ref={movePanel}>
+                  <span className="popover-label">MOVE TO</span>
+                  <div className="popover-pills">
+                    {otherLoaded.map((p) => (
+                      <button
+                        key={p.id}
+                        className="popover-pill"
+                        onClick={() => {
+                          setShowMove(false);
+                          onMove(p.id);
+                        }}
+                      >
+                        {p.name}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </span>
             <button className="btn btn-quiet" onClick={() => setShowHistory(true)}>
               History
             </button>
