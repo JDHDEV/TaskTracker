@@ -940,9 +940,9 @@ textarea {
 
 /* Manage projects dialog */
 .dialog-projects {
-  /* 600px (was 560) so the widened create field + the two create/open buttons
-     still fit on one row (plan.8 wider-input). */
-  width: min(600px, calc(100vw - 32px));
+  /* Wide enough that a loaded row — identity + state chip + all five action
+     buttons — fits on one line without wrapping or crushing the name. */
+  width: min(940px, calc(100vw - 32px));
 }
 
 .project-row {
@@ -953,12 +953,13 @@ textarea {
   border-top: 1px solid var(--line);
 }
 
-/* Per-row controls, grouped so they wrap as a unit when a row is tight rather
-   than overflowing the non-wrapping .project-row (plan.8 adds a 5th button). */
+/* Per-row controls. The dialog is sized so all five fit on one line; keep them
+   from wrapping or shrinking so a loaded row never reflows or steals the name's
+   space. */
 .project-actions {
   display: flex;
   gap: 6px;
-  flex-wrap: wrap;
+  flex-shrink: 0;
   justify-content: flex-end;
 }
 
@@ -976,7 +977,10 @@ textarea {
 /* Identity block in a project row: name over its muted on-disk path. */
 .project-ident {
   flex: 1;
-  min-width: 0;
+  /* Floor (was 0) so the name/path column can't be squeezed to nothing by a
+     loaded row's extra button + longer state chip — the "name disappears when
+     loaded" bug. */
+  min-width: 200px;
   display: flex;
   flex-direction: column;
   gap: 2px;
@@ -1005,6 +1009,7 @@ textarea {
   letter-spacing: 0.08em;
   color: var(--muted);
   white-space: nowrap;
+  flex-shrink: 0;
 }
 
 .project-state-on {

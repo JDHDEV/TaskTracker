@@ -17,6 +17,10 @@ interface Props {
   variant?: "item" | "prompt";
   onRework: (instruction: string, provider: ProviderId) => void;
   onSave: () => void;
+  /** Prompt editor only (plan.9): revert unsaved title/body edits to the most
+   *  recently saved version. When provided, a Discard button appears left of
+   *  Save; the item editor leaves it undefined. */
+  onDiscard?: () => void;
 }
 
 const ITEM_PRESETS = [
@@ -46,6 +50,7 @@ export default function AiBar({
   variant = "item",
   onRework,
   onSave,
+  onDiscard,
 }: Props) {
   const [provider, setProvider] = useState<ProviderId>(getPreferredProvider);
   const [custom, setCustom] = useState("");
@@ -100,6 +105,16 @@ export default function AiBar({
       >
         {busy ? "Working…" : "Rework"}
       </button>
+      {onDiscard && (
+        <button
+          className="btn btn-quiet"
+          disabled={!dirty || generatingTitle}
+          title="Revert to the most recently saved version"
+          onClick={onDiscard}
+        >
+          Discard
+        </button>
+      )}
       <button
         className="btn btn-save"
         disabled={!dirty || generatingTitle || saveBlocked}

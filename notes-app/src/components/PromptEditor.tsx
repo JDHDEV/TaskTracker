@@ -7,7 +7,7 @@ import type {
   ProviderId,
   UpdatePrompt,
 } from "../types";
-import { aiRewriteStream, copyToClipboard } from "../lib/api";
+import { aiRewriteStream, confirmDialog, copyToClipboard } from "../lib/api";
 import { usePopover } from "../hooks/usePopover";
 import AiBar from "./AiBar";
 import PromptHistoryDialog from "./PromptHistoryDialog";
@@ -227,6 +227,22 @@ export default function PromptEditor({
     };
   }
 
+  // Revert unsaved title/body edits to the most recently saved version (the
+  // `prompt` prop, which PromptsPage re-fetches after every save). Confirmed
+  // because it throws away in-progress edits; only offered for a saved prompt —
+  // a fresh draft has no saved version to revert to.
+  function discardEdits() {
+    void (async () => {
+      const ok = await confirmDialog(
+        "Discard unsaved changes and revert to the most recently saved version?",
+      );
+      if (!ok) return;
+      setTitle(prompt.title);
+      setBody(prompt.body);
+      setDirty(false);
+    })();
+  }
+
   return (
     <section className="editor">
       <header className="editor-head">
@@ -346,6 +362,7 @@ export default function PromptEditor({
         saveBlocked={false}
         onRework={(i, p) => void rework(i, p)}
         onSave={() => void save()}
+        onDiscard={isDraft ? undefined : discardEdits}
       />
 
       {showHistory && (
