@@ -28,7 +28,11 @@ interface Props {
   /** Move this prompt to another loaded project. PromptsPage confirms, mutates,
    *  and clears the selection (mirroring onDelete). */
   onMove: (targetProjectId: string) => void;
-  onError: (message: string) => void;
+  /** Widened for keyed (resolvable) validation toasts; transient sites still
+   *  call it one-arg (assignable). */
+  onError: (message: string, opts?: { key?: string }) => void;
+  /** Clear a keyed toast the instant its condition is fixed. */
+  onResolve: (key: string) => void;
 }
 
 /** Detail pane for one prompt: title + body only (no status/priority/due/pin/
@@ -45,6 +49,7 @@ export default function PromptEditor({
   onDelete,
   onMove,
   onError,
+  onResolve,
 }: Props) {
   const [title, setTitle] = useState(prompt.title);
   const [body, setBody] = useState(prompt.body);
@@ -99,6 +104,14 @@ export default function PromptEditor({
     };
   }, [prompt.id, isDraft]);
 
+  // Resolve-on-condition (§5): clear the keyed "no text to rework" toast (#16)
+  // when body text exists, and the "needs a title or text" toast the instant
+  // either the title or the body becomes non-empty.
+  useEffect(() => {
+    if (body.trim()) onResolve("prompt-no-text");
+    if (title.trim() || body.trim()) onResolve("prompt-empty");
+  }, [title, body, onResolve]);
+
   async function copyBody() {
     try {
       await copyToClipboard(body);
@@ -123,10 +136,17 @@ export default function PromptEditor({
     savingRef.current = true;
     setSaving(true);
     try {
-      // No title guard (plan.8): the title is optional. The repository rejects a
-      // fully-blank prompt (empty title AND empty body) and that error surfaces
-      // through onError like any other save failure.
       const effectiveBody = overrides?.body ?? body;
+      // The title is optional (plan.8), but a fully-blank prompt (empty title AND
+      // empty body) is rejected. Guard it here with a KEYED, resolvable toast that
+      // clears the instant a title or body exists (and can never linger past a
+      // successful save) — rather than the backend's unkeyed error, which
+      // persisted after the user fixed the field. The repository still enforces
+      // the rule as the backstop.
+      if (!title.trim() && !effectiveBody.trim()) {
+        onError("Add a title or some text before saving.", { key: "prompt-empty" });
+        return false;
+      }
       if (isDraft) {
         const input: NewPrompt = {
           projectId: prompt.projectId ?? "",
@@ -168,7 +188,7 @@ export default function PromptEditor({
 
   async function rework(instruction: string, provider: ProviderId) {
     if (!body.trim()) {
-      onError("There is no text to rework yet.");
+      onError("There is no text to rework yet.", { key: "prompt-no-text" });
       return;
     }
     stopRef.current?.(); // defensive: AiBar disables Rework while busy

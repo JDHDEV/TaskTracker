@@ -17,6 +17,8 @@ import Editor from "./components/Editor";
 import SettingsDialog from "./components/SettingsDialog";
 import ManageProjectsDialog from "./components/ManageProjectsDialog";
 import PromptsPage from "./components/PromptsPage";
+import Toasts from "./components/Toasts";
+import { useToasts } from "./hooks/useToasts";
 
 type Page = "worknotes" | "prompts";
 
@@ -45,10 +47,18 @@ export default function App() {
 
   const [showSettings, setShowSettings] = useState(false);
   const [showProjects, setShowProjects] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  // Non-blocking status line: startup per-project load failures, and the
-  // screen-reader announcement when an unload evicts the open item.
-  const [notice, setNotice] = useState<string | null>(null);
+  // Toasts replace the former single-slot error/notice banners. Errors persist
+  // until dismissed/resolved; notices auto-expire at 30s. Resolvable validation
+  // toasts are pushed with a stable key and cleared (dismissKey) the instant the
+  // owning field's condition becomes false. The callbacks are stable across
+  // renders (the hook memoizes them), so they are safe useCallback/effect deps.
+  const {
+    toasts: toastList,
+    error: showError,
+    notice: showNotice,
+    dismiss: dismissToast,
+    dismissKey,
+  } = useToasts();
   const [theme, setTheme] = useState<"light" | "dark">(() =>
     localStorage.getItem("theme") === "dark" ? "dark" : "light",
   );
@@ -86,9 +96,9 @@ export default function App() {
         : await api.listItems(f);
       if (shouldCommit(token, loadToken.current)) setItems(result);
     } catch (err) {
-      if (shouldCommit(token, loadToken.current)) setError(String(err));
+      if (shouldCommit(token, loadToken.current)) showError(String(err));
     }
-  }, [kind, projectFilter, statusFilter, tagFilter, sort, search]);
+  }, [kind, projectFilter, statusFilter, tagFilter, sort, search, showError]);
 
   const loadMeta = useCallback(async () => {
     try {
@@ -99,9 +109,9 @@ export default function App() {
       setKnownProjects(nextProjects);
       setActiveTags(nextTags);
     } catch (err) {
-      setError(String(err));
+      showError(String(err));
     }
-  }, []);
+  }, [showError]);
 
   // Debounce search only; discrete filter changes fire immediately (0 ms).
   useEffect(() => {
@@ -118,12 +128,14 @@ export default function App() {
     void (async () => {
       try {
         const warnings = await api.startupWarnings();
-        if (warnings.length) setNotice(warnings.join(" "));
+        // Coalesced into ONE keyed notice (not N banners) — the stable key keeps
+        // the multi-warning startup case a single row (§3.2).
+        if (warnings.length) showNotice(warnings.join(" "), { key: "startup-warnings" });
       } catch {
         // A missing warnings channel is not itself worth alarming about.
       }
     })();
-  }, []);
+  }, [showNotice]);
 
   // Tag lifecycle: when the vocabulary shrinks (a tag's last active reference
   // finished, was archived, or its project unloaded), drop any selected filter
@@ -159,7 +171,7 @@ export default function App() {
       await refreshAll();
       return true;
     } catch (err) {
-      setError(String(err));
+      showError(String(err));
       return false;
     }
   }
@@ -197,7 +209,7 @@ export default function App() {
       setSelectedId(created.id);
       return true;
     } catch (err) {
-      setError(String(err));
+      showError(String(err));
       return false;
     }
   }
@@ -214,10 +226,16 @@ export default function App() {
     )
       return;
     const ok = await mutate(() => api.unloadProject(p.id));
-    if (ok && affectsOpen) {
-      setDraft(null);
-      setSelectedId(null);
-      setNotice(`Unloaded "${p.name}" — the open item was closed.`);
+    if (ok) {
+      if (affectsOpen) {
+        setDraft(null);
+        setSelectedId(null);
+        showNotice(`Unloaded "${p.name}" — the open item was closed.`);
+      } else {
+        // Confirm every unload, not only the one that closed an open item —
+        // a later unload with nothing open gave no feedback at all otherwise.
+        showNotice(`Unloaded "${p.name}".`);
+      }
     }
   }
 
@@ -245,11 +263,12 @@ export default function App() {
     if (!ok) return;
     if (affectsOpenItem) {
       setSelectedId(null);
-      setNotice(`Reloaded "${p.name}" — the open item was closed so it can reload.`);
+      showNotice(`Reloaded "${p.name}" — the open item was closed so it can reload.`);
     }
     if (warnings.length > 0) {
       const n = warnings.length;
-      setError(
+      // An error (persists — names files the user must fix), not a notice.
+      showError(
         `Reloaded "${p.name}", but ${n} item${n === 1 ? "" : "s"} couldn't be imported:\n` +
           warnings.join("\n"),
       );
@@ -313,23 +332,7 @@ export default function App() {
         </button>
       </header>
 
-      {error && (
-        <div className="toast" role="alert">
-          <span>{error}</span>
-          <button className="btn btn-quiet" onClick={() => setError(null)}>
-            Dismiss
-          </button>
-        </div>
-      )}
-
-      {notice && (
-        <div className="toast toast-notice" role="status">
-          <span>{notice}</span>
-          <button className="btn btn-quiet" onClick={() => setNotice(null)}>
-            Dismiss
-          </button>
-        </div>
-      )}
+      <Toasts toasts={toastList} onDismiss={dismissToast} />
 
       <div
         className="page-body"
@@ -395,7 +398,8 @@ export default function App() {
                 });
               })();
             }}
-            onError={setError}
+            onError={showError}
+            onResolve={dismissKey}
           />
         ) : (
           <section className="editor editor-empty">
@@ -419,7 +423,8 @@ export default function App() {
         <PromptsPage
           loaded={loaded}
           onProjectsChanged={() => void loadMeta()}
-          onError={setError}
+          onError={showError}
+          onResolve={dismissKey}
         />
       </div>
 
@@ -430,11 +435,12 @@ export default function App() {
           onChanged={() => void refreshAll()}
           onUnload={(p) => unloadProject(p)}
           onReload={(p) => reloadProject(p)}
-          onError={setError}
+          onError={showError}
+          onResolve={dismissKey}
         />
       )}
       {showSettings && (
-        <SettingsDialog onClose={() => setShowSettings(false)} onError={setError} />
+        <SettingsDialog onClose={() => setShowSettings(false)} onError={showError} />
       )}
     </div>
   );

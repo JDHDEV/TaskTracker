@@ -1,4 +1,4 @@
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { ProjectInfo } from "../types";
 import {
   confirmDialog,
@@ -25,7 +25,11 @@ interface Props {
    *  from this project would be staled by re-reading files, and surfaces any
    *  per-file import warnings. */
   onReload: (project: ProjectInfo) => Promise<void>;
-  onError: (message: string) => void;
+  /** Widened for keyed (resolvable) validation toasts; the transient withBusy
+   *  failure site still calls it one-arg (assignable). */
+  onError: (message: string, opts?: { key?: string }) => void;
+  /** Clear a keyed toast the instant its condition is fixed. */
+  onResolve: (key: string) => void;
 }
 
 export default function ManageProjectsDialog({
@@ -35,9 +39,16 @@ export default function ManageProjectsDialog({
   onUnload,
   onReload,
   onError,
+  onResolve,
 }: Props) {
   const [newName, setNewName] = useState("");
   const [busy, setBusy] = useState(false);
+
+  // Resolve-on-condition (§5): clear the keyed "Enter a project name first."
+  // toast (#24) the instant a name is typed.
+  useEffect(() => {
+    if (newName.trim()) onResolve("project-name");
+  }, [newName, onResolve]);
   // Native file dialogs escape React focus management — restore focus to the
   // trigger after the picker promise settles (usePopover's discipline).
   const openRef = useRef<HTMLButtonElement>(null);
@@ -69,7 +80,7 @@ export default function ManageProjectsDialog({
   function handleCreate() {
     const name = newName.trim();
     if (!name) {
-      onError("Enter a project name first.");
+      onError("Enter a project name first.", { key: "project-name" });
       return;
     }
     void withBusy(async () => {
@@ -245,7 +256,12 @@ export default function ManageProjectsDialog({
               }
             }}
           />
-          <button ref={createRef} className="btn" disabled={busy} onClick={handleCreate}>
+          <button
+            ref={createRef}
+            className="btn"
+            disabled={busy || !newName.trim()}
+            onClick={handleCreate}
+          >
             Create in folder…
           </button>
           <button ref={openRef} className="btn btn-quiet" disabled={busy} onClick={handleOpen}>

@@ -31,7 +31,13 @@ interface Props {
   onArchive: (archived: boolean) => void;
   onPin: (pinned: boolean) => void;
   onDelete: () => void;
-  onError: (message: string) => void;
+  /** Widened for keyed (resolvable) validation toasts: a stable `key` lets the
+   *  same toast replace-in-place and be cleared on resolution. The transient AI
+   *  failure sites still call it one-arg (assignable). */
+  onError: (message: string, opts?: { key?: string }) => void;
+  /** Clear a keyed toast the instant its condition is fixed (paired with the
+   *  keyed `onError` pushes below). */
+  onResolve: (key: string) => void;
 }
 
 const STATUSES: Status[] = ["todo", "doing", "done"];
@@ -50,6 +56,7 @@ export default function Editor({
   onPin,
   onDelete,
   onError,
+  onResolve,
 }: Props) {
   const [title, setTitle] = useState(item.title);
   const [body, setBody] = useState(item.body);
@@ -91,6 +98,19 @@ export default function Editor({
   useEffect(() => {
     titleRef.current = title;
   }, [title]);
+
+  // Resolve-on-condition (§5): clear a keyed validation toast the instant its
+  // condition is fixed — a project is chosen (#9), or body text exists (#11/#13)
+  // — not on the next retry. A dismissKey for an absent/expired key is a no-op.
+  useEffect(() => {
+    if (projectId) onResolve("item-project");
+  }, [projectId, onResolve]);
+  useEffect(() => {
+    if (body.trim()) {
+      onResolve("editor-no-text");
+      onResolve("editor-no-title-src");
+    }
+  }, [body, onResolve]);
 
   // Re-seed local state from the item. App.tsx keys this component by
   // draft-seq/selected-id, so most selections remount it; this effect covers
@@ -143,7 +163,7 @@ export default function Editor({
       // A new draft must target a project store before it can be created (items
       // are created INTO a project — this guard precedes any AI title call).
       if (isDraft && !projectId) {
-        onError("Choose a project for this item before saving.");
+        onError("Choose a project for this item before saving.", { key: "item-project" });
         return false;
       }
       const effectiveBody = overrides?.body ?? body;
@@ -229,7 +249,7 @@ export default function Editor({
 
   async function rework(instruction: string, provider: ProviderId) {
     if (!body.trim()) {
-      onError("There is no text to rework yet.");
+      onError("There is no text to rework yet.", { key: "editor-no-text" });
       return;
     }
     stopRef.current?.(); // defensive: the AiBar disables Rework while busy, so
@@ -314,7 +334,7 @@ export default function Editor({
   async function suggestTitle() {
     if (suggestingTitle) return; // already running
     if (!body.trim()) {
-      onError("There is no text to generate a title from.");
+      onError("There is no text to generate a title from.", { key: "editor-no-title-src" });
       return;
     }
     stopRef.current?.(); // supersede any in-flight rework/suggest

@@ -16,7 +16,11 @@ interface Props {
    *  project's count; a move changes two). Mirrors how the item side refreshes
    *  the catalog through App's mutate. */
   onProjectsChanged: () => void;
-  onError: (message: string) => void;
+  /** Widened for keyed (resolvable) validation toasts; transient sites still
+   *  call it one-arg (assignable). */
+  onError: (message: string, opts?: { key?: string }) => void;
+  /** Clear a keyed toast on resolution — threaded down to PromptEditor. */
+  onResolve: (key: string) => void;
 }
 
 /** A blank local draft targeting `projectId` — mirrors src/lib/draft.ts's
@@ -35,7 +39,12 @@ function newDraft(projectId: string): Prompt {
   };
 }
 
-export default function PromptsPage({ loaded, onProjectsChanged, onError }: Props) {
+export default function PromptsPage({
+  loaded,
+  onProjectsChanged,
+  onError,
+  onResolve,
+}: Props) {
   const [projectId, setProjectId] = useState("");
   const [reusableOnly, setReusableOnly] = useState(false);
   const [prompts, setPrompts] = useState<Prompt[]>([]);
@@ -182,6 +191,7 @@ export default function PromptsPage({ loaded, onProjectsChanged, onError }: Prop
             })();
           }}
           onError={onError}
+          onResolve={onResolve}
         />
       ) : (
         <section className="editor editor-empty">

@@ -134,6 +134,15 @@ textarea {
   display: none;
 }
 
+/* Toast stack: banners in normal document flow above the two-pane body, one
+   .toast per message (each its own role=alert/status live region). Flat and
+   hairline — the app has no shadow/elevation tokens. The store caps the column
+   at TOAST_MAX so it can never grow unbounded. */
+.toast-stack {
+  display: flex;
+  flex-direction: column;
+}
+
 .toast {
   display: flex;
   align-items: center;
@@ -145,12 +154,35 @@ textarea {
   border-bottom: 1px solid #e8c6bb;
 }
 
+/* Preserve author newlines (e.g. the multi-file import-failure list) while
+   keeping a long line from forcing horizontal scroll of the page body. */
+.toast-message {
+  min-width: 0;
+  white-space: pre-line;
+  overflow-wrap: anywhere;
+}
+
 /* A non-alarming status line (startup warnings, unload eviction notice) — the
    neutral surface, not the danger tint the error toast carries. */
 .toast-notice {
   background: var(--surface);
   color: var(--muted);
   border-bottom: 1px solid var(--line);
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .toast {
+    animation: toast-in 120ms ease;
+  }
+}
+
+@keyframes toast-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
 }
 
 .panes {
