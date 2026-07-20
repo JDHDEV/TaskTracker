@@ -81,6 +81,20 @@ fn new_prompt(project_id: &str, title: &str, body: &str) -> NewPrompt {
     }
 }
 
+/// Pin a prompt's DERIVED `updatedAt` (its current version's `created_at`) via a
+/// SIDE connection to the project's own `index.db` — same idiom as
+/// `secondary_loaded_project_content_edit_bumps_updated_at_but_pin_and_archive_do_not`
+/// (~line 615), but for prompt versions: `set_prompt_version_timestamp_for_test`
+/// is an inherent method on the concrete `SqliteRepository`, not on the
+/// `PromptRepository` trait the manager routes through.
+async fn pin_prompt_updated_at(mgr: &ProjectManager, project: &ProjectInfo, prompt_id: &str, ts: &str) {
+    let version_id = mgr.prompt_versions(prompt_id).await.unwrap()[0].id.clone();
+    let db_path = Path::new(&project.path).join("index.db");
+    let side = SqliteRepository::open_existing(&db_path).await.unwrap();
+    side.set_prompt_version_timestamp_for_test(&version_id, ts).await.unwrap();
+    side.close().await;
+}
+
 /// Canonicalize and strip the `\\?\` verbatim prefix, mirroring what
 /// `validate_project_dir` stores as a project's catalog path.
 fn canonical_string(p: &Path) -> String {
@@ -1203,23 +1217,392 @@ async fn create_prompt_lands_only_in_target_store() {
 }
 
 #[tokio::test]
-async fn list_prompts_without_a_project_id_is_invalid() {
-    // Prompts have no cross-store "all projects" fan-out (unlike items); an
-    // empty/blank projectId is rejected rather than silently returning nothing
-    // or every loaded store's prompts.
+async fn list_prompts_without_a_project_id_requires_reusable_only() {
+    // Prompts have no cross-store "dump everything" fan-out: a projectId-less
+    // request is rejected UNLESS it explicitly asks for the reusable-only union
+    // (plan.9 §8) — omitting projectId must never dump every private prompt in
+    // every loaded project, but an explicit reusableOnly=true fan-out is fine.
     let (mgr, _app) = new_manager().await;
     let (_a, _dir_a) = create_project(&mgr, "Alpha").await;
 
-    assert!(matches!(
-        mgr.list_prompts(&PromptListFilter::default()).await.unwrap_err(),
-        AppError::Invalid(_)
-    ));
-    assert!(matches!(
-        mgr.list_prompts(&PromptListFilter { project_id: Some("   ".into()), ..Default::default() })
+    assert!(
+        matches!(
+            mgr.list_prompts(&PromptListFilter::default()).await.unwrap_err(),
+            AppError::Invalid(_)
+        ),
+        "default filter (reusableOnly unset) with no projectId must be rejected"
+    );
+    assert!(
+        matches!(
+            mgr.list_prompts(&PromptListFilter { project_id: Some("   ".into()), ..Default::default() })
+                .await
+                .unwrap_err(),
+            AppError::Invalid(_)
+        ),
+        "a blank projectId is treated as absent and must be rejected"
+    );
+    assert!(
+        matches!(
+            mgr.list_prompts(&PromptListFilter { reusable_only: Some(false), ..Default::default() })
+                .await
+                .unwrap_err(),
+            AppError::Invalid(_)
+        ),
+        "an explicit non-reusable request with no projectId must still be rejected"
+    );
+
+    // But an explicit reusable-only fan-out with no projectId is accepted.
+    assert!(
+        mgr.list_prompts(&PromptListFilter { reusable_only: Some(true), ..Default::default() })
             .await
-            .unwrap_err(),
-        AppError::Invalid(_)
-    ));
+            .is_ok(),
+        "reusableOnly=true with no projectId must fan out, not error"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Cross-project reusable-prompt fan-out (plan.9 §8): `list_prompts` with no
+// `projectId` and `reusableOnly: true` unions every loaded store's REUSABLE
+// prompts, stamped with each prompt's TRUE owning-store UUID, k-way-merged
+// newest-first and deduped by id.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn list_prompts_fan_out_stamps_each_prompt_with_its_true_owning_project() {
+    let (mgr, _app) = new_manager().await;
+    let (a, _dir_a) = create_project(&mgr, "Alpha").await;
+    let (b, _dir_b) = create_project(&mgr, "Beta").await;
+
+    let pa = mgr
+        .create_prompt(NewPrompt { reusable: Some(true), ..new_prompt(&a.id, "alpha reusable", "body") })
+        .await
+        .unwrap();
+    let pb = mgr
+        .create_prompt(NewPrompt { reusable: Some(true), ..new_prompt(&b.id, "beta reusable", "body") })
+        .await
+        .unwrap();
+
+    let union = mgr
+        .list_prompts(&PromptListFilter { reusable_only: Some(true), ..Default::default() })
+        .await
+        .unwrap();
+    assert_eq!(union.len(), 2);
+    let owner_of = |id: &str| union.iter().find(|p| p.id == id).and_then(|p| p.project_id.clone());
+    assert_eq!(
+        owner_of(&pa.id),
+        Some(a.id.clone()),
+        "alpha's prompt must be stamped with alpha's id, its TRUE owner, not the caller's"
+    );
+    assert_eq!(owner_of(&pb.id), Some(b.id.clone()), "beta's prompt must be stamped with beta's id");
+}
+
+#[tokio::test]
+async fn list_prompts_with_project_id_still_returns_only_that_projects_prompts() {
+    // Regression for the new fan-out branch: a scoped request must stay
+    // single-store even though BOTH projects carry reusable prompts.
+    let (mgr, _app) = new_manager().await;
+    let (a, _dir_a) = create_project(&mgr, "Alpha").await;
+    let (b, _dir_b) = create_project(&mgr, "Beta").await;
+    mgr.create_prompt(NewPrompt { reusable: Some(true), ..new_prompt(&a.id, "a", "b") }).await.unwrap();
+    mgr.create_prompt(NewPrompt { reusable: Some(true), ..new_prompt(&b.id, "b", "b") }).await.unwrap();
+
+    let only_a = mgr
+        .list_prompts(&PromptListFilter { project_id: Some(a.id.clone()), ..Default::default() })
+        .await
+        .unwrap();
+    assert_eq!(only_a.len(), 1, "scoping to A must never pull in B's prompt even though both are reusable");
+    assert_eq!(only_a[0].project_id.as_deref(), Some(a.id.as_str()));
+}
+
+#[tokio::test]
+async fn list_prompts_fan_out_excludes_non_reusable_but_scoped_list_still_sees_it() {
+    let (mgr, _app) = new_manager().await;
+    let (a, _dir_a) = create_project(&mgr, "Alpha").await;
+    let reusable = mgr
+        .create_prompt(NewPrompt { reusable: Some(true), ..new_prompt(&a.id, "reusable", "b") })
+        .await
+        .unwrap();
+    let private = mgr.create_prompt(new_prompt(&a.id, "private", "b")).await.unwrap();
+
+    let union = mgr
+        .list_prompts(&PromptListFilter { reusable_only: Some(true), ..Default::default() })
+        .await
+        .unwrap();
+    let union_ids: Vec<&str> = union.iter().map(|p| p.id.as_str()).collect();
+    assert!(union_ids.contains(&reusable.id.as_str()));
+    assert!(
+        !union_ids.contains(&private.id.as_str()),
+        "a non-reusable prompt must never leak into the omitted-projectId union"
+    );
+
+    // But scoped to its own project with no reusable filter, the private prompt
+    // IS returned.
+    let scoped = mgr
+        .list_prompts(&PromptListFilter { project_id: Some(a.id.clone()), reusable_only: None })
+        .await
+        .unwrap();
+    let scoped_ids: Vec<&str> = scoped.iter().map(|p| p.id.as_str()).collect();
+    assert!(scoped_ids.contains(&private.id.as_str()), "scoped to A, the private prompt is returned");
+    assert!(scoped_ids.contains(&reusable.id.as_str()));
+}
+
+#[tokio::test]
+async fn list_prompts_fan_out_k_way_merges_by_recency_not_concatenation() {
+    let (mgr, _app) = new_manager().await;
+    let (a, _dir_a) = create_project(&mgr, "Alpha").await;
+    let (b, _dir_b) = create_project(&mgr, "Beta").await;
+
+    let ts_old = "2026-07-14T00:00:01.000+00:00";
+    let ts_mid = "2026-07-14T00:00:02.000+00:00";
+    let ts_new = "2026-07-14T00:00:03.000+00:00";
+
+    let a_old = mgr
+        .create_prompt(NewPrompt { reusable: Some(true), ..new_prompt(&a.id, "a-old", "b") })
+        .await
+        .unwrap();
+    let a_new = mgr
+        .create_prompt(NewPrompt { reusable: Some(true), ..new_prompt(&a.id, "a-new", "b") })
+        .await
+        .unwrap();
+    let b_mid = mgr
+        .create_prompt(NewPrompt { reusable: Some(true), ..new_prompt(&b.id, "b-mid", "b") })
+        .await
+        .unwrap();
+
+    pin_prompt_updated_at(&mgr, &a, &a_old.id, ts_old).await;
+    pin_prompt_updated_at(&mgr, &a, &a_new.id, ts_new).await;
+    pin_prompt_updated_at(&mgr, &b, &b_mid.id, ts_mid).await;
+
+    let union = mgr
+        .list_prompts(&PromptListFilter { reusable_only: Some(true), ..Default::default() })
+        .await
+        .unwrap();
+    let ids: Vec<&str> = union.iter().map(|p| p.id.as_str()).collect();
+    // A naive per-store concatenation could never produce this interleave
+    // (b-mid sits strictly between a-new and a-old): only a real k-way merge does.
+    assert_eq!(ids, vec![a_new.id.as_str(), b_mid.id.as_str(), a_old.id.as_str()]);
+}
+
+#[tokio::test]
+async fn list_prompts_fan_out_tiebreaks_equal_updated_at_by_id_ascending_deterministically() {
+    let (mgr, _app) = new_manager().await;
+    let (a, _dir_a) = create_project(&mgr, "Alpha").await;
+    let (b, _dir_b) = create_project(&mgr, "Beta").await;
+    let ts = "2026-07-14T00:00:00.000+00:00";
+
+    let pa = mgr.create_prompt(NewPrompt { reusable: Some(true), ..new_prompt(&a.id, "a", "b") }).await.unwrap();
+    let pb = mgr.create_prompt(NewPrompt { reusable: Some(true), ..new_prompt(&b.id, "b", "b") }).await.unwrap();
+    pin_prompt_updated_at(&mgr, &a, &pa.id, ts).await;
+    pin_prompt_updated_at(&mgr, &b, &pb.id, ts).await;
+
+    let (lo, hi) = if pa.id < pb.id { (pa.id.clone(), pb.id.clone()) } else { (pb.id.clone(), pa.id.clone()) };
+
+    for attempt in 0..3 {
+        let union = mgr
+            .list_prompts(&PromptListFilter { reusable_only: Some(true), ..Default::default() })
+            .await
+            .unwrap();
+        let ids: Vec<&str> = union.iter().map(|p| p.id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec![lo.as_str(), hi.as_str()],
+            "attempt {attempt}: equal updated_at must tiebreak by id ASC, stably across repeated calls"
+        );
+    }
+}
+
+#[tokio::test]
+async fn list_prompts_fan_out_returns_both_prompts_sharing_a_title_across_projects() {
+    let (mgr, _app) = new_manager().await;
+    let (a, _dir_a) = create_project(&mgr, "Alpha").await;
+    let (b, _dir_b) = create_project(&mgr, "Beta").await;
+    let pa = mgr
+        .create_prompt(NewPrompt { reusable: Some(true), ..new_prompt(&a.id, "release email", "a body") })
+        .await
+        .unwrap();
+    let pb = mgr
+        .create_prompt(NewPrompt { reusable: Some(true), ..new_prompt(&b.id, "release email", "b body") })
+        .await
+        .unwrap();
+
+    let union = mgr
+        .list_prompts(&PromptListFilter { reusable_only: Some(true), ..Default::default() })
+        .await
+        .unwrap();
+    assert_eq!(union.len(), 2, "same-titled reusable prompts in two projects must both appear");
+    let ids: Vec<&str> = union.iter().map(|p| p.id.as_str()).collect();
+    assert!(ids.contains(&pa.id.as_str()) && ids.contains(&pb.id.as_str()), "assert on id, not title");
+}
+
+#[tokio::test]
+async fn list_prompts_fan_out_dedupes_a_pathological_shared_id_across_two_stores() {
+    // Real UUIDs never collide across projects; this reachable-only-via-crafted-
+    // files scenario proves the manager-level dedup (not just the unit-tested
+    // merge in `merge_tests::prompts_same_id_from_two_stores_collapses_to_one`)
+    // holds end to end through the file-store rebuild path.
+    let (mgr, _app) = new_manager().await;
+    let (a, dir_a) = create_project(&mgr, "Alpha").await;
+    let (b, dir_b) = create_project(&mgr, "Beta").await;
+
+    let shared_id = "99999999-9999-9999-9999-999999999999";
+    let version_id_a = "aaaaaaaa-1111-1111-1111-111111111111";
+    let version_id_b = "bbbbbbbb-2222-2222-2222-222222222222";
+    let ts = "2026-07-14T00:00:00.000+00:00";
+
+    for (dir, version_id, title) in
+        [(dir_a.path(), version_id_a, "from alpha"), (dir_b.path(), version_id_b, "from beta")]
+    {
+        let prompts_dir = dir.join("prompts");
+        promptfile::write_prompt(
+            &prompts_dir,
+            &promptfile::PromptRecord { id: shared_id.into(), reusable: true, created_at: ts.into() },
+        )
+        .unwrap();
+        promptfile::write_version(
+            &prompts_dir,
+            &promptfile::PromptVersionRecord {
+                id: version_id.into(),
+                prompt_id: shared_id.into(),
+                title: title.into(),
+                body: "body".into(),
+                source: "manual".into(),
+                created_at: ts.into(),
+            },
+        )
+        .unwrap();
+    }
+
+    mgr.reload(&a.id).await.unwrap();
+    mgr.reload(&b.id).await.unwrap();
+
+    let union = mgr
+        .list_prompts(&PromptListFilter { reusable_only: Some(true), ..Default::default() })
+        .await
+        .unwrap();
+    let matches = union.iter().filter(|p| p.id == shared_id).count();
+    assert_eq!(matches, 1, "the same prompt id surfacing from two loaded stores must collapse to one row");
+}
+
+#[tokio::test]
+async fn list_prompts_fan_out_drops_a_prompt_when_its_owning_project_is_unloaded() {
+    let (mgr, _app) = new_manager().await;
+    let (a, _dir_a) = create_project(&mgr, "Alpha").await;
+    let (b, _dir_b) = create_project(&mgr, "Beta").await;
+    let pa = mgr.create_prompt(NewPrompt { reusable: Some(true), ..new_prompt(&a.id, "a", "b") }).await.unwrap();
+    let pb = mgr.create_prompt(NewPrompt { reusable: Some(true), ..new_prompt(&b.id, "b", "b") }).await.unwrap();
+
+    assert_eq!(
+        mgr.list_prompts(&PromptListFilter { reusable_only: Some(true), ..Default::default() })
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
+
+    mgr.unload(&a.id).await.unwrap();
+
+    let union = mgr
+        .list_prompts(&PromptListFilter { reusable_only: Some(true), ..Default::default() })
+        .await
+        .unwrap();
+    assert_eq!(union.len(), 1, "unloading alpha must drop its reusable prompt from the union");
+    assert_eq!(union[0].id, pb.id, "beta's prompt remains");
+    let ids: Vec<&str> = union.iter().map(|p| p.id.as_str()).collect();
+    assert!(!ids.contains(&pa.id.as_str()));
+}
+
+#[tokio::test]
+async fn list_prompts_fan_out_with_zero_loaded_projects_is_empty_not_an_error() {
+    let (mgr, _app) = new_manager().await;
+    let union = mgr
+        .list_prompts(&PromptListFilter { reusable_only: Some(true), ..Default::default() })
+        .await
+        .unwrap();
+    assert!(union.is_empty(), "zero loaded projects must yield an empty Ok, not an error");
+}
+
+#[tokio::test]
+async fn list_prompts_fan_out_with_a_single_loaded_project_matches_scoping_to_it() {
+    let (mgr, _app) = new_manager().await;
+    let (a, _dir_a) = create_project(&mgr, "Alpha").await;
+    mgr.create_prompt(NewPrompt { reusable: Some(true), ..new_prompt(&a.id, "one", "b") }).await.unwrap();
+    mgr.create_prompt(NewPrompt { reusable: Some(true), ..new_prompt(&a.id, "two", "b") }).await.unwrap();
+    mgr.create_prompt(new_prompt(&a.id, "private", "b")).await.unwrap(); // non-reusable — must not appear either way
+
+    let fanned = mgr
+        .list_prompts(&PromptListFilter { reusable_only: Some(true), ..Default::default() })
+        .await
+        .unwrap();
+    let scoped = mgr
+        .list_prompts(&PromptListFilter { project_id: Some(a.id.clone()), reusable_only: Some(true) })
+        .await
+        .unwrap();
+    let fanned_ids: Vec<&str> = fanned.iter().map(|p| p.id.as_str()).collect();
+    let scoped_ids: Vec<&str> = scoped.iter().map(|p| p.id.as_str()).collect();
+    assert_eq!(
+        fanned_ids, scoped_ids,
+        "with only one loaded project, the omitted-projectId fan-out must degenerate to that \
+         project's reusable prompts, in the same order as scoping to it"
+    );
+    assert_eq!(fanned_ids.len(), 2);
+}
+
+#[tokio::test]
+async fn list_prompts_fan_out_reflects_a_reload_mid_session_not_stale_data() {
+    let (mgr, _app) = new_manager().await;
+    let (a, dir_a) = create_project(&mgr, "Alpha").await;
+    let (b, _dir_b) = create_project(&mgr, "Beta").await;
+    mgr.create_prompt(NewPrompt { reusable: Some(true), ..new_prompt(&b.id, "beta reusable", "b") })
+        .await
+        .unwrap();
+
+    assert_eq!(
+        mgr.list_prompts(&PromptListFilter { reusable_only: Some(true), ..Default::default() })
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+
+    // A reusable prompt appears directly on A's disk (simulating a git pull) —
+    // invisible until A is reloaded.
+    let pulled_id = "12121212-1212-1212-1212-121212121212";
+    let pulled_version_id = "34343434-3434-3434-3434-343434343434";
+    let ts = "2026-07-14T00:00:00.000+00:00";
+    let prompts_dir = dir_a.path().join("prompts");
+    promptfile::write_prompt(
+        &prompts_dir,
+        &promptfile::PromptRecord { id: pulled_id.into(), reusable: true, created_at: ts.into() },
+    )
+    .unwrap();
+    promptfile::write_version(
+        &prompts_dir,
+        &promptfile::PromptVersionRecord {
+            id: pulled_version_id.into(),
+            prompt_id: pulled_id.into(),
+            title: "pulled reusable".into(),
+            body: "body".into(),
+            source: "manual".into(),
+            created_at: ts.into(),
+        },
+    )
+    .unwrap();
+
+    let before_reload = mgr
+        .list_prompts(&PromptListFilter { reusable_only: Some(true), ..Default::default() })
+        .await
+        .unwrap();
+    assert_eq!(before_reload.len(), 1, "the pulled-in file is invisible until A is reloaded");
+
+    mgr.reload(&a.id).await.unwrap();
+
+    let after_reload = mgr
+        .list_prompts(&PromptListFilter { reusable_only: Some(true), ..Default::default() })
+        .await
+        .unwrap();
+    assert_eq!(after_reload.len(), 2, "reload must pick up the new reusable prompt into the union");
+    let ids: Vec<&str> = after_reload.iter().map(|p| p.id.as_str()).collect();
+    assert!(ids.contains(&pulled_id));
 }
 
 #[tokio::test]

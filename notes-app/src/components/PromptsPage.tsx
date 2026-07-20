@@ -8,8 +8,9 @@ import PromptEditor from "./PromptEditor";
 
 interface Props {
   /** The loaded subset of the shared project catalog — the same value App
-   *  computes for Worknotes. Prompts are viewed one project at a time (the
-   *  backend requires a projectId), so there is no "All projects" option. */
+   *  computes for Worknotes. The rail scopes to one project, or to "All projects"
+   *  ("" — reusable prompts fanned across every loaded store, each labeled with
+   *  its owning project; plan.9). */
   loaded: ProjectInfo[];
   /** Ask App to re-fetch the project catalog after a prompt mutation, so the
    *  Manage-projects prompt counts stay current (a create/delete changes one
@@ -21,6 +22,10 @@ interface Props {
   onError: (message: string, opts?: { key?: string }) => void;
   /** Clear a keyed toast on resolution — threaded down to PromptEditor. */
   onResolve: (key: string) => void;
+  /** Report the owning project of the prompt currently open here (null when
+   *  none), so App's unload confirm can warn before an unload closes it — App
+   *  otherwise tracks only the Worknotes item selection. */
+  onOpenPromptChange: (projectId: string | null) => void;
 }
 
 /** A blank local draft targeting `projectId` — mirrors src/lib/draft.ts's
@@ -44,6 +49,7 @@ export default function PromptsPage({
   onProjectsChanged,
   onError,
   onResolve,
+  onOpenPromptChange,
 }: Props) {
   const [projectId, setProjectId] = useState("");
   const [reusableOnly, setReusableOnly] = useState(false);
@@ -55,31 +61,41 @@ export default function PromptsPage({
   // Monotonic request token guarding loadPrompts, matching App's loadItems.
   const loadToken = useRef(0);
 
-  // Default (and re-anchor) the selected project to the first loaded one; if
-  // the current selection is no longer loaded, fall back the same way the
-  // Worknotes rail resets its project filter when a project is unloaded.
+  // The scope defaults to "All projects" ("") and is preserved across loads. A
+  // selection naming a now-unloaded project falls back to "" (All) — the same
+  // reset the Worknotes rail's project filter does on unload — never to a stale
+  // id, and "" is never coerced off onto the first loaded project.
   useEffect(() => {
     setProjectId((current) =>
-      loaded.some((p) => p.id === current) ? current : (loaded[0]?.id ?? ""),
+      current === "" || loaded.some((p) => p.id === current) ? current : "",
     );
+    // Drop a draft whose target project was unloaded — it can't be saved
+    // anywhere, so it must not linger open (the unload confirm warned first).
+    setDraft((d) => (d && !loaded.some((p) => p.id === d.projectId) ? null : d));
   }, [loaded]);
 
   const loadPrompts = useCallback(async () => {
     const token = (loadToken.current = nextToken(loadToken.current));
-    if (!projectId) {
+    // All scope with nothing loaded → nothing to fan out over; skip the IPC and
+    // let the rail show its "No projects loaded" empty state.
+    if (projectId === "" && loaded.length === 0) {
       setPrompts([]);
       return;
     }
     try {
-      const result = await api.listPrompts({
-        projectId,
-        reusableOnly: reusableOnly || undefined,
-      });
+      // All scope ("") → reusable-only cross-store fan-out (no projectId: the
+      // backend forces reusable-only and stamps each row's TRUE owner). A
+      // specific project → the single-store path with the reusable chip.
+      const filter =
+        projectId === ""
+          ? { reusableOnly: true }
+          : { projectId, reusableOnly: reusableOnly || undefined };
+      const result = await api.listPrompts(filter);
       if (shouldCommit(token, loadToken.current)) setPrompts(result);
     } catch (err) {
       if (shouldCommit(token, loadToken.current)) onError(String(err));
     }
-  }, [projectId, reusableOnly, onError]);
+  }, [projectId, reusableOnly, loaded.length, onError]);
 
   useEffect(() => {
     void loadPrompts();
@@ -89,6 +105,27 @@ export default function PromptsPage({
   // The reusable filter is applied SERVER-side by listPrompts (authoritative,
   // index-backed — matching how ItemList's filters work), so no client re-filter.
   const selected = draft ?? prompts.find((p) => p.id === selectedId) ?? null;
+
+  // A selected prompt's owning-project name. In the All scope it may differ from
+  // the project the user thinks they are in — mutations route by id to the true
+  // owner (§4 High), so PromptEditor shows this as a persistent header label and
+  // the destructive confirmations name it (§5 Q2). Null in a single-project scope
+  // (the owner is unambiguous there). Owner is always a loaded store, so it
+  // resolves; `?? "its project"` is a defensive fallback for the confirmations.
+  const ownerName = (id: string | null): string | null =>
+    (id && loaded.find((p) => p.id === id)?.name) || null;
+  // Owner label applies only to a SAVED prompt in the All scope — a draft isn't
+  // owned by any store yet, so it never carries one (even if the scope is flipped
+  // to All while a single-project draft is open).
+  const ownerLabel =
+    projectId === "" && draft === null && selected ? ownerName(selected.projectId) : null;
+
+  // Report the open prompt's owning project up to App (for the unload confirm).
+  // A draft reports its target project; a saved prompt its stamped owner.
+  const openPromptProject = selected ? selected.projectId : null;
+  useEffect(() => {
+    onOpenPromptChange(openPromptProject);
+  }, [openPromptProject, onOpenPromptChange]);
 
   async function mutate(action: () => Promise<unknown>): Promise<boolean> {
     try {
@@ -159,14 +196,18 @@ export default function PromptsPage({
               ? setDraft((d) => (d ? { ...d, reusable: next } : d))
               : void mutate(() => api.updatePrompt(selected.id, { reusable: next }))
           }
+          ownerLabel={ownerLabel}
           onMove={(targetProjectId) => {
             void (async () => {
               const target = loaded.find((p) => p.id === targetProjectId);
+              // Name the OWNING project (the source) in the confirmation: in the
+              // All scope this prompt may belong to a project other than the one
+              // the user is browsing (§5 Q2).
               if (
                 !(await api.confirmDialog(
-                  `Move "${displayTitle(selected.title, selected.body)}" to "${
-                    target?.name ?? "another project"
-                  }"? Its full version history moves with it.`,
+                  `Move "${displayTitle(selected.title, selected.body)}" from "${
+                    ownerName(selected.projectId) ?? "its project"
+                  }" to "${target?.name ?? "another project"}"? Its full version history moves with it.`,
                 ))
               )
                 return;
@@ -178,9 +219,13 @@ export default function PromptsPage({
           }}
           onDelete={() => {
             void (async () => {
+              // Name the owning project — a delete in the All scope acts on that
+              // project's real files and full version history (§4 High / §5 Q2).
               if (
                 !(await api.confirmDialog(
-                  `Delete "${displayTitle(selected.title, selected.body)}"? This cannot be undone.`,
+                  `Delete "${displayTitle(selected.title, selected.body)}" from "${
+                    ownerName(selected.projectId) ?? "its project"
+                  }"? This cannot be undone.`,
                 ))
               )
                 return;

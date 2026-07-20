@@ -68,6 +68,11 @@ export default function App() {
   // below), so switching never discards an in-progress edit on either page.
   const [page, setPage] = useState<Page>("worknotes");
 
+  // The owning project of the prompt currently open on the Prompts page (null
+  // when none), reported up by PromptsPage. Lets the unload confirm warn before
+  // closing an open prompt, not just an open Worknotes item.
+  const [openPromptProjectId, setOpenPromptProjectId] = useState<string | null>(null);
+
   // Monotonic request token: a slow listItems that resolves after a newer load
   // (or after an unload closed a store) must not repopulate the list. Only the
   // latest token commits — the exact race the single-DB app never had.
@@ -214,25 +219,34 @@ export default function App() {
     }
   }
 
-  // Unload confirms first when the open item (or draft) belongs to the target —
-  // unloading would silently drop it — then evicts it with an SR announcement.
+  // Unload confirms first when the target owns something open — a Worknotes item
+  // (or draft) OR a prompt open on the Prompts page — since unloading silently
+  // drops it; then evicts and announces. Every unload gets a confirming notice.
   async function unloadProject(p: ProjectInfo) {
-    const affectsOpen = selected != null && selected.projectId === p.id;
+    const affectsOpenItem = selected != null && selected.projectId === p.id;
+    const affectsOpenPrompt = openPromptProjectId === p.id;
+    const affectsOpen = affectsOpenItem || affectsOpenPrompt;
+    // "item" when a Worknotes item is open; otherwise the open thing is a prompt.
+    const openLabel = affectsOpenItem ? "item" : "prompt";
     if (
       affectsOpen &&
       !(await api.confirmDialog(
-        `Unloading "${p.name}" will close the item you have open. Continue?`,
+        `Unloading "${p.name}" will close the ${openLabel} you have open. Continue?`,
       ))
     )
       return;
     const ok = await mutate(() => api.unloadProject(p.id));
     if (ok) {
-      if (affectsOpen) {
+      // Clear the Worknotes selection here; PromptsPage clears its own open
+      // prompt when `loaded` drops the project.
+      if (affectsOpenItem) {
         setDraft(null);
         setSelectedId(null);
-        showNotice(`Unloaded "${p.name}" — the open item was closed.`);
+      }
+      if (affectsOpen) {
+        showNotice(`Unloaded "${p.name}" — the open ${openLabel} was closed.`);
       } else {
-        // Confirm every unload, not only the one that closed an open item —
+        // Confirm every unload, not only the one that closed something open —
         // a later unload with nothing open gave no feedback at all otherwise.
         showNotice(`Unloaded "${p.name}".`);
       }
@@ -425,6 +439,7 @@ export default function App() {
           onProjectsChanged={() => void loadMeta()}
           onError={showError}
           onResolve={dismissKey}
+          onOpenPromptChange={setOpenPromptProjectId}
         />
       </div>
 

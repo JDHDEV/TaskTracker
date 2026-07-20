@@ -123,10 +123,12 @@ export function listActiveTags(): Promise<string[]> {
   return invoke("list_active_tags");
 }
 
-// --- Prompts (plan.7). A per-project, versioned prompt library. Prompts are
-// viewed one project at a time, so listPrompts requires a projectId in its
-// filter. Every content edit is captured as an immutable version; the AI
-// "enhance" flow reuses aiRewriteStream and persists an accepted proposal via
+// --- Prompts (plan.7 / plan.9). A per-project, versioned prompt library.
+// listPrompts scopes to one project (filter.projectId set) OR fans REUSABLE
+// prompts across every loaded store when projectId is omitted (the "All
+// projects" scope; a projectId-less non-reusable list is rejected server-side).
+// Every content edit is captured as an immutable version; the AI "enhance" flow
+// reuses aiRewriteStream and persists an accepted proposal via
 // updatePrompt({ body, source: "aiEnhanced" }). ---
 
 export function listPrompts(filter: PromptListFilter): Promise<Prompt[]> {

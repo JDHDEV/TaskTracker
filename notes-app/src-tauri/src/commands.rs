@@ -73,10 +73,11 @@ pub async fn list_active_tags(state: State<'_, AppState>) -> Result<Vec<String>>
     state.manager.active_tags_union().await
 }
 
-// --- Prompts (plan.7) ------------------------------------------------------
-// Thin wrappers over the manager, mirroring the item commands. Prompts are
-// viewed one project at a time, so `list_prompts` requires a `projectId` in its
-// filter; the manager rejects an empty/absent one. All prompt/model text reaches
+// --- Prompts (plan.7 / plan.9) ---------------------------------------------
+// Thin wrappers over the manager, mirroring the item commands. `list_prompts`
+// scopes to one project when its filter carries a `projectId`, else fans REUSABLE
+// prompts across all loaded stores (the "All projects" scope) — a projectId-less
+// non-reusable filter is rejected by the manager. All prompt/model text reaches
 // the frontend as plain strings rendered in text nodes (no HTML — M4).
 
 #[tauri::command]

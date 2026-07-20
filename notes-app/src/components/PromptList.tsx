@@ -30,7 +30,16 @@ export default function PromptList({
   onCreate,
 }: Props) {
   const now = new Date(); // one clock read per render, like ItemList
-  const canCreate = projectId !== "";
+  // "" is the All-projects scope (plan.9): reusable prompts fanned across every
+  // loaded store. New prompt needs a concrete target, so it stays disabled there.
+  const allScope = projectId === "";
+  const canCreate = !allScope;
+  // In the All scope the fan-out is reusable-only, so the chip pair is forced on
+  // "Reusable only" and disabled (the state value is irrelevant while All).
+  const effectiveReusable = allScope ? true : reusableOnly;
+  // Resolve a row's owning-project name (shown only in the All scope, where a
+  // row's origin would otherwise be ambiguous). Mirrors ItemList's projectName.
+  const projectName = new Map(loaded.map((p) => [p.id, p.name]));
   return (
     <aside className="rail">
       <div className="rail-actions">
@@ -42,10 +51,16 @@ export default function PromptList({
       <select
         className="select rail-select"
         value={projectId}
-        aria-label="Choose project"
+        aria-label="Filter by project"
         onChange={(e) => onProjectChange(e.target.value)}
       >
-        {loaded.length === 0 && <option value="">No projects loaded</option>}
+        {/* Exactly one value="" option: an inert "No projects loaded" when the
+            catalog has no loaded store, else the All-projects scope. */}
+        {loaded.length === 0 ? (
+          <option value="">No projects loaded</option>
+        ) : (
+          <option value="">All projects</option>
+        )}
         {loaded.map((p) => (
           <option key={p.id} value={p.id}>
             {p.name}
@@ -58,8 +73,10 @@ export default function PromptList({
           <button
             key={String(f.id)}
             role="tab"
-            aria-selected={reusableOnly === f.id}
-            className={reusableOnly === f.id ? "chip chip-on" : "chip"}
+            aria-selected={effectiveReusable === f.id}
+            className={effectiveReusable === f.id ? "chip chip-on" : "chip"}
+            disabled={allScope}
+            title={allScope ? "The All-projects view shows reusable prompts only" : undefined}
             onClick={() => onReusableOnly(f.id)}
           >
             {f.label}
@@ -70,9 +87,11 @@ export default function PromptList({
       <ul className="list">
         {prompts.length === 0 && (
           <li className="list-empty">
-            {!canCreate
+            {loaded.length === 0
               ? "No projects loaded — open or create one to start."
-              : "Nothing here yet — create your first prompt."}
+              : allScope
+                ? "No reusable prompts in any loaded project yet."
+                : "Nothing here yet — create your first prompt."}
           </li>
         )}
         {prompts.map((p) => (
@@ -88,6 +107,12 @@ export default function PromptList({
               </span>
               {p.body && <span className="row-body">{p.body}</span>}
               <span className="row-version">v{p.versionCount}</span>
+              {/* Owning-project label — only in the All scope, where a row's
+                  origin is otherwise ambiguous (mutations route by id to the
+                  true owner, so the owner must be visible; §4 High / §5 Q2). */}
+              {allScope && p.projectId && (
+                <span className="row-project">{projectName.get(p.projectId) ?? "Unknown project"}</span>
+              )}
             </button>
           </li>
         ))}

@@ -248,10 +248,12 @@ pub struct UpdatePrompt {
     pub source: Option<String>,
 }
 
-/// Which prompts to list. `projectId` selects the store (a whole store is one
-/// project — the manager routes to it; prompts are viewed one project at a time,
-/// so there is no cross-store fan-out). `reusableOnly` is the only prompt filter
-/// in v1 — a bound `WHERE reusable = 1`, never raw SQL.
+/// Which prompts to list. With `projectId` set, the manager serves that ONE
+/// store (a whole store is one project). With it absent/empty, the manager fans
+/// REUSABLE prompts out across all loaded stores (plan.9's "All projects" scope),
+/// stamping each row's true owner — a projectId-less NON-reusable list is
+/// rejected. `reusableOnly` is the only prompt filter in v1 — a bound
+/// `WHERE reusable = 1`, never raw SQL.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PromptListFilter {

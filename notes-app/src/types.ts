@@ -118,8 +118,10 @@ export interface UpdatePrompt {
   source?: PromptSource;
 }
 
-/** projectId selects the store (prompts are viewed one project at a time — the
- *  manager requires it). reusableOnly is the only prompt filter in v1. */
+/** projectId selects one store. Omit it for the "All projects" scope: the
+ *  manager fans REUSABLE prompts out across all loaded stores, stamping each
+ *  row's owning project (a projectId-less non-reusable list is rejected).
+ *  reusableOnly is the only prompt filter in v1. */
 export interface PromptListFilter {
   projectId?: string;
   reusableOnly?: boolean;

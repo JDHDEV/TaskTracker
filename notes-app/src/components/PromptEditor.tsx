@@ -33,6 +33,12 @@ interface Props {
   onError: (message: string, opts?: { key?: string }) => void;
   /** Clear a keyed toast the instant its condition is fixed. */
   onResolve: (key: string) => void;
+  /** The owning-project name, shown as a persistent header label — set only in
+   *  the All-projects scope, where this prompt may belong to a project other than
+   *  the one being browsed. The Save and Mark-reusable paths have no confirmation
+   *  dialog, so this label is their only in-context owner signal (§5 Q2). Null in
+   *  a single-project scope (the owner is unambiguous). */
+  ownerLabel?: string | null;
 }
 
 /** Detail pane for one prompt: title + body only (no status/priority/due/pin/
@@ -50,6 +56,7 @@ export default function PromptEditor({
   onMove,
   onError,
   onResolve,
+  ownerLabel,
 }: Props) {
   const [title, setTitle] = useState(prompt.title);
   const [body, setBody] = useState(prompt.body);
@@ -276,6 +283,14 @@ export default function PromptEditor({
 
       <div className="meta">
         <span className="meta-kind">prompt</span>
+        {/* Persistent owner label in the All scope: this prompt may belong to a
+            project other than the one being browsed, and Save/Mark-reusable have
+            no confirmation, so this is the only in-context owner signal (§5 Q2). */}
+        {ownerLabel && (
+          <span className="row-project" title="Owning project — edits save back to it">
+            {ownerLabel}
+          </span>
+        )}
         <button
           className={prompt.reusable ? "btn btn-quiet btn-reusable-on" : "btn btn-quiet"}
           aria-pressed={prompt.reusable}

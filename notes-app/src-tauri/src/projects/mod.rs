@@ -10,7 +10,7 @@ pub mod legacy;
 pub mod paths;
 
 use std::cmp::Ordering;
-use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, RwLock};
 
@@ -433,11 +433,14 @@ impl ProjectManager {
         repo.delete(id).await
     }
 
-    // --- Prompt routing (plan.7) ------------------------------------------
-    // Prompts are viewed ONE project at a time (no cross-store fan-out), so
-    // `list_prompts` requires a `projectId`. `get`/`update`/`delete`/`versions`
-    // locate the owning store by id (mirroring `owner()` for items) and stamp the
-    // owning project on the returned prompt.
+    // --- Prompt routing (plan.7 / plan.9) ---------------------------------
+    // A prompt scoped to ONE project (`projectId` set) is served single-store.
+    // With no `projectId`, `list_prompts` fans REUSABLE prompts out across every
+    // loaded store (plan.9's "All projects" scope) and k-way-merges them — a
+    // projectId-less NON-reusable request is still rejected (it would dump every
+    // prompt in every project). `get`/`update`/`delete`/`versions`/`move` locate
+    // the owning store by id (mirroring `owner()` for items) and stamp the owning
+    // project on the returned prompt.
 
     /// Create a prompt into the project named by `input.project_id` (the routing
     /// key). Rejects an empty or not-loaded target. Stamps the owning UUID.
@@ -454,22 +457,56 @@ impl ProjectManager {
         Ok(prompt)
     }
 
-    /// List prompts in ONE project (required `projectId`), stamping ownership.
+    /// List prompts. With a `projectId`, serve that ONE store, stamping the
+    /// requested project (unchanged single-store path). Without one, fan REUSABLE
+    /// prompts out across every loaded store, each row stamped with its TRUE
+    /// owning-store UUID, k-way-merged by recency (plan.9's "All projects" scope).
+    ///
+    /// The cross-store surface is REUSABLE-ONLY (§4 M1): a projectId-less request
+    /// that is not `reusable_only` is rejected — omitting `projectId` must never
+    /// dump every private prompt in every loaded project. The per-store list is
+    /// run with `reusable_only = true` forced (defense-in-depth), never the
+    /// caller's filter verbatim.
     pub async fn list_prompts(&self, filter: &PromptListFilter) -> Result<Vec<Prompt>> {
         let target = filter
             .project_id
             .as_deref()
             .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .ok_or_else(|| AppError::Invalid("choose a project to see its prompts".into()))?;
-        let repo = self
-            .prompts_for(target)
-            .map_err(|_| AppError::Invalid("that project isn't loaded".into()))?;
-        let mut prompts = repo.list(filter).await?;
-        for p in &mut prompts {
-            p.project_id = Some(target.to_string());
+            .filter(|s| !s.is_empty());
+
+        // Single-project path (unchanged): stamp the requested project.
+        if let Some(target) = target {
+            let repo = self
+                .prompts_for(target)
+                .map_err(|_| AppError::Invalid("that project isn't loaded".into()))?;
+            let mut prompts = repo.list(filter).await?;
+            for p in &mut prompts {
+                p.project_id = Some(target.to_string());
+            }
+            return Ok(prompts);
         }
-        Ok(prompts)
+
+        // All-projects fan-out is reusable-only. Reject a projectId-less
+        // non-reusable request rather than dumping every project's prompts.
+        if !filter.reusable_only.unwrap_or(false) {
+            return Err(AppError::Invalid("choose a project to see its prompts".into()));
+        }
+
+        // Force reusable-only for every per-store call (never the caller's filter,
+        // which could carry a future extra predicate). Snapshot the prompt repos
+        // under the lock, release it, then `await` each list — the RwLock is
+        // NEVER held across `.await` (§4 M2); a store unloaded mid-list surfaces a
+        // clean sqlx error, not a panic, exactly like `active_tags_union`.
+        let reusable_filter = PromptListFilter { project_id: None, reusable_only: Some(true) };
+        let mut lists: Vec<VecDeque<Prompt>> = Vec::new();
+        for (pid, repo) in self.prompt_snapshot() {
+            let mut prompts = repo.list(&reusable_filter).await?;
+            for p in &mut prompts {
+                p.project_id = Some(pid.clone()); // the TRUE owning store's UUID
+            }
+            lists.push(prompts.into());
+        }
+        Ok(k_way_merge_prompts(lists))
     }
 
     pub async fn get_prompt(&self, id: &str) -> Result<Prompt> {
@@ -1192,6 +1229,52 @@ fn k_way_merge(mut lists: Vec<VecDeque<Item>>, sort: Sort) -> Vec<Item> {
     out
 }
 
+/// Total order for the cross-store prompt merge, mirroring the per-store list SQL
+/// `ORDER BY r.created_at DESC, p.id ASC` (surfaced as `updated_at`). Prompts
+/// have no pinned/sort-mode dimension — simpler than `item_order`. Fixed-precision
+/// RFC 3339 timestamps make byte-order = chronological (SQLite BINARY collation).
+fn prompt_order(a: &Prompt, b: &Prompt) -> Ordering {
+    b.updated_at.cmp(&a.updated_at).then_with(|| a.id.cmp(&b.id))
+}
+
+/// K-way merge of per-store prompt lists, each already ordered by `prompt_order`.
+/// Picks the smallest head across stores each step and DEDUPES by prompt id (§4
+/// M3): if two loaded stores pathologically surface the same id (reachable only
+/// via a crafted/duplicate store, since ids are UUIDs), it collapses to one row
+/// rather than showing a prompt twice — distinct from `k_way_merge`, which keeps
+/// same-id items because the frontend keys those by `projectId:id`.
+fn k_way_merge_prompts(mut lists: Vec<VecDeque<Prompt>>) -> Vec<Prompt> {
+    let total: usize = lists.iter().map(VecDeque::len).sum();
+    let mut out: Vec<Prompt> = Vec::with_capacity(total);
+    let mut seen: HashSet<String> = HashSet::new();
+    loop {
+        let mut best: Option<usize> = None;
+        for i in 0..lists.len() {
+            if let Some(head) = lists[i].front() {
+                match best {
+                    None => best = Some(i),
+                    Some(b) => {
+                        if prompt_order(head, lists[b].front().unwrap()) == Ordering::Less {
+                            best = Some(i);
+                        }
+                    }
+                }
+            }
+        }
+        match best {
+            Some(i) => {
+                let p = lists[i].pop_front().unwrap();
+                if seen.insert(p.id.clone()) {
+                    out.push(p);
+                }
+                // else: an id already emitted from an earlier store — drop it.
+            }
+            None => break,
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod merge_tests {
     use super::*;
@@ -1265,5 +1348,61 @@ mod merge_tests {
         assert_eq!(merged.len(), 2);
         let projects: Vec<&str> = merged.iter().filter_map(|i| i.project_id.as_deref()).collect();
         assert!(projects.contains(&"A") && projects.contains(&"B"));
+    }
+
+    // --- Prompt cross-store merge (plan.9) --------------------------------
+
+    fn prompt(id: &str, updated: &str) -> Prompt {
+        Prompt {
+            id: id.into(),
+            title: id.into(),
+            body: String::new(),
+            reusable: true,
+            created_at: updated.into(),
+            updated_at: updated.into(),
+            version_count: 1,
+            project_id: None,
+        }
+    }
+
+    fn prompt_ids(prompts: &[Prompt]) -> Vec<&str> {
+        prompts.iter().map(|p| p.id.as_str()).collect()
+    }
+
+    #[test]
+    fn prompts_interleave_by_recency_across_stores() {
+        // A real k-way merge, not per-store concatenation: newest-first globally.
+        let a = vec![
+            prompt("a-new", "2026-07-14T00:00:03.000+00:00"),
+            prompt("a-old", "2026-07-14T00:00:01.000+00:00"),
+        ]
+        .into();
+        let b = vec![prompt("b-mid", "2026-07-14T00:00:02.000+00:00")].into();
+        let merged = k_way_merge_prompts(vec![a, b]);
+        assert_eq!(prompt_ids(&merged), vec!["a-new", "b-mid", "a-old"]);
+    }
+
+    #[test]
+    fn prompts_equal_updated_at_break_by_id_asc() {
+        // Deterministic tiebreak: equal updated_at → id ASC, stable across calls.
+        let ts = "2026-07-14T00:00:00.000+00:00";
+        let a = vec![prompt("id-2", ts)].into();
+        let b = vec![prompt("id-1", ts)].into();
+        let merged = k_way_merge_prompts(vec![a, b]);
+        assert_eq!(prompt_ids(&merged), vec!["id-1", "id-2"]);
+    }
+
+    #[test]
+    fn prompts_same_id_from_two_stores_collapses_to_one() {
+        // Unlike items, prompts DEDUPE by id (§4 M3): a pathological id collision
+        // across stores yields exactly one row, never a doubled prompt.
+        let ts = "2026-07-14T00:00:00.000+00:00";
+        let mut x = prompt("dup", ts);
+        x.project_id = Some("A".into());
+        let mut y = prompt("dup", ts);
+        y.project_id = Some("B".into());
+        let merged = k_way_merge_prompts(vec![vec![x].into(), vec![y].into()]);
+        assert_eq!(merged.len(), 1, "a duplicate prompt id across stores collapses to one row");
+        assert_eq!(merged[0].id, "dup");
     }
 }
