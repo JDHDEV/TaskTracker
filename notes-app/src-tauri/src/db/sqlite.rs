@@ -8,7 +8,7 @@ use sqlx::QueryBuilder;
 use crate::error::{AppError, Result};
 use crate::models::{
     Item, Kind, ListFilter, NewItem, NewPrompt, Priority, Prompt, PromptListFilter, PromptVersion,
-    Sort, Status, UpdateItem, UpdatePrompt,
+    Sort, Status, UpdateItem, UpdatePrompt, CURRENT_SCHEMA_VERSION,
 };
 use crate::store::{itemfile, promptfile};
 
@@ -268,8 +268,8 @@ impl SqliteRepository {
         sqlx::query(
             "INSERT INTO items \
              (id, kind, title, body, status, priority, due_at, tags, \
-              created_at, updated_at, archived, pinned, project_id, jira_url) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, NULL, ?13)",
+              created_at, updated_at, archived, pinned, project_id, jira_url, schema_version) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, NULL, ?13, ?14)",
         )
         .bind(&item.id)
         .bind(item.kind)
@@ -284,6 +284,8 @@ impl SqliteRepository {
         .bind(item.archived)
         .bind(item.pinned)
         .bind(&item.jira_url)
+        // Preserve the source row's marker verbatim (legacy migration copy).
+        .bind(&item.schema_version)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -345,8 +347,8 @@ impl SqliteRepository {
             sqlx::query(
                 "INSERT INTO items \
                  (id, kind, title, body, status, priority, due_at, tags, \
-                  created_at, updated_at, archived, pinned, project_id, jira_url) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, NULL, ?13)",
+                  created_at, updated_at, archived, pinned, project_id, jira_url, schema_version) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, NULL, ?13, ?14)",
             )
             .bind(&item.id)
             .bind(item.kind)
@@ -361,6 +363,9 @@ impl SqliteRepository {
             .bind(item.archived)
             .bind(item.pinned)
             .bind(&item.jira_url)
+            // Files are the source of truth: bind the parsed value verbatim (a
+            // legacy no-marker file already parsed as "1.0.0"); never re-stamp.
+            .bind(&item.schema_version)
             .execute(&mut *tx)
             .await?;
         }
@@ -406,12 +411,17 @@ impl SqliteRepository {
                 ));
                 continue;
             }
-            sqlx::query("INSERT INTO prompts (id, reusable, created_at) VALUES (?1, ?2, ?3)")
-                .bind(&scanned.prompt.id)
-                .bind(scanned.prompt.reusable)
-                .bind(&scanned.prompt.created_at)
-                .execute(&mut *tx)
-                .await?;
+            sqlx::query(
+                "INSERT INTO prompts (id, reusable, created_at, schema_version) \
+                 VALUES (?1, ?2, ?3, ?4)",
+            )
+            .bind(&scanned.prompt.id)
+            .bind(scanned.prompt.reusable)
+            .bind(&scanned.prompt.created_at)
+            // Files win: bind the parsed head marker verbatim; never re-stamp.
+            .bind(&scanned.prompt.schema_version)
+            .execute(&mut *tx)
+            .await?;
             for version in fresh {
                 sqlx::query(
                     "INSERT INTO prompt_versions \
@@ -625,6 +635,9 @@ impl ItemRepository for SqliteRepository {
             // Always NULL in-store; the manager stamps the owning project UUID.
             project_id: None,
             jira_url,
+            // Backend-forced from the constant, exactly like `id`/`created_at`.
+            // Never read from `input` (NewItem carries no such field).
+            schema_version: CURRENT_SCHEMA_VERSION.to_string(),
         };
 
         // File-then-index (Stage 2): the canonical file is written before the
@@ -636,8 +649,8 @@ impl ItemRepository for SqliteRepository {
         sqlx::query(
             "INSERT INTO items \
              (id, kind, title, body, status, priority, due_at, tags, \
-              created_at, updated_at, archived, pinned, project_id, jira_url) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+              created_at, updated_at, archived, pinned, project_id, jira_url, schema_version) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
         )
         .bind(&item.id)
         .bind(item.kind)
@@ -653,6 +666,7 @@ impl ItemRepository for SqliteRepository {
         .bind(item.pinned)
         .bind(&item.project_id)
         .bind(&item.jira_url)
+        .bind(&item.schema_version)
         .execute(&self.pool)
         .await?;
 
@@ -842,7 +856,7 @@ impl SqliteRepository {
                         COUNT(*) OVER (PARTITION BY pv.prompt_id) AS n \
                  FROM prompt_versions pv WHERE pv.prompt_id = ?1 \
              ) \
-             SELECT p.id, r.title, r.body, p.reusable, p.created_at, \
+             SELECT p.id, r.title, r.body, p.reusable, p.schema_version, p.created_at, \
                     r.created_at AS updated_at, r.n AS version_count \
              FROM prompts p JOIN ranked r ON r.prompt_id = p.id AND r.rn = 1 \
              WHERE p.id = ?1",
@@ -868,6 +882,7 @@ impl SqliteRepository {
         prompt_id: &str,
         reusable: bool,
         prompt_created_at: &str,
+        prompt_schema_version: &str,
         versions: &[PromptVersion],
     ) -> Result<Prompt> {
         if let Some(dir) = &self.prompts_dir {
@@ -875,6 +890,9 @@ impl SqliteRepository {
                 id: prompt_id.to_string(),
                 reusable,
                 created_at: prompt_created_at.to_string(),
+                // Preserve the SOURCE marker verbatim (the id-preserving move);
+                // never re-stamp to the current constant.
+                schema_version: prompt_schema_version.to_string(),
             };
             promptfile::write_prompt(dir, &head).map_err(save_prompt_file_error)?;
             for v in versions {
@@ -891,12 +909,17 @@ impl SqliteRepository {
         }
 
         let mut tx = self.pool.begin().await?;
-        sqlx::query("INSERT INTO prompts (id, reusable, created_at) VALUES (?1, ?2, ?3)")
-            .bind(prompt_id)
-            .bind(reusable)
-            .bind(prompt_created_at)
-            .execute(&mut *tx)
-            .await?;
+        sqlx::query(
+            "INSERT INTO prompts (id, reusable, created_at, schema_version) \
+             VALUES (?1, ?2, ?3, ?4)",
+        )
+        .bind(prompt_id)
+        .bind(reusable)
+        .bind(prompt_created_at)
+        // Preserve the source marker verbatim (never re-stamp on move).
+        .bind(prompt_schema_version)
+        .execute(&mut *tx)
+        .await?;
         for v in versions {
             sqlx::query(
                 "INSERT INTO prompt_versions (id, prompt_id, title, body, source, created_at) \
@@ -968,7 +991,7 @@ impl PromptRepository for SqliteRepository {
         }
         qb.push(
             " ) \
-             SELECT p.id, r.title, r.body, p.reusable, p.created_at, \
+             SELECT p.id, r.title, r.body, p.reusable, p.schema_version, p.created_at, \
                     r.created_at AS updated_at, r.n AS version_count \
              FROM prompts p JOIN ranked r ON r.prompt_id = p.id AND r.rn = 1 \
              ORDER BY r.created_at DESC, p.id ASC",
@@ -1007,6 +1030,8 @@ impl PromptRepository for SqliteRepository {
             id: prompt_id.clone(),
             reusable,
             created_at: now.clone(),
+            // Backend-forced from the constant (NewPrompt carries no such field).
+            schema_version: CURRENT_SCHEMA_VERSION.to_string(),
         };
         let version = promptfile::PromptVersionRecord {
             id: version_id.clone(),
@@ -1025,12 +1050,16 @@ impl PromptRepository for SqliteRepository {
         }
 
         let mut tx = self.pool.begin().await?;
-        sqlx::query("INSERT INTO prompts (id, reusable, created_at) VALUES (?1, ?2, ?3)")
-            .bind(&prompt_id)
-            .bind(reusable)
-            .bind(&now)
-            .execute(&mut *tx)
-            .await?;
+        sqlx::query(
+            "INSERT INTO prompts (id, reusable, created_at, schema_version) \
+             VALUES (?1, ?2, ?3, ?4)",
+        )
+        .bind(&prompt_id)
+        .bind(reusable)
+        .bind(&now)
+        .bind(CURRENT_SCHEMA_VERSION)
+        .execute(&mut *tx)
+        .await?;
         sqlx::query(
             "INSERT INTO prompt_versions (id, prompt_id, title, body, source, created_at) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
@@ -1096,6 +1125,9 @@ impl PromptRepository for SqliteRepository {
                     id: id.to_string(),
                     reusable: new_reusable,
                     created_at: current.created_at.clone(),
+                    // Preserve the existing marker — a metadata-only toggle must
+                    // never re-stamp it (the pin/archive analogue for prompts).
+                    schema_version: current.schema_version.clone(),
                 };
                 promptfile::write_prompt(dir, &head).map_err(save_prompt_file_error)?;
             }
@@ -1183,6 +1215,7 @@ impl PromptRepository for SqliteRepository {
         prompt_id: &str,
         reusable: bool,
         prompt_created_at: &str,
+        prompt_schema_version: &str,
         versions: &[PromptVersion],
     ) -> Result<Prompt> {
         if versions.is_empty() {
@@ -1199,7 +1232,13 @@ impl PromptRepository for SqliteRepository {
         // failed. The SOURCE store is never touched here — that ordering
         // (delete-source-last) lives in `ProjectManager::move_prompt`.
         match self
-            .import_prompt_committed(prompt_id, reusable, prompt_created_at, versions)
+            .import_prompt_committed(
+                prompt_id,
+                reusable,
+                prompt_created_at,
+                prompt_schema_version,
+                versions,
+            )
             .await
         {
             Ok(prompt) => Ok(prompt),

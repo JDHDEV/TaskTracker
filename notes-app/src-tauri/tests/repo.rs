@@ -862,3 +862,96 @@ async fn list_filter_deserializes_camelcase() {
     assert!(empty.tags.is_none());
     assert!(empty.sort.is_none());
 }
+
+// ---------------------------------------------------------------------------
+// schema_version marker (plan.10): backend-owned, create-only record-format
+// marker on Item. Not client-settable; survives every read path; is absent
+// from both the content-edit (updated_at-moving) and the meta-state
+// (pin/archive) SQL write paths, so it can never move after create.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn create_stamps_current_schema_version_for_note_and_task() {
+    let repo = SqliteRepository::connect_in_memory().await.unwrap();
+    let note = repo.create(new_item(Kind::Note, "a note", "")).await.unwrap();
+    let task = repo.create(new_item(Kind::Task, "a task", "")).await.unwrap();
+    assert_eq!(note.schema_version, "1.0.0");
+    assert_eq!(task.schema_version, "1.0.0");
+}
+
+#[tokio::test]
+async fn schema_version_survives_get_list_and_search() {
+    let repo = SqliteRepository::connect_in_memory().await.unwrap();
+    let item = repo.create(new_item(Kind::Note, "findable title", "unique needle text")).await.unwrap();
+    assert_eq!(item.schema_version, "1.0.0");
+
+    let fetched = repo.get(&item.id).await.unwrap();
+    assert_eq!(fetched.schema_version, "1.0.0", "get() must return the marker");
+
+    let listed = repo.list(&ListFilter::default()).await.unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].schema_version, "1.0.0", "list() must return the marker");
+
+    let hits = repo.search("needle", &ListFilter::default()).await.unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].schema_version, "1.0.0", "search() must return the marker");
+}
+
+#[tokio::test]
+async fn new_item_json_carrying_a_client_schema_version_is_ignored_on_create() {
+    // NewItem has no schemaVersion field (Section 4 security requirement): a
+    // client-supplied value in the wire JSON must not error deserialization
+    // (serde silently drops unknown fields) and must not reach the stored
+    // record — create() always mints the backend constant, exactly like a
+    // client trying to set id/createdAt.
+    let parsed: NewItem = serde_json::from_str(
+        r#"{"kind":"note","title":"hostile","projectId":"p1","schemaVersion":"9.9.9"}"#,
+    )
+    .unwrap();
+    let repo = SqliteRepository::connect_in_memory().await.unwrap();
+    let created = repo.create(parsed).await.unwrap();
+    assert_eq!(created.schema_version, "1.0.0", "a client-supplied schemaVersion must never persist");
+}
+
+#[tokio::test]
+async fn update_item_json_carrying_a_client_schema_version_is_ignored() {
+    // Same for UpdateItem: a patch whose JSON body includes schemaVersion must
+    // not move the stored marker, even alongside a real, accepted edit.
+    let repo = SqliteRepository::connect_in_memory().await.unwrap();
+    let item = repo.create(new_item(Kind::Note, "before", "")).await.unwrap();
+
+    let patch: UpdateItem =
+        serde_json::from_str(r#"{"title":"after","schemaVersion":"9.9.9"}"#).unwrap();
+    let updated = repo.update(&item.id, patch).await.unwrap();
+    assert_eq!(updated.title, "after", "the real patch field still applies");
+    assert_eq!(updated.schema_version, "1.0.0", "a client-supplied schemaVersion in a patch must be ignored");
+}
+
+#[tokio::test]
+async fn title_edit_bumps_updated_at_but_leaves_schema_version_untouched() {
+    let repo = SqliteRepository::connect_in_memory().await.unwrap();
+    let item = repo.create(new_item(Kind::Note, "before", "")).await.unwrap();
+    let old = "2000-01-01T00:00:00+00:00";
+    repo.set_timestamps_for_test(&item.id, old, old).await.unwrap();
+
+    let updated = repo
+        .update(&item.id, UpdateItem { title: Some("after".into()), ..Default::default() })
+        .await
+        .unwrap();
+    assert!(updated.updated_at > old.to_string(), "the content edit still bumps updated_at");
+    assert_eq!(updated.schema_version, "1.0.0", "schema_version is preserved across a content edit");
+}
+
+#[tokio::test]
+async fn pin_and_archive_do_not_change_schema_version() {
+    // Mirrors pin_and_archive_do_not_bump_updated_at: the marker is create-only
+    // and is absent from the meta-state (pin/archive) write path too.
+    let repo = SqliteRepository::connect_in_memory().await.unwrap();
+    let item = repo.create(new_item(Kind::Task, "t", "")).await.unwrap();
+    let baseline = item.schema_version.clone();
+
+    let pinned = repo.update(&item.id, UpdateItem { pinned: Some(true), ..Default::default() }).await.unwrap();
+    assert_eq!(pinned.schema_version, baseline, "pin flip must not change schema_version");
+    let archived = repo.update(&item.id, UpdateItem { archived: Some(true), ..Default::default() }).await.unwrap();
+    assert_eq!(archived.schema_version, baseline, "archive flip must not change schema_version");
+}

@@ -576,9 +576,17 @@ impl ProjectManager {
         let versions = source.versions(prompt_id).await?;
         let expected = versions.len();
 
-        // Import into the target (files-then-index, atomic), ids preserved.
+        // Import into the target (files-then-index, atomic), ids preserved. The
+        // source head's `schema_version` travels through so the move preserves
+        // the marker rather than re-stamping it to the current constant (Step 6a).
         let imported = target
-            .import_prompt(prompt_id, head.reusable, &head.created_at, &versions)
+            .import_prompt(
+                prompt_id,
+                head.reusable,
+                &head.created_at,
+                &head.schema_version,
+                &versions,
+            )
             .await?;
 
         // Verify BEFORE deleting the source: re-read the target's history and
@@ -1296,6 +1304,7 @@ mod merge_tests {
             pinned,
             project_id: None,
             jira_url: None,
+            schema_version: "1.0.0".into(),
         }
     }
 
@@ -1358,6 +1367,7 @@ mod merge_tests {
             title: id.into(),
             body: String::new(),
             reusable: true,
+            schema_version: "1.0.0".into(),
             created_at: updated.into(),
             updated_at: updated.into(),
             version_count: 1,

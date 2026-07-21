@@ -27,6 +27,8 @@ export function newDraft(kind: Kind, projectId: string = ""): Item {
     pinned: false,
     projectId: projectId || null,
     jiraUrl: null,
+    // Placeholder: the backend mints the real marker on Save (it is not sent).
+    schemaVersion: "",
   };
 }
 
@@ -52,5 +54,8 @@ export function duplicateDraft(source: Item): Item {
     pinned: false,
     projectId: source.projectId,
     jiraUrl: null,
+    // A duplicate is a fresh record; the backend stamps the current marker on
+    // create. Never carry the source's — a placeholder until Save.
+    schemaVersion: "",
   };
 }

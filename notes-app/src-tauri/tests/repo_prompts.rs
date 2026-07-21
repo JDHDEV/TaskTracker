@@ -400,7 +400,7 @@ async fn import_prompt_preserves_ids_history_and_provenance() {
     let repo2 = SqliteRepository::connect_in_memory().await.unwrap();
     let prompts2: &dyn PromptRepository = &repo2;
     let imported = prompts2
-        .import_prompt(&src.id, head.reusable, &head.created_at, &source_versions)
+        .import_prompt(&src.id, head.reusable, &head.created_at, &head.schema_version, &source_versions)
         .await
         .unwrap();
 
@@ -430,9 +430,55 @@ async fn import_prompt_rejects_an_empty_version_list() {
     let prompts: &dyn PromptRepository = &repo;
     assert!(matches!(
         prompts
-            .import_prompt("id", false, "2026-07-19T00:00:00.000+00:00", &[])
+            .import_prompt("id", false, "2026-07-19T00:00:00.000+00:00", "1.0.0", &[])
             .await
             .unwrap_err(),
         AppError::Invalid(_)
     ));
+}
+
+// ---------------------------------------------------------------------------
+// schema_version marker (plan.10) — index-level create/round-trip/immunity.
+// File-store preservation (reusable toggle, cross-project move) is covered in
+// tests/project_manager.rs, since the in-memory repo here has no prompts_dir.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn prompt_create_stamps_current_schema_version_and_it_survives_get_and_list() {
+    let repo = SqliteRepository::connect_in_memory().await.unwrap();
+    let prompts: &dyn PromptRepository = &repo;
+    let p = prompts.create(new_prompt("t", "b")).await.unwrap();
+    assert_eq!(p.schema_version, "1.0.0");
+
+    let fetched = prompts.get(&p.id).await.unwrap();
+    assert_eq!(fetched.schema_version, "1.0.0", "get() must return the marker");
+
+    let listed = prompts.list(&PromptListFilter::default()).await.unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].schema_version, "1.0.0", "list() must return the marker");
+}
+
+#[tokio::test]
+async fn new_prompt_json_carrying_a_client_schema_version_is_ignored_on_create() {
+    // NewPrompt has no schemaVersion field: a client-supplied value in the wire
+    // JSON must not error deserialization and must not reach the stored record.
+    let parsed: NewPrompt =
+        serde_json::from_str(r#"{"projectId":"p1","title":"hostile","schemaVersion":"9.9.9"}"#).unwrap();
+    let repo = SqliteRepository::connect_in_memory().await.unwrap();
+    let prompts: &dyn PromptRepository = &repo;
+    let created = prompts.create(parsed).await.unwrap();
+    assert_eq!(created.schema_version, "1.0.0", "a client-supplied schemaVersion must never persist");
+}
+
+#[tokio::test]
+async fn update_prompt_json_carrying_a_client_schema_version_is_ignored() {
+    let repo = SqliteRepository::connect_in_memory().await.unwrap();
+    let prompts: &dyn PromptRepository = &repo;
+    let p = prompts.create(new_prompt("before", "b")).await.unwrap();
+
+    let patch: UpdatePrompt =
+        serde_json::from_str(r#"{"title":"after","schemaVersion":"9.9.9"}"#).unwrap();
+    let updated = prompts.update(&p.id, patch).await.unwrap();
+    assert_eq!(updated.title, "after", "the real patch field still applies");
+    assert_eq!(updated.schema_version, "1.0.0", "a client-supplied schemaVersion in a patch must be ignored");
 }

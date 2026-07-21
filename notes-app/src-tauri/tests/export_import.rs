@@ -41,6 +41,7 @@ fn note(id: &str, title: &str) -> Item {
         pinned: false,
         project_id: None,
         jira_url: None,
+        schema_version: "1.0.0".into(),
     }
 }
 
@@ -169,7 +170,12 @@ const PROMPT_ID: &str = "cccccccc-cccc-cccc-cccc-cccccccccccc";
 const VERSION_ID: &str = "dddddddd-dddd-dddd-dddd-dddddddddddd";
 
 fn prompt_head() -> promptfile::PromptRecord {
-    promptfile::PromptRecord { id: PROMPT_ID.into(), reusable: true, created_at: TS.into() }
+    promptfile::PromptRecord {
+        id: PROMPT_ID.into(),
+        reusable: true,
+        created_at: TS.into(),
+        schema_version: "1.0.0".into(),
+    }
 }
 
 fn prompt_version(id: &str, title: &str, body: &str) -> promptfile::PromptVersionRecord {

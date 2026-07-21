@@ -39,6 +39,7 @@ describe("duplicateDraft", () => {
     pinned: true,
     projectId: "proj-1",
     jiraUrl: "https://acme.atlassian.net/browse/PLAT-142",
+    schemaVersion: "1.0.0",
   };
 
   it("carries over kind, status, priority, projectId, and tags", () => {

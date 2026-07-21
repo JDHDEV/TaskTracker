@@ -20,6 +20,9 @@ export interface Item {
   pinned: boolean;
   projectId: string | null;
   jiraUrl: string | null;
+  /** Backend-owned record-format marker ("1.0.0"). Read-only passthrough — not
+   *  on NewItem/UpdateItem; a client can never set it. */
+  schemaVersion: string;
 }
 
 /** A known project: catalog identity + whether it is loaded, plus live item and
@@ -81,6 +84,9 @@ export interface Prompt {
   title: string;
   body: string;
   reusable: boolean;
+  /** Backend-owned record-format marker ("1.0.0") on the prompt head. Read-only
+   *  passthrough — not on NewPrompt/UpdatePrompt. */
+  schemaVersion: string;
   createdAt: string; // RFC 3339
   updatedAt: string; // RFC 3339 — the current version's createdAt (derived)
   versionCount: number;

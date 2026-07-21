@@ -12,7 +12,7 @@ use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 
 use crate::db::{ItemRepository, SqliteRepository};
 use crate::error::{AppError, Result};
-use crate::models::Item;
+use crate::models::{Item, CURRENT_SCHEMA_VERSION};
 
 use super::catalog::Catalog;
 use super::{GITIGNORE, LEGACY_DB_FILE};
@@ -53,10 +53,18 @@ pub async fn migrate_if_needed(
     // NOTE: reads assume `notes.db` is fully migrated (0001–0004) — true for any
     // DB this app has opened, since it runs migrations at startup. A behind-schema
     // legacy DB fails these reads and rolls back safely (no data loss).
+    // The legacy `notes.db` predates the `schema_version` column (migration 0007,
+    // never run against it), and this SELECT lists columns explicitly, so `Item`'s
+    // new field cannot come from a physical column here. Project the marker as a
+    // BOUND constant (`?1 AS schema_version`) — it works whether or not the source
+    // has the column and stamps every migrated item as the current, 1.0.0-shaped
+    // format (they are). `insert_item_verbatim` then persists it into the new store.
     let items: Vec<Item> = sqlx::query_as::<_, Item>(
         "SELECT id, kind, title, body, status, priority, due_at, tags, \
-         created_at, updated_at, archived, pinned, project_id, jira_url FROM items",
+         created_at, updated_at, archived, pinned, project_id, jira_url, \
+         ?1 AS schema_version FROM items",
     )
+    .bind(CURRENT_SCHEMA_VERSION)
     .fetch_all(&legacy_pool)
     .await
     .map_err(|_| read_err())?;

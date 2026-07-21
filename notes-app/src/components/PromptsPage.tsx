@@ -37,6 +37,8 @@ function newDraft(projectId: string): Prompt {
     title: "",
     body: "",
     reusable: false,
+    // Placeholder: the backend mints the real marker on Save (it is not sent).
+    schemaVersion: "",
     createdAt: "",
     updatedAt: "",
     versionCount: 0,

@@ -1147,6 +1147,56 @@ async fn reload_reports_conflict_marker_files_and_imports_the_rest() {
 }
 
 // ---------------------------------------------------------------------------
+// schema_version marker (plan.10): back-fill on rebuild is read-only w.r.t.
+// the on-disk file, and forward-stamping happens naturally the next time the
+// item is edited (write_item always emits the schema_version line).
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn reload_backfills_schema_version_for_a_legacy_item_without_rewriting_its_file() {
+    // A legacy items/<uuid>.md written before this marker existed carries no
+    // `schema_version:` line. Loading it must back-fill "1.0.0" into the INDEX
+    // (rebuild_from_dir binds the parser's default verbatim), while the
+    // on-disk bytes stay byte-identical — rebuild never rewrites files.
+    let (mgr, _app) = new_manager().await;
+    let (info, dir) = create_project(&mgr, "Alpha").await;
+    let items_dir = dir.path().join("items");
+
+    let legacy_id = "01234567-89ab-cdef-0123-456789abcdef";
+    let legacy_text = note_md(legacy_id, "legacy note");
+    assert!(!legacy_text.contains("schema_version"), "fixture must genuinely lack the marker");
+    std::fs::write(items_dir.join(format!("{legacy_id}.md")), &legacy_text).unwrap();
+
+    mgr.reload(&info.id).await.unwrap();
+
+    let item = mgr.get(legacy_id).await.unwrap();
+    assert_eq!(item.schema_version, "1.0.0", "the index back-fills the marker for a legacy file");
+
+    let after = std::fs::read_to_string(items_dir.join(format!("{legacy_id}.md"))).unwrap();
+    assert_eq!(after, legacy_text, "rebuild must not rewrite the untouched file on disk");
+}
+
+#[tokio::test]
+async fn update_on_a_legacy_item_stamps_schema_version_into_the_rewritten_file() {
+    // Forward stamping: editing a legacy (no-marker) item rewrites its
+    // canonical file via the normal write_item path, which always emits the
+    // schema_version line — so the very next edit brings a legacy file's
+    // on-disk shape up to date.
+    let (mgr, _app) = new_manager().await;
+    let (info, dir) = create_project(&mgr, "Alpha").await;
+    let items_dir = dir.path().join("items");
+
+    let legacy_id = "76543210-fedc-ba98-7654-3210fedcba98";
+    std::fs::write(items_dir.join(format!("{legacy_id}.md")), note_md(legacy_id, "legacy note")).unwrap();
+    mgr.reload(&info.id).await.unwrap();
+
+    mgr.update(legacy_id, UpdateItem { title: Some("renamed".into()), ..Default::default() }).await.unwrap();
+
+    let after = std::fs::read_to_string(items_dir.join(format!("{legacy_id}.md"))).unwrap();
+    assert!(after.contains("schema_version: 1.0.0"), "the rewritten file now carries the marker: {after}");
+}
+
+// ---------------------------------------------------------------------------
 // Prompts (plan.7): H1 reopen-after-migrate, routing isolation, reload rebuild
 // + full history from files, synthesized head, conflict-marker skip, and the
 // Delete-files sweep. Prompt REPOSITORY-level invariants (versioning,
@@ -1455,7 +1505,7 @@ async fn list_prompts_fan_out_dedupes_a_pathological_shared_id_across_two_stores
         let prompts_dir = dir.join("prompts");
         promptfile::write_prompt(
             &prompts_dir,
-            &promptfile::PromptRecord { id: shared_id.into(), reusable: true, created_at: ts.into() },
+            &promptfile::PromptRecord { id: shared_id.into(), reusable: true, created_at: ts.into(), schema_version: "1.0.0".into() },
         )
         .unwrap();
         promptfile::write_version(
@@ -1572,7 +1622,7 @@ async fn list_prompts_fan_out_reflects_a_reload_mid_session_not_stale_data() {
     let prompts_dir = dir_a.path().join("prompts");
     promptfile::write_prompt(
         &prompts_dir,
-        &promptfile::PromptRecord { id: pulled_id.into(), reusable: true, created_at: ts.into() },
+        &promptfile::PromptRecord { id: pulled_id.into(), reusable: true, created_at: ts.into(), schema_version: "1.0.0".into() },
     )
     .unwrap();
     promptfile::write_version(
@@ -1627,7 +1677,7 @@ async fn reload_rebuilds_prompts_and_full_history_from_files_out_of_band() {
     let ts = "2026-07-14T00:00:00.000+00:00";
     promptfile::write_prompt(
         &prompts_dir,
-        &promptfile::PromptRecord { id: pulled_id.into(), reusable: false, created_at: ts.into() },
+        &promptfile::PromptRecord { id: pulled_id.into(), reusable: false, created_at: ts.into(), schema_version: "1.0.0".into() },
     )
     .unwrap();
     promptfile::write_version(
@@ -1746,7 +1796,7 @@ async fn reload_reports_a_conflict_marker_prompt_version_and_imports_the_rest() 
     let ts = "2026-07-14T00:00:00.000+00:00";
     promptfile::write_prompt(
         &prompts_dir,
-        &promptfile::PromptRecord { id: pid2.into(), reusable: false, created_at: ts.into() },
+        &promptfile::PromptRecord { id: pid2.into(), reusable: false, created_at: ts.into(), schema_version: "1.0.0".into() },
     )
     .unwrap();
     promptfile::write_version(
@@ -2005,6 +2055,112 @@ async fn deleting_source_files_after_a_move_does_not_touch_the_target_copy() {
     mgr.unload(&b.id).await.unwrap();
     mgr.delete_files(&b.id).await.unwrap();
     assert!(!dir_b.path().join("prompts").join(&p.id).exists());
+}
+
+// ---------------------------------------------------------------------------
+// schema_version marker (plan.10, Step 6a): cross-project move and the
+// reusable-only update branch must PRESERVE the prompt head's marker, never
+// re-stamp it to CURRENT_SCHEMA_VERSION. Only observable with a marker that
+// DIFFERS from the constant, so these write the head directly via
+// promptfile::write_prompt (bypassing create(), which always mints the
+// constant) and reload it into a loaded project.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn move_prompt_preserves_the_source_schema_version_not_the_current_constant() {
+    let (mgr, _app) = new_manager().await;
+    let (a, dir_a) = create_project(&mgr, "Alpha").await;
+    let (b, _dir_b) = create_project(&mgr, "Beta").await;
+
+    let prompt_id = "13131313-1313-1313-1313-131313131313";
+    let version_id = "24242424-2424-2424-2424-242424242424";
+    let ts = "2026-07-14T00:00:00.000+00:00";
+    let prompts_dir = dir_a.path().join("prompts");
+    promptfile::write_prompt(
+        &prompts_dir,
+        &promptfile::PromptRecord {
+            id: prompt_id.into(),
+            reusable: false,
+            created_at: ts.into(),
+            schema_version: "0.9.0".into(),
+        },
+    )
+    .unwrap();
+    promptfile::write_version(
+        &prompts_dir,
+        &promptfile::PromptVersionRecord {
+            id: version_id.into(),
+            prompt_id: prompt_id.into(),
+            title: "old-format prompt".into(),
+            body: "body".into(),
+            source: "manual".into(),
+            created_at: ts.into(),
+        },
+    )
+    .unwrap();
+    mgr.reload(&a.id).await.unwrap();
+    assert_eq!(
+        mgr.get_prompt(prompt_id).await.unwrap().schema_version,
+        "0.9.0",
+        "reload preserves the on-disk marker verbatim"
+    );
+
+    let moved = mgr.move_prompt(prompt_id, &b.id).await.unwrap();
+    assert_eq!(
+        moved.schema_version, "0.9.0",
+        "move preserves the source marker rather than re-stamping to the current constant"
+    );
+}
+
+#[tokio::test]
+async fn reusable_toggle_on_a_legacy_prompt_preserves_its_marker_not_the_current_constant() {
+    let (mgr, _app) = new_manager().await;
+    let (info, dir) = create_project(&mgr, "Alpha").await;
+
+    let prompt_id = "35353535-3535-3535-3535-353535353535";
+    let version_id = "46464646-4646-4646-4646-464646464646";
+    let ts = "2026-07-14T00:00:00.000+00:00";
+    let prompts_dir = dir.path().join("prompts");
+    promptfile::write_prompt(
+        &prompts_dir,
+        &promptfile::PromptRecord {
+            id: prompt_id.into(),
+            reusable: false,
+            created_at: ts.into(),
+            schema_version: "0.9.0".into(),
+        },
+    )
+    .unwrap();
+    promptfile::write_version(
+        &prompts_dir,
+        &promptfile::PromptVersionRecord {
+            id: version_id.into(),
+            prompt_id: prompt_id.into(),
+            title: "old-format prompt".into(),
+            body: "body".into(),
+            source: "manual".into(),
+            created_at: ts.into(),
+        },
+    )
+    .unwrap();
+    mgr.reload(&info.id).await.unwrap();
+
+    let toggled = mgr
+        .update_prompt(prompt_id, UpdatePrompt { reusable: Some(true), ..Default::default() })
+        .await
+        .unwrap();
+    assert!(toggled.reusable);
+    assert_eq!(
+        toggled.schema_version, "0.9.0",
+        "a reusable-only toggle must preserve the existing marker, not re-stamp it"
+    );
+
+    // The rewritten prompt.md on disk also carries the preserved marker.
+    let head_text = std::fs::read_to_string(prompts_dir.join(prompt_id).join("prompt.md")).unwrap();
+    assert!(
+        head_text.contains("schema_version: 0.9.0"),
+        "the rewritten head file preserves the marker: {head_text}"
+    );
 }
 
 #[tokio::test]

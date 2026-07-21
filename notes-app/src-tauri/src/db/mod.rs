@@ -78,11 +78,13 @@ pub trait PromptRepository: Send + Sync {
     async fn count_prompts(&self) -> Result<i64>;
     /// Import a prompt with its FULL version history VERBATIM (plan.8 move).
     /// Unlike `create` (which mints fresh ids and a single first version), this
-    /// preserves the prompt `id`/`reusable`/`created_at` and EACH version's
-    /// `id`/`title`/`body`/`source`/`created_at` (the user chose an id-preserving
-    /// move — byte-identical history). Writes `prompt.md` + one immutable version
-    /// file per version into this store, then inserts the index rows in one
-    /// transaction (files-then-index, parent-before-child). Modeled on
+    /// preserves the prompt `id`/`reusable`/`created_at`/`schema_version` and EACH
+    /// version's `id`/`title`/`body`/`source`/`created_at` (the user chose an
+    /// id-preserving move — byte-identical history). `prompt_schema_version` is the
+    /// SOURCE head's marker, carried across so a cross-store move never re-stamps
+    /// it to the current constant (plan.10 Step 6a). Writes `prompt.md` + one
+    /// immutable version file per version into this store, then inserts the index
+    /// rows in one transaction (files-then-index, parent-before-child). Modeled on
     /// `insert_item_verbatim`. Callers (`ProjectManager::move_prompt`) verify the
     /// imported history against the source before deleting the source.
     async fn import_prompt(
@@ -90,6 +92,7 @@ pub trait PromptRepository: Send + Sync {
         prompt_id: &str,
         reusable: bool,
         prompt_created_at: &str,
+        prompt_schema_version: &str,
         versions: &[PromptVersion],
     ) -> Result<Prompt>;
 }

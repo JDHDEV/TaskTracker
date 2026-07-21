@@ -1,0 +1,22 @@
+-- Per-record `schema_version` marker (plan.10): the on-disk record FORMAT
+-- version, stamped on every item and prompt at creation and carried in the
+-- canonical Markdown files (the source of truth). These two columns mirror that
+-- marker into the git-ignored, rebuildable index so `SELECT *` over `items` and
+-- the prompt current-version CTEs surface it back over IPC.
+--
+-- Additive and metadata-only: `ALTER TABLE ... ADD COLUMN ... DEFAULT '1.0.0'`
+-- back-fills every pre-existing row to '1.0.0' without rewriting the table (a
+-- constant literal default is an O(1) schema change, not a row scan). The value
+-- matches `models::CURRENT_SCHEMA_VERSION` and the parsers' absent-key default,
+-- so a freshly-minted store's DEFAULT and a file-rebuilt store's verbatim value
+-- can never disagree.
+--
+-- FTS/triggers/indexes are untouched: the `items_fts` external-content index
+-- covers only (title, body) and the sync triggers name those columns explicitly
+-- (never `new.*`), so a new item column needs no trigger or shadow-table change.
+-- No new index — the marker is never a query predicate in v1.
+--
+-- Distinct from `meta.schema_version`, which holds the migration LEVEL (e.g.
+-- "7") — a different axis from this record-format marker (see plan.10 §10).
+ALTER TABLE items ADD COLUMN schema_version TEXT NOT NULL DEFAULT '1.0.0';
+ALTER TABLE prompts ADD COLUMN schema_version TEXT NOT NULL DEFAULT '1.0.0';

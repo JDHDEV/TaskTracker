@@ -43,6 +43,7 @@ use std::path::{Path, PathBuf};
 use super::itemfile::{
     self, has_conflict_markers, is_uuid, quote, read_capped, unquote, MAX_ITEM_FILE_BYTES,
 };
+use crate::models::CURRENT_SCHEMA_VERSION;
 
 /// The prompt-level record persisted in `prompt.md` — the only mutable prompt
 /// state. `id` is the directory name; `created_at` is the prompt's creation
@@ -52,6 +53,10 @@ pub struct PromptRecord {
     pub id: String,
     pub reusable: bool,
     pub created_at: String,
+    /// Record-FORMAT marker (see `models::CURRENT_SCHEMA_VERSION`). Lives on the
+    /// prompt HEAD only — version files are unchanged. Absent in a legacy head
+    /// parses as the current version.
+    pub schema_version: String,
 }
 
 /// One immutable version, persisted in `<version-uuid>.md`. `prompt_id` is
@@ -154,6 +159,9 @@ pub fn serialize_prompt(p: &PromptRecord) -> String {
     line(&mut out, "id", &p.id);
     line(&mut out, "reusable", bool_str(p.reusable));
     line(&mut out, "created_at", &p.created_at);
+    // Record-format marker (head only). A backend constant with no newline, so
+    // the bareword `line()` helper is safe — see the item-file note.
+    line(&mut out, "schema_version", &p.schema_version);
     out.push_str("---\n");
     out
 }
@@ -189,7 +197,14 @@ pub fn parse_prompt(text: &str) -> Result<PromptRecord, PromptFileError> {
     }
     let reusable = parse_bool(&require(&fields, "reusable")?)?;
     let created_at = require(&fields, "created_at")?;
-    Ok(PromptRecord { id, reusable, created_at })
+    // A legacy head with no `schema_version:` line reads as the current version
+    // (already 1.0.0-shaped), never an error. Matches the SQL DEFAULT and
+    // `itemfile::parse`.
+    let schema_version = fields
+        .get("schema_version")
+        .cloned()
+        .unwrap_or_else(|| CURRENT_SCHEMA_VERSION.to_string());
+    Ok(PromptRecord { id, reusable, created_at, schema_version })
 }
 
 /// Parse a version file's bytes into a `PromptVersionRecord`, stamping the
@@ -327,6 +342,9 @@ pub fn scan(prompts_dir: &Path) -> PromptScanOutcome {
             id: dir_name.clone(),
             reusable: false,
             created_at: min_created_at(&versions),
+            // A synthesized head (missing/unreadable `prompt.md`) carries no
+            // marker; default it to the current version like the parser does.
+            schema_version: CURRENT_SCHEMA_VERSION.to_string(),
         });
         prompts.push(ScannedPrompt { prompt, versions });
     }
@@ -528,7 +546,7 @@ mod tests {
     const TS2: &str = "2026-07-18T11:00:00.000+00:00";
 
     fn head() -> PromptRecord {
-        PromptRecord { id: PID.into(), reusable: true, created_at: TS.into() }
+        PromptRecord { id: PID.into(), reusable: true, created_at: TS.into(), schema_version: "1.0.0".into() }
     }
 
     fn version(id: &str, title: &str, body: &str, source: &str, created_at: &str) -> PromptVersionRecord {
@@ -547,6 +565,17 @@ mod tests {
         let p = head();
         let parsed = parse_prompt(&serialize_prompt(&p)).unwrap();
         assert_eq!(p, parsed);
+    }
+
+    #[test]
+    fn parse_prompt_defaults_a_legacy_heads_absent_schema_version_to_1_0_0() {
+        // A head written before this marker existed has no `schema_version:`
+        // line. It must parse Ok (never Err) and default to the current format
+        // version, matching the SQL DEFAULT and itemfile::parse.
+        let text = format!("---\nid: {PID}\nreusable: true\ncreated_at: {TS}\n---\n");
+        assert!(!text.contains("schema_version"), "fixture must genuinely lack the marker");
+        let parsed = parse_prompt(&text).unwrap();
+        assert_eq!(parsed.schema_version, "1.0.0");
     }
 
     #[test]

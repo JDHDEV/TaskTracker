@@ -1,6 +1,15 @@
 use serde::{Deserialize, Serialize};
 use sqlx::types::Json;
 
+/// The record-FORMAT marker stamped on every item and prompt at creation. It
+/// names the on-disk shape a future migration keys off, so bump it ONLY on a
+/// file-format change — NOT on every app release (a distinct axis from the app
+/// version, which happens to also be `1.0.0` today). Backend-owned: minted
+/// server-side in `create` exactly like `id`/`createdAt`, never accepted from an
+/// input DTO. Legacy records written before this field existed carry no marker
+/// and parse-default to this same value (they are already 1.0.0-shaped).
+pub const CURRENT_SCHEMA_VERSION: &str = "1.0.0";
+
 /// Notes and tasks share one shape; `kind` discriminates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
 #[serde(rename_all = "lowercase")]
@@ -60,6 +69,11 @@ pub struct Item {
     pub pinned: bool,
     pub project_id: Option<String>,
     pub jira_url: Option<String>,
+    /// Backend-owned record-FORMAT marker (see `CURRENT_SCHEMA_VERSION`). Minted
+    /// in `create`, preserved untouched on every `update` (so it never moves
+    /// `updatedAt`), and defaulted to `"1.0.0"` for legacy files with no marker.
+    /// Never present on `NewItem`/`UpdateItem` — a client cannot set it.
+    pub schema_version: String,
 }
 
 /// A known project for the frontend: catalog identity (id, name, directory
@@ -185,6 +199,11 @@ pub struct Prompt {
     pub title: String,
     pub body: String,
     pub reusable: bool,
+    /// Backend-owned record-FORMAT marker on the prompt HEAD (see
+    /// `CURRENT_SCHEMA_VERSION`). Minted in `create`, preserved on a `reusable`
+    /// toggle and on a cross-project move, and defaulted to `"1.0.0"` for legacy
+    /// heads with no marker. Never present on `NewPrompt`/`UpdatePrompt`.
+    pub schema_version: String,
     pub created_at: String,
     /// The current version's `created_at` (derived) — not a stored column.
     pub updated_at: String,

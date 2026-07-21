@@ -26,7 +26,7 @@ use std::path::Path;
 
 use sqlx::types::Json;
 
-use crate::models::{Item, Kind, Priority, Status};
+use crate::models::{Item, Kind, Priority, Status, CURRENT_SCHEMA_VERSION};
 
 /// A per-file cap. `scan` skips (and reports) any file larger than this before
 /// reading it, so a hostile multi-gigabyte "item" can't be slurped into memory.
@@ -118,6 +118,10 @@ pub fn serialize(item: &Item) -> String {
     }
     line(&mut out, "created_at", &item.created_at);
     line(&mut out, "updated_at", &item.updated_at);
+    // Record-format marker. A backend constant with no newline, so the bareword
+    // `line()` helper (no escaping) is safe — a client-controlled value here
+    // could inject a frontmatter key, which is why it is never on an input DTO.
+    line(&mut out, "schema_version", &item.schema_version);
     out.push_str("---\n");
     out.push_str(&item.body);
     out
@@ -233,6 +237,13 @@ pub fn parse(text: &str) -> Result<Item, ItemFileError> {
     let jira_url = fields.get("jira_url").map(|v| unquote(v)).transpose()?;
     let created_at = get("created_at")?.clone();
     let updated_at = get("updated_at")?.clone();
+    // Back-fill the durable path: a legacy file written before this marker
+    // existed has no `schema_version:` line and reads as the current version
+    // (it is already 1.0.0-shaped), never an error. Matches the SQL DEFAULT.
+    let schema_version = fields
+        .get("schema_version")
+        .cloned()
+        .unwrap_or_else(|| CURRENT_SCHEMA_VERSION.to_string());
 
     Ok(Item {
         id,
@@ -249,6 +260,7 @@ pub fn parse(text: &str) -> Result<Item, ItemFileError> {
         pinned,
         project_id: None,
         jira_url,
+        schema_version,
     })
 }
 
@@ -554,6 +566,7 @@ mod tests {
             pinned: true,
             project_id: None,
             jira_url: Some("https://x.atlassian.net/browse/ABC-1".into()),
+            schema_version: "1.0.0".into(),
         }
     }
 
@@ -573,6 +586,7 @@ mod tests {
             pinned: false,
             project_id: None,
             jira_url: None,
+            schema_version: "1.0.0".into(),
         }
     }
 
@@ -591,6 +605,10 @@ mod tests {
         assert_eq!(a.pinned, b.pinned);
         assert_eq!(a.project_id, b.project_id);
         assert_eq!(a.jira_url, b.jira_url);
+        // `Item` derives no `PartialEq`, so the round-trip test only checks the
+        // marker because this helper does — without this line a `parse` that
+        // dropped `schema_version` would still ship green.
+        assert_eq!(a.schema_version, b.schema_version);
     }
 
     #[test]
@@ -648,6 +666,21 @@ mod tests {
         let parsed = parse(text).unwrap();
         assert_eq!(parsed.status, Some(Status::Todo));
         assert_eq!(parsed.priority, Some(Priority::Normal));
+    }
+
+    #[test]
+    fn parse_defaults_a_legacy_files_absent_schema_version_to_1_0_0() {
+        // A file written before this marker existed has no `schema_version:`
+        // line. It must parse Ok (never Err(Malformed)) and default to the
+        // current format version — the durable back-fill path, since index.db
+        // is rebuilt from these files on every load.
+        let text = "---\nid: 550e8400-e29b-41d4-a716-446655440000\nkind: task\n\
+                    title: \"bare task\"\npinned: false\narchived: false\ntags: []\n\
+                    created_at: 2026-07-17T10:00:00.000+00:00\n\
+                    updated_at: 2026-07-17T10:00:00.000+00:00\n---\n";
+        assert!(!text.contains("schema_version"), "fixture must genuinely lack the marker");
+        let parsed = parse(text).unwrap();
+        assert_eq!(parsed.schema_version, "1.0.0");
     }
 
     #[test]
