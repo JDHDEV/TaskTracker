@@ -3,6 +3,7 @@
   "productName": "worknotes",
   "version": "1.0.0",
   "identifier": "io.github.jdhdev.worknotes",
+  "mainBinaryName": "worknotes",
   "build": {
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://localhost:1420",
