@@ -2,7 +2,7 @@
 
 This is the agreed UI/behavior spec. The interactive reference is `reference/Worknotes_dc.html` (open in a browser); `reference/design-tool-handoff.md` is the design tool's own handoff notes. Where they disagree, THIS document wins — it includes rules added after the prototype was generated (tag lifecycle, project removal guard, JIRA link).
 
-worknotes is a local-first Windows 11 desktop app called **worknotes**, used by one person to capture work notes and tasks and refine them with AI. One primary screen — a two-pane workbench — plus three overlays: an **API keys** dialog, a **Manage projects** dialog, and inline **tag picker** popups. The feeling is a calm, native productivity workbench: warm paper-gray surfaces, hairline borders, typographic (no icons), quiet everywhere except one signature element — a highlighter-yellow "Proposed rewrite" card where AI suggestions land. Flat design: no gradients, no drop shadows. Light theme is the default; a dark theme swaps only the neutral palette — the yellow stays the single bright accent in both. Desktop frame 1200 × 760.
+worknotes is a local-first Windows 11 desktop app called **worknotes**, used by one person to capture work notes and tasks and refine them with AI. One primary screen — a two-pane workbench — plus three overlays: an **API keys** dialog, a **Manage projects** dialog, and inline **tag picker** popups. The feeling is a calm, native productivity workbench: warm paper-gray surfaces, hairline borders, typographic (no icons), quiet everywhere except one signature element — a highlighter-yellow "Proposed rewrite" card where AI suggestions land. Flat design: no gradients, no drop shadows. The default look is the **Original** light palette; a topbar picker selects one of **five named palettes** — Original (light), Gray + teal light, Gray + teal dark, Neon noir (dark), Claude terminal (dark) — each a full token set. As of Plan 11 a palette re-themes the neutrals **and** the accent/danger family (the earlier "swap neutrals only, accents stay constant" rule is relaxed — see the palette tokens below); only the doing/done status-dot colors stay fixed across all five. Desktop frame 1200 × 760.
 
 ## Design tokens (use these exactly)
 
@@ -16,22 +16,36 @@ Light theme neutrals:
 
 Dark theme neutrals: bg `#1D1C1A`, surface `#272623`, ink `#ECEAE4`, muted `#A0A09A`, hairlines `#3A3833`, surround `#131211`, outer border `#3A3833`.
 
-Constant across both themes (never re-themed):
-- Signature highlighter yellow `#F6E05E`; soft yellow fill `#FBF3C9`; dark yellow ink for text on yellow `#6B5C0E`; Discard-button border `#E6D68A`
-- Danger `#B4533A` (Delete, the `high` priority word)
-- Status dots — todo `#9AA0A6`, doing `#D9A441`, done `#4C8A64`
+Palette-dependent as of Plan 11 (each palette declares its own — see "New palettes" below for the full five token sets):
+- The signature accent `--mark` / soft fill `--mark-soft` / ink-on-accent `--mark-ink`, and `--danger`. The **Original** palette keeps the historical highlighter yellow `#F6E05E` / `#FBF3C9` / `#6B5C0E` and danger `#B4533A` (Delete, the `high` priority word); the other four substitute their own accent + danger (teal, neon green, Claude orange, etc.).
+- `--todo` (the todo status dot) tracks each palette's muted gray.
+
+Constant across all five palettes (never re-themed):
+- Status dots — doing `#D9A441`, done `#4C8A64`
 - Dialog scrim `rgba(35, 39, 42, 0.35)`
 
 Type:
 - UI text: Segoe UI Variable (fallback Segoe UI, then system-ui), 14px base, line-height ~1.45
 - Metadata voice: Cascadia Mono (fallback Consolas), 11px, usually UPPERCASE with 0.08em letter-spacing — timestamps, kind labels, tags, priority words, section labels
-- Editor title 22px weight ~650, borderless; body textarea 15px, line-height 1.6
+- Editor title 17px weight ~650, borderless (tightened from 22px in Plan 11); body textarea 15px, line-height 1.6
 
 Radii 6px (controls) / 8px (cards, dialogs) / 20px (pill chips). Focus is a 2px ink outline, no glow. Editor padding ~20–22px; rail header block ~14px.
 
+### New palettes (Plan 11)
+
+Five palettes ship, chosen from a topbar dropdown and persisted; the selection sets two attributes on `<html>`, applied together: `data-palette` (accent family + neutrals) and `data-theme` (`light`/`dark` polarity, which the neutral-swap and calendar-invert rules still key on). The authoritative full 14-token set for each lives in `src/styles.css` (`:root[data-palette="…"]`). Signature accents:
+
+- **Original** (light) — highlighter yellow `#F6E05E`, danger `#B4533A`. This is the base `:root`; it is the default when nothing is stored.
+- **Gray + teal, light** (`v2-light`) — teal `#4DDDBC`, danger `#FF4D4D`; its `New note`/`New task` create buttons are softened to a surface fill (Change 5).
+- **Gray + teal, dark** (`v2-dark`) — teal `#4DDDBC` on dark neutrals, review-card fill `#14312B`, danger `#FF4D4D`.
+- **Neon noir** (dark) — neon green `#2CFF05`, danger neon magenta `#BF00FF`.
+- **Claude terminal** (dark) — Claude orange `#D97757`, danger clay `#C0553A`.
+
+The three dark palettes override the solid-primary `.btn` fill (ink is light in dark mode) and darken the review-badge text for contrast; the doing/done status dots stay constant across all five. The legacy yellow-accent "Original dark" theme is dropped — there is no code path to it.
+
 ## Main screen
 
-**Top bar** (46px, surface, bottom hairline, padding 0 18px): left, wordmark `worknotes` in Cascadia Mono 13px, letter-spacing 0.14em. Right, three quiet outline buttons (mono 11px, muted, hairline border): `Dark` or `Light` (label names the *target* theme and toggles it), `Manage projects`, `API keys`.
+**Top bar** (46px, surface, bottom hairline, padding 0 18px): left, wordmark `worknotes` in Cascadia Mono 13px, letter-spacing 0.14em. Right, a **palette picker** `<select>` (the five palettes above; replaces the old Light/Dark toggle) followed by two quiet outline buttons (mono 11px, muted, hairline border): `Manage projects`, `API keys`.
 
 **Left rail** (300px, surface, right hairline). Header block, then a scrolling list.
 
@@ -67,7 +81,7 @@ Empty editor state: `Select something on the left, or create a note to start.`
 - **Saving an item with an empty title generates one.** When a save runs on an item whose title is blank but whose body is not — the Save button, Ctrl+S, or a `Replace text` accept, which all route through the one save path — the app calls the AI to generate a title from the body, auto-accepts it, and completes the save — silently on success: the title visibly populates the field and there is no toast. The Save button reads `Generating title…` and is disabled while the call is in flight. A failure or a missing API key surfaces as a toast (the missing-key message names the provider; other failures read `couldn't generate a title — try again`) and the save is aborted, leaving the item dirty. Saving with **both** title and body empty keeps the existing `Give it a title before saving.` error and makes no AI call. This is the one case where AI output is accepted without an explicit accept click — it fills only an empty title, never overwrites one, and never touches the body. It applies to notes and tasks alike; a single-space title counts as empty.
 - The JIRA field associates an external ticket with any item, note or task. Typing or clearing it marks the item dirty like any other edit; the link chip exists only while a URL is present and always opens the default browser — it never navigates inside the app.
 - `Duplicate metadata` creates a new item at the top carrying over kind, status, priority, project, and tags — empty title and body, unpinned, and no JIRA link (it identifies one specific ticket) — then selects it, dirty.
-- Theme toggle swaps the neutral palette only; every accent listed as constant stays put.
+- The palette picker selects one of the five named palettes (see "New palettes"); each re-themes the neutrals **and** the accent/danger family. Only the doing/done status dots stay constant; `--todo` tracks the palette's muted gray. The selection persists and is applied before first paint (no flash).
 
 ### Tag lifecycle (new)
 

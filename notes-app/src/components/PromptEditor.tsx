@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { forwardRef, useEffect, useImperativeHandle, useRef, useState } from "react";
 import type {
   NewPrompt,
   ProjectInfo,
@@ -8,9 +8,16 @@ import type {
   UpdatePrompt,
 } from "../types";
 import { aiRewriteStream, confirmDialog, copyToClipboard } from "../lib/api";
+import { tabDomId, tabPanelDomId } from "../lib/openTabs";
 import { usePopover } from "../hooks/usePopover";
 import AiBar from "./AiBar";
 import PromptHistoryDialog from "./PromptHistoryDialog";
+
+/** Imperative handle: lets the parent persist a background (non-active) prompt
+ *  tab from the close-dirty "Save" branch (its buffer lives only here). */
+export interface PromptEditorHandle {
+  save: () => Promise<boolean>;
+}
 
 interface Props {
   prompt: Prompt;
@@ -18,6 +25,17 @@ interface Props {
   /** The loaded project catalog (from PromptsPage) — the move-target choices are
    *  the loaded projects other than this prompt's own. */
   loaded: ProjectInfo[];
+  /** This tab's identity key — derives the tab/panel ARIA ids. */
+  tabKey: string;
+  /** True when this tab is not the active one — the section is mounted but
+   *  display:none (preserving its buffer/stream). Distinct from `active`. */
+  hidden: boolean;
+  /** Whether this is the visible, active prompt tab. Gates the window Ctrl+S
+   *  listener so only the active editor saves (N editors stay mounted, and both
+   *  pages are mounted at once — so this also folds in "Prompts page visible"). */
+  active: boolean;
+  /** Fires on dirty↔clean transitions only, driving the tab's unsaved dot. */
+  onDirtyChange: (dirty: boolean) => void;
   onSave: (patch: UpdatePrompt) => Promise<boolean>;
   onCreate: (input: NewPrompt) => Promise<boolean>;
   /** Persists immediately (no version, no dirty state) — the reusable flag is
@@ -45,19 +63,26 @@ interface Props {
  *  archive/tags — those are item-only), a reusable toggle, History, Delete,
  *  and the AI enhance flow reused verbatim from Editor.tsx's rework, minus the
  *  R1 title-proposal half (prompts have no AI-generated titles). */
-export default function PromptEditor({
-  prompt,
-  isDraft,
-  loaded,
-  onSave,
-  onCreate,
-  onToggleReusable,
-  onDelete,
-  onMove,
-  onError,
-  onResolve,
-  ownerLabel,
-}: Props) {
+const PromptEditor = forwardRef<PromptEditorHandle, Props>(function PromptEditor(
+  {
+    prompt,
+    isDraft,
+    loaded,
+    tabKey,
+    hidden,
+    active,
+    onDirtyChange,
+    onSave,
+    onCreate,
+    onToggleReusable,
+    onDelete,
+    onMove,
+    onError,
+    onResolve,
+    ownerLabel,
+  }: Props,
+  ref,
+) {
   const [title, setTitle] = useState(prompt.title);
   const [body, setBody] = useState(prompt.body);
   const [dirty, setDirty] = useState(isDraft); // a fresh draft starts dirty
@@ -86,6 +111,20 @@ export default function PromptEditor({
   const stopRef = useRef<(() => void) | null>(null);
   // Blocks save re-entry (a second Ctrl+S while a save is in flight).
   const savingRef = useRef(false);
+
+  // Expose save() so the close-dirty "Save" branch can persist THIS prompt tab
+  // even when it is a background (non-active) tab whose buffer lives only here.
+  useImperativeHandle(ref, () => ({ save: () => save() }));
+
+  // Surface dirty↔clean transitions to the parent tab strip (never per keystroke;
+  // seeded to the initial value so there is no redundant mount fire).
+  const reportedDirty = useRef(dirty);
+  useEffect(() => {
+    if (reportedDirty.current !== dirty) {
+      reportedDirty.current = dirty;
+      onDirtyChange(dirty);
+    }
+  }, [dirty, onDirtyChange]);
 
   // Re-seed local state from the prompt. PromptsPage keys this component by
   // draft-seq/selected-id, so most selections remount it; this effect covers
@@ -181,10 +220,13 @@ export default function PromptEditor({
     }
   }
 
-  // Ctrl+S / Cmd+S saves — the identical path.
+  // Ctrl+S / Cmd+S saves — the identical path. Gated on `active` so only the
+  // visible, active tab saves (every open tab keeps a mounted editor with this
+  // window-level listener, and both pages are mounted at once).
   useEffect(() => {
     function onKey(e: KeyboardEvent) {
       if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "s") {
+        if (!active) return;
         e.preventDefault();
         void save();
       }
@@ -271,7 +313,13 @@ export default function PromptEditor({
   }
 
   return (
-    <section className="editor">
+    <section
+      className="editor"
+      role="tabpanel"
+      hidden={hidden}
+      id={tabPanelDomId(tabKey)}
+      aria-labelledby={tabDomId(tabKey)}
+    >
       <header className="editor-head">
         <input
           className="title"
@@ -354,6 +402,24 @@ export default function PromptEditor({
         )}
       </div>
 
+      <textarea
+        className="body"
+        value={body}
+        placeholder="Write the prompt text here."
+        onChange={(e) => edit(setBody)(e.target.value)}
+      />
+
+      <AiBar
+        variant="prompt"
+        busy={aiBusy}
+        dirty={dirty}
+        generatingTitle={false}
+        saveBlocked={false}
+        onRework={(i, p) => void rework(i, p)}
+        onSave={() => void save()}
+        onDiscard={isDraft ? undefined : discardEdits}
+      />
+
       {proposal !== null && (
         <div className="review" role="region" aria-label="AI rewrite proposal">
           <div className="review-head">
@@ -382,24 +448,6 @@ export default function PromptEditor({
         </div>
       )}
 
-      <textarea
-        className="body"
-        value={body}
-        placeholder="Write the prompt text here."
-        onChange={(e) => edit(setBody)(e.target.value)}
-      />
-
-      <AiBar
-        variant="prompt"
-        busy={aiBusy}
-        dirty={dirty}
-        generatingTitle={false}
-        saveBlocked={false}
-        onRework={(i, p) => void rework(i, p)}
-        onSave={() => void save()}
-        onDiscard={isDraft ? undefined : discardEdits}
-      />
-
       {showHistory && (
         <PromptHistoryDialog
           promptId={prompt.id}
@@ -409,4 +457,6 @@ export default function PromptEditor({
       )}
     </section>
   );
-}
+});
+
+export default PromptEditor;
