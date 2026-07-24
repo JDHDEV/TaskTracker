@@ -30,7 +30,7 @@ Stack: Tauri 2 shell · React 19 + TypeScript (Vite) · Rust core · SQLite via 
 - sqlx runtime API only (`query`, `query_as`, `QueryBuilder`). No `query!` compile-time macros; the build must never need a live `DATABASE_URL`.
 - Schema changes are additive numbered migrations in `src-tauri/migrations/`; sqlx applies them at startup. Never edit an existing migration.
 - Timestamps are RFC 3339 TEXT end to end (SQLite ↔ Rust ↔ JS), no mapping layers.
-- Styling: CSS custom properties in `src/styles.css`, tokens per `docs/DESIGN.md`. Light/dark themes swap neutrals only — the highlighter yellow, danger red, and status-dot colors are constant.
+- Styling: CSS custom properties in `src/styles.css`, tokens per `docs/DESIGN.md`. Five named palettes are selected via `data-palette` on `<html>` alongside a polarity `data-theme` (`light`/`dark`), both set atomically; a palette swaps the neutrals **and** the accent/danger family (`--mark*`, `--danger`, and `--todo` all vary per palette). Only the doing/done status-dot colors are constant across all five. (Pre-Plan-11 this read "themes swap neutrals only; accents constant" — that rule is relaxed.)
 - AI models are constants: `MODEL` in `src-tauri/src/ai/anthropic.rs` (`claude-sonnet-4-6`; current names at https://docs.claude.com/en/docs/about-claude/models/overview) and `src-tauri/src/ai/openai.rs` (`gpt-4o-mini`).
 
 ## Verify after every change

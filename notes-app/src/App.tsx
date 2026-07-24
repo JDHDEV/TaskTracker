@@ -1,4 +1,11 @@
-import { useCallback, useEffect, useRef, useState, type KeyboardEvent } from "react";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type KeyboardEvent,
+} from "react";
 import type {
   Item,
   Kind,
@@ -10,10 +17,37 @@ import type {
 } from "./types";
 import * as api from "./lib/api";
 import { recomputeTagFilter } from "./lib/tags";
-import { loadedProjects, nextToken, resolveCreateTarget, shouldCommit } from "./lib/projects";
+import {
+  itemKey,
+  loadedProjects,
+  nextToken,
+  resolveCreateTarget,
+  shouldCommit,
+} from "./lib/projects";
 import { duplicateDraft, newDraft } from "./lib/draft";
+import {
+  getStoredPalette,
+  isPaletteId,
+  PALETTES,
+  polarityOf,
+  setStoredPalette,
+  type PaletteId,
+} from "./lib/palettes";
+import {
+  activateTab,
+  activeTab,
+  closeTab,
+  emptyTabs,
+  hasTab,
+  openTab,
+  promoteTab,
+  setDirty,
+  setTabItem,
+  type OpenTabsState,
+} from "./lib/openTabs";
 import ItemList, { KindFilter, StatusFilter } from "./components/ItemList";
-import Editor from "./components/Editor";
+import Editor, { type EditorHandle } from "./components/Editor";
+import EditorTabs, { type EditorTabDescriptor } from "./components/EditorTabs";
 import SettingsDialog from "./components/SettingsDialog";
 import ManageProjectsDialog from "./components/ManageProjectsDialog";
 import PromptsPage from "./components/PromptsPage";
@@ -22,9 +56,14 @@ import { useToasts } from "./hooks/useToasts";
 
 type Page = "worknotes" | "prompts";
 
+/** A tab's display title: the saved title, or a kind-based placeholder while an
+ *  item/draft is still untitled. */
+function itemTabTitle(item: Item): string {
+  return item.title || (item.kind === "task" ? "Untitled task" : "Untitled note");
+}
+
 export default function App() {
   const [items, setItems] = useState<Item[]>([]);
-  const [selectedId, setSelectedId] = useState<string | null>(null);
 
   // Filter set — each is AND-combined; tagFilter is OR within itself. All of it
   // drives one ListFilter built in loadItems() and sent to both IPC paths.
@@ -41,9 +80,22 @@ export default function App() {
   const [activeTags, setActiveTags] = useState<string[]>([]);
   const loaded = loadedProjects(knownProjects);
 
-  // A local-only draft item (D1). While set, it is what the editor edits.
-  const [draft, setDraft] = useState<Item | null>(null);
-  const [draftSeq, setDraftSeq] = useState(0); // per-draft remount key (D1b)
+  // Open editor tabs (Plan 11). Each tab holds a snapshot Item + an unsaved flag;
+  // the active tab is the visible editor. Every open item keeps a mounted-hidden
+  // <Editor>, so per-tab edits and in-flight AI streams survive a tab switch.
+  // Drafts get a synthetic `draft-<seq>` key (real items key on itemKey()); on
+  // save the draft key is promoted to the created item's key so the tab stays
+  // open and re-clicking its row activates it instead of duplicating it.
+  const [tabs, setTabs] = useState<OpenTabsState<Item>>(emptyTabs);
+  const [draftSeq, setDraftSeq] = useState(0);
+  // Latest tabs, so async reconciliation reads the current set after an await.
+  const tabsRef = useRef(tabs);
+  useEffect(() => {
+    tabsRef.current = tabs;
+  }, [tabs]);
+  // Imperative save() handles per open tab, so the close-dirty "Save" branch can
+  // persist a background (non-active) tab whose buffer lives only in its editor.
+  const editorRefs = useRef(new Map<string, EditorHandle>());
 
   const [showSettings, setShowSettings] = useState(false);
   const [showProjects, setShowProjects] = useState(false);
@@ -59,30 +111,52 @@ export default function App() {
     dismiss: dismissToast,
     dismissKey,
   } = useToasts();
-  const [theme, setTheme] = useState<"light" | "dark">(() =>
-    localStorage.getItem("theme") === "dark" ? "dark" : "light",
-  );
+  // The selected palette (accent family + neutrals + polarity). Seeded from the
+  // whitelist-validated store so a stale/garbage id falls back to "original".
+  const [palette, setPalette] = useState<PaletteId>(getStoredPalette);
 
   // Router-free page toggle (Worknotes / Prompts). Both pages stay mounted
   // (the inactive one is hidden, not unmounted — see the `hidden` wrappers
   // below), so switching never discards an in-progress edit on either page.
   const [page, setPage] = useState<Page>("worknotes");
 
-  // The owning project of the prompt currently open on the Prompts page (null
-  // when none), reported up by PromptsPage. Lets the unload confirm warn before
-  // closing an open prompt, not just an open Worknotes item.
-  const [openPromptProjectId, setOpenPromptProjectId] = useState<string | null>(null);
+  // The set of projects with at least one open prompt tab on the Prompts page
+  // (reported up by PromptsPage). Lets the unload confirm warn before an unload
+  // closes an open prompt — even a dirty background one — not just an item.
+  const [openPromptProjectIds, setOpenPromptProjectIds] = useState<string[]>([]);
+
+  // Bumped when a project is reloaded so PromptsPage closes its own open prompt
+  // tabs of that project — reload keeps the project `loaded`, so PromptsPage's
+  // loaded-driven close effect won't fire on its own.
+  const [promptReloadSignal, setPromptReloadSignal] =
+    useState<{ projectId: string; n: number } | null>(null);
+
+  // Focus target for the empty-editor placeholder, so closing the LAST tab moves
+  // focus into the placeholder region instead of dropping it to <body>.
+  const emptyEditorRef = useRef<HTMLElement>(null);
+  const hadTabsRef = useRef(false);
+  useEffect(() => {
+    const has = tabs.tabs.length > 0;
+    if (hadTabsRef.current && !has) emptyEditorRef.current?.focus();
+    hadTabsRef.current = has;
+  }, [tabs.tabs.length]);
 
   // Monotonic request token: a slow listItems that resolves after a newer load
   // (or after an unload closed a store) must not repopulate the list. Only the
   // latest token commits — the exact race the single-DB app never had.
   const loadToken = useRef(0);
 
-  // Neutrals swap via [data-theme] on <html>; light uses the :root defaults.
+  // A palette drives two <html> attributes, set atomically: data-palette (accent
+  // + neutrals — the authoritative token source) and data-theme (polarity, which
+  // the legacy [data-theme="dark"] rules key on). main.tsx applies the same pair
+  // synchronously before first render (no flash); this keeps them in sync on
+  // every later change and persists via the whitelist-validated setter.
   useEffect(() => {
-    document.documentElement.dataset.theme = theme;
-    localStorage.setItem("theme", theme);
-  }, [theme]);
+    const root = document.documentElement;
+    root.dataset.palette = palette;
+    root.dataset.theme = polarityOf(palette);
+    setStoredPalette(palette);
+  }, [palette]);
 
   // One ListFilter for both the list and search paths. projectFilter "" means
   // "no filter" and is OMITTED — the manager then queries all loaded stores.
@@ -161,12 +235,63 @@ export default function App() {
     setProjectFilter((pf) => (pf && !knownProjects.some((p) => p.id === pf && p.loaded) ? "" : pf));
   }, [knownProjects]);
 
-  // selected resolves to the draft first (D1c); a clicked rail row clears it.
-  const selected = draft ?? items.find((i) => i.id === selectedId) ?? null;
+  const active = activeTab(tabs);
+  // Rail highlight: the active tab's saved item id (a draft has "" → no row).
+  const selectedId = active && active.item.id !== "" ? active.item.id : null;
+
+  // EditorTabs descriptors — primitives only, so a keystroke in one editor (which
+  // re-renders only that editor, not App) never rebuilds this list.
+  const tabDescriptors = useMemo<EditorTabDescriptor[]>(
+    () =>
+      tabs.tabs.map((t) => ({
+        key: t.key,
+        title: itemTabTitle(t.item),
+        pinned: t.item.pinned,
+        dotClass: t.item.kind === "task" ? `dot dot-${t.item.status ?? "todo"}` : undefined,
+        dotTitle: t.item.kind === "task" ? (t.item.status ?? "todo") : undefined,
+        dirty: t.isDirty,
+      })),
+    [tabs],
+  );
 
   async function refreshAll() {
     await Promise.all([loadItems(), loadMeta()]);
   }
+
+  // After a refresh, re-sync each open (non-draft) tab's snapshot from the store
+  // BY ID — never by diffing the filtered `items` list (a filter change would
+  // then falsely "delete" still-open tabs and lose their edits). A rejected
+  // getItem means the item is genuinely gone → close that tab; otherwise refresh
+  // the snapshot so Pin/Archive labels and the tab title track the store, WITHOUT
+  // disturbing the mounted editor's local edit buffer (its re-seed keys on
+  // item.id, which is unchanged, so a dirty tab keeps its in-progress edits).
+  const reconcileTabs = useCallback(async () => {
+    const open = tabsRef.current.tabs.filter((t) => t.item.id !== "");
+    if (open.length === 0) return;
+    const results = await Promise.all(
+      open.map((t) =>
+        api.getItem(t.item.id).then(
+          (item): { key: string; item: Item | null } => ({ key: t.key, item }),
+          (): { key: string; item: Item | null } => ({ key: t.key, item: null }),
+        ),
+      ),
+    );
+    setTabs((s) => {
+      let next = s;
+      for (const r of results) {
+        if (!hasTab(next, r.key)) continue; // closed meanwhile
+        if (r.item) {
+          next = setTabItem(next, r.key, r.item);
+        } else if (!next.tabs.find((t) => t.key === r.key)?.isDirty) {
+          // Genuinely gone → close it. But never silently drop a DIRTY tab on a
+          // (possibly transient) fetch failure — keep its unsaved edits; a real
+          // deletion surfaces when the user next tries to save.
+          next = closeTab(next, r.key);
+        }
+      }
+      return next;
+    });
+  }, []);
 
   // Returns whether the action succeeded so callers (Editor.save) only clear
   // their dirty state on a real persist — a rejected save must stay "Save".
@@ -174,6 +299,7 @@ export default function App() {
     try {
       await action();
       await refreshAll();
+      await reconcileTabs();
       return true;
     } catch (err) {
       showError(String(err));
@@ -181,29 +307,32 @@ export default function App() {
     }
   }
 
+  // Rail click / open-or-activate: open a tab for `id` (looked up in `items` for
+  // its snapshot), or just activate it if already open — openTab keeps an
+  // already-open tab's snapshot and edits, so re-clicking never discards them.
+  function selectRow(id: string) {
+    const item = items.find((i) => i.id === id);
+    if (item) setTabs((s) => openTab(s, itemKey(item), item));
+  }
+
   function openNewDraft(kind: Kind) {
+    const seq = draftSeq + 1;
+    setDraftSeq(seq);
     // Target the rail's project when it names a loaded project; otherwise ""
     // (All projects), so the editor requires an explicit target before Save.
-    setDraft(newDraft(kind, resolveCreateTarget(projectFilter, loaded)));
-    setDraftSeq((s) => s + 1);
-    setSelectedId(null);
+    const draftItem = newDraft(kind, resolveCreateTarget(projectFilter, loaded));
+    setTabs((s) => openTab(s, `draft-${seq}`, draftItem, true)); // a fresh draft starts dirty
   }
 
   function openDuplicateDraft(source: Item) {
-    setDraft(duplicateDraft(source));
-    setDraftSeq((s) => s + 1);
-    setSelectedId(null);
+    const seq = draftSeq + 1;
+    setDraftSeq(seq);
+    setTabs((s) => openTab(s, `draft-${seq}`, duplicateDraft(source), true));
   }
 
-  function selectRow(id: string) {
-    setDraft(null); // a rail click always exits the draft (D1c)
-    setSelectedId(id);
-  }
-
-  async function createFromDraft(input: NewItem): Promise<boolean> {
+  async function createFromDraft(draftKey: string, input: NewItem): Promise<boolean> {
     try {
       const created = await api.createItem(input);
-      setDraft(null);
       setSearch("");
       if (kind !== "all" && kind !== created.kind) setKind("all");
       // Same guard the kind filter gets: if the new item landed in a project the
@@ -211,7 +340,9 @@ export default function App() {
       // selectable (otherwise the just-saved item would vanish from the list).
       if (projectFilter && projectFilter !== created.projectId) setProjectFilter("");
       await refreshAll();
-      setSelectedId(created.id);
+      // Promote the draft tab to the created item's real key so the tab stays
+      // open and its rail row now activates it instead of opening a duplicate.
+      setTabs((s) => promoteTab(s, draftKey, itemKey(created), created));
       return true;
     } catch (err) {
       showError(String(err));
@@ -219,54 +350,118 @@ export default function App() {
     }
   }
 
-  // Unload confirms first when the target owns something open — a Worknotes item
-  // (or draft) OR a prompt open on the Prompts page — since unloading silently
-  // drops it; then evicts and announces. Every unload gets a confirming notice.
+  // Close a tab, dropping its imperative-save handle. Neighbour activation and
+  // empty-state handling live in the pure closeTab reducer.
+  function closeTabByKey(key: string) {
+    setTabs((s) => closeTab(s, key));
+    editorRefs.current.delete(key);
+  }
+
+  // Close × / Delete-key on a tab. A clean tab closes immediately. A dirty tab
+  // prompts first (never window.confirm — the webview suppresses it): a brand-new
+  // draft offers Discard/keep; a saved item offers the three-way Cancel / Discard
+  // / Save, the Save branch persisting via the tab's imperative save() handle so
+  // even a background tab is saved before it closes.
+  function requestCloseTab(key: string) {
+    void (async () => {
+      const tab = tabsRef.current.tabs.find((t) => t.key === key);
+      if (!tab) return;
+      if (tab.isDirty) {
+        const title = itemTabTitle(tab.item);
+        if (tab.item.id === "") {
+          // A scratch draft has no saved version to save back to on close.
+          if (!(await api.confirmDialog(`Discard this unsaved ${tab.item.kind}?`))) return;
+        } else {
+          // api.confirmDialog renders the dialog plugin's ask() — a two-button
+          // Yes/No dialog — so the three-way choice is two chained Yes/No prompts.
+          if (
+            !(await api.confirmDialog(`"${title}" has unsaved changes. Close this tab?`))
+          )
+            return; // No → keep editing
+          if (
+            await api.confirmDialog(
+              `Save your changes to "${title}" before closing? Yes saves and closes; No discards them.`,
+            )
+          ) {
+            const saved = await editorRefs.current.get(key)?.save();
+            if (!saved) return; // save failed → keep the tab open, edits intact
+          }
+        }
+      }
+      closeTabByKey(key);
+    })();
+  }
+
+  function requestDeleteItem(key: string, item: Item) {
+    void (async () => {
+      if (!(await api.confirmDialog(`Delete "${item.title}"? This cannot be undone.`)))
+        return;
+      const ok = await mutate(() => api.deleteItem(item.id));
+      // reconcileTabs (inside mutate) already closes the deleted item's tab; this
+      // is the explicit, immediate close of the tab the user acted on.
+      if (ok) closeTabByKey(key);
+    })();
+  }
+
+  // Unload confirms first when the target owns anything open — Worknotes item
+  // tabs (including background/dirty ones) OR an open prompt on the Prompts page
+  // — since unloading silently drops them; then evicts and announces.
   async function unloadProject(p: ProjectInfo) {
-    const affectsOpenItem = selected != null && selected.projectId === p.id;
-    const affectsOpenPrompt = openPromptProjectId === p.id;
+    const affectedItemTabs = tabs.tabs.filter((t) => t.item.projectId === p.id);
+    const affectsOpenItem = affectedItemTabs.length > 0;
+    const affectsOpenPrompt = openPromptProjectIds.includes(p.id);
     const affectsOpen = affectsOpenItem || affectsOpenPrompt;
-    // "item" when a Worknotes item is open; otherwise the open thing is a prompt.
-    const openLabel = affectsOpenItem ? "item" : "prompt";
-    if (
-      affectsOpen &&
-      !(await api.confirmDialog(
-        `Unloading "${p.name}" will close the ${openLabel} you have open. Continue?`,
-      ))
-    )
-      return;
+    if (affectsOpen) {
+      const parts: string[] = [];
+      if (affectsOpenItem) {
+        const n = affectedItemTabs.length;
+        parts.push(`${n} open item${n === 1 ? "" : "s"}`);
+      }
+      if (affectsOpenPrompt) parts.push("open prompt(s)");
+      const dirtyN = affectedItemTabs.filter((t) => t.isDirty).length;
+      const dirtyWarn = dirtyN > 0 ? ` Unsaved changes in ${dirtyN} of them will be lost.` : "";
+      if (
+        !(await api.confirmDialog(
+          `Unloading "${p.name}" will close ${parts.join(" and ")}.${dirtyWarn} Continue?`,
+        ))
+      )
+        return;
+    }
     const ok = await mutate(() => api.unloadProject(p.id));
     if (ok) {
-      // Clear the Worknotes selection here; PromptsPage clears its own open
-      // prompt when `loaded` drops the project.
       if (affectsOpenItem) {
-        setDraft(null);
-        setSelectedId(null);
+        // Close every item tab of the unloaded project (PromptsPage closes its
+        // own prompt tabs when `loaded` drops the project).
+        setTabs((s) => affectedItemTabs.reduce((acc, t) => closeTab(acc, t.key), s));
+        affectedItemTabs.forEach((t) => editorRefs.current.delete(t.key));
       }
-      if (affectsOpen) {
-        showNotice(`Unloaded "${p.name}" — the open ${openLabel} was closed.`);
-      } else {
-        // Confirm every unload, not only the one that closed something open —
-        // a later unload with nothing open gave no feedback at all otherwise.
-        showNotice(`Unloaded "${p.name}".`);
-      }
+      showNotice(
+        affectsOpen
+          ? `Unloaded "${p.name}" — closed the items/prompts you had open.`
+          : `Unloaded "${p.name}".`,
+      );
     }
   }
 
-  // Reload re-reads a project from its on-disk files (after a git pull/sync).
-  // If an EXISTING item from that project is open in the editor, its file may
-  // have changed underneath — saving stale local edits would silently clobber
-  // the pulled change — so confirm first, then evict it (the user re-opens to
-  // see the fresh content). A new unsaved draft is left alone: it isn't on disk
-  // yet, so a reload can't stale it and it can still be saved. Any file that
-  // couldn't be imported (e.g. unresolved conflict markers) is reported.
+  // Reload re-reads a project from its on-disk files (after a git pull/sync). Any
+  // SAVED item of that project open in a tab may have changed underneath — saving
+  // stale local edits would clobber the pulled change — so confirm, then close
+  // every such tab (the user re-opens to see the fresh content). Drafts of that
+  // project are left alone: they aren't on disk yet, so a reload can't stale them.
   async function reloadProject(p: ProjectInfo) {
-    const affectsOpenItem =
-      draft == null && selected != null && selected.projectId === p.id;
+    const affectedItemTabs = tabs.tabs.filter(
+      (t) => t.item.id !== "" && t.item.projectId === p.id,
+    );
+    const n = affectedItemTabs.length;
+    // Prompts live in the SAME per-project store, which reload tears down and
+    // rebuilds — so an open prompt tab of this project would silently clobber the
+    // freshly-reloaded file on a later save, exactly like an item tab. Confirm for
+    // both, and sweep both.
+    const affectsPrompt = openPromptProjectIds.includes(p.id);
     if (
-      affectsOpenItem &&
+      (n > 0 || affectsPrompt) &&
       !(await api.confirmDialog(
-        `Reloading "${p.name}" re-reads its files from disk and will close the item you have open (any unsaved edits are discarded). Continue?`,
+        `Reloading "${p.name}" re-reads its files from disk and will close the item(s) and/or prompt(s) you have open in it (any unsaved edits are discarded). Continue?`,
       ))
     )
       return;
@@ -275,15 +470,23 @@ export default function App() {
       warnings = await api.reloadProject(p.id);
     });
     if (!ok) return;
-    if (affectsOpenItem) {
-      setSelectedId(null);
-      showNotice(`Reloaded "${p.name}" — the open item was closed so it can reload.`);
+    if (n > 0) {
+      setTabs((s) => affectedItemTabs.reduce((acc, t) => closeTab(acc, t.key), s));
+      affectedItemTabs.forEach((t) => editorRefs.current.delete(t.key));
+    }
+    // Nudge PromptsPage to close its own open prompt tabs of this project.
+    if (affectsPrompt)
+      setPromptReloadSignal((prev) => ({ projectId: p.id, n: (prev?.n ?? 0) + 1 }));
+    if (n > 0 || affectsPrompt) {
+      showNotice(
+        `Reloaded "${p.name}" — closed the item(s)/prompt(s) you had open so they can reload.`,
+      );
     }
     if (warnings.length > 0) {
-      const n = warnings.length;
+      const w = warnings.length;
       // An error (persists — names files the user must fix), not a notice.
       showError(
-        `Reloaded "${p.name}", but ${n} item${n === 1 ? "" : "s"} couldn't be imported:\n` +
+        `Reloaded "${p.name}", but ${w} item${w === 1 ? "" : "s"} couldn't be imported:\n` +
           warnings.join("\n"),
       );
     }
@@ -332,12 +535,23 @@ export default function App() {
           </button>
         </div>
         <span className="meta-spring" />
-        <button
-          className="btn btn-quiet"
-          onClick={() => setTheme((t) => (t === "dark" ? "light" : "dark"))}
+        <select
+          className="select"
+          value={palette}
+          aria-label="Color palette"
+          onChange={(e) => {
+            // Whitelist the value before it becomes state (and then a DOM attr),
+            // per §4.2 — not just the persisted-read gate. Options come only from
+            // PALETTES, so this always passes; it removes the unchecked cast.
+            if (isPaletteId(e.target.value)) setPalette(e.target.value);
+          }}
         >
-          {theme === "dark" ? "Light" : "Dark"}
-        </button>
+          {PALETTES.map((p) => (
+            <option key={p.id} value={p.id}>
+              {p.label}
+            </option>
+          ))}
+        </select>
         <button className="btn btn-quiet" onClick={() => setShowProjects(true)}>
           Manage projects
         </button>
@@ -358,7 +572,7 @@ export default function App() {
       <div className="panes">
         <ItemList
           items={items}
-          selectedId={draft ? null : selectedId}
+          selectedId={selectedId}
           kind={kind}
           search={search}
           tagFilter={tagFilter}
@@ -377,46 +591,57 @@ export default function App() {
           onCreate={openNewDraft}
         />
 
-        {selected ? (
-          <Editor
-            key={draft ? `draft-${draftSeq}` : selected.id}
-            item={selected}
-            isDraft={draft !== null}
-            loaded={loaded}
-            activeTags={activeTags}
-            onSave={(patch: UpdateItem) =>
-              mutate(() => api.updateItem(selected.id, patch))
-            }
-            onCreate={(input) => createFromDraft(input)}
-            onTargetChange={(id) =>
-              setDraft((d) => (d ? { ...d, projectId: id || null } : d))
-            }
-            onDuplicate={() => openDuplicateDraft(selected)}
-            onArchive={(archived) =>
-              void mutate(() => api.updateItem(selected.id, { archived }))
-            }
-            onPin={(pinned) =>
-              void mutate(() => api.updateItem(selected.id, { pinned }))
-            }
-            onDelete={() => {
-              void (async () => {
-                if (
-                  !(await api.confirmDialog(
-                    `Delete "${selected.title}"? This cannot be undone.`,
-                  ))
-                )
-                  return;
-                await mutate(async () => {
-                  await api.deleteItem(selected.id);
-                  setSelectedId(null);
-                });
-              })();
-            }}
-            onError={showError}
-            onResolve={dismissKey}
-          />
+        {tabs.tabs.length > 0 ? (
+          <div className="editor-pane">
+            <EditorTabs
+              tabs={tabDescriptors}
+              activeKey={tabs.activeKey}
+              onActivate={(key) => setTabs((s) => activateTab(s, key))}
+              onClose={requestCloseTab}
+              onNew={() => openNewDraft("note")}
+              listLabel="Open items"
+              newLabel="Open another item"
+            />
+            {tabs.tabs.map((t) => {
+              const isDraft = t.item.id === "";
+              return (
+                <Editor
+                  key={t.key}
+                  ref={(h) => {
+                    if (h) editorRefs.current.set(t.key, h);
+                    else editorRefs.current.delete(t.key);
+                  }}
+                  tabKey={t.key}
+                  hidden={t.key !== tabs.activeKey}
+                  active={page === "worknotes" && t.key === tabs.activeKey}
+                  item={t.item}
+                  isDraft={isDraft}
+                  loaded={loaded}
+                  activeTags={activeTags}
+                  onDirtyChange={(dirty) => setTabs((s) => setDirty(s, t.key, dirty))}
+                  onSave={(patch: UpdateItem) =>
+                    mutate(() => api.updateItem(t.item.id, patch))
+                  }
+                  onCreate={(input) => createFromDraft(t.key, input)}
+                  onTargetChange={(id) =>
+                    setTabs((s) => setTabItem(s, t.key, { ...t.item, projectId: id || null }))
+                  }
+                  onDuplicate={() => openDuplicateDraft(t.item)}
+                  onArchive={(archived) =>
+                    void mutate(() => api.updateItem(t.item.id, { archived }))
+                  }
+                  onPin={(pinned) =>
+                    void mutate(() => api.updateItem(t.item.id, { pinned }))
+                  }
+                  onDelete={() => requestDeleteItem(t.key, t.item)}
+                  onError={showError}
+                  onResolve={dismissKey}
+                />
+              );
+            })}
+          </div>
         ) : (
-          <section className="editor editor-empty">
+          <section className="editor editor-empty" tabIndex={-1} ref={emptyEditorRef}>
             <p>
               {loaded.length === 0
                 ? "No projects loaded — open or create one to start."
@@ -436,10 +661,12 @@ export default function App() {
       >
         <PromptsPage
           loaded={loaded}
+          pageActive={page === "prompts"}
+          reloadSignal={promptReloadSignal}
           onProjectsChanged={() => void loadMeta()}
           onError={showError}
           onResolve={dismissKey}
-          onOpenPromptChange={setOpenPromptProjectId}
+          onOpenPromptsChange={setOpenPromptProjectIds}
         />
       </div>
 

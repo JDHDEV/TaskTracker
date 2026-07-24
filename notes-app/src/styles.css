@@ -4,8 +4,10 @@
    dev tool annotates things. Signature element: the highlighter yellow,
    reserved for AI review moments and the active-row mark. */
 :root {
-  /* Neutral palette — light is the default; the dark theme swaps only these
-     (plus the window surround below). See [data-theme="dark"]. */
+  /* Neutral palette — these are the Original (light) values and the fallback
+     before <html data-palette> is set. Each palette re-themes these (see the
+     :root[data-palette=…] blocks below); the legacy [data-theme="dark"] block is
+     a specificity-losing fallback the palette blocks always override. */
   --bg: #f1f0ec;
   --surface: #fbfaf8;
   --ink: #23272a;
@@ -14,7 +16,10 @@
   --surround: #dcdad4;
   --outer: #ccc9c1;
 
-  /* Accents — constant across both themes, never re-themed. */
+  /* Accents — Original palette values. As of Plan 11 --mark*, --danger, and
+     --todo are re-themed per palette (see the :root[data-palette=…] blocks); do
+     NOT treat them as global constants. Only --doing/--done (status dots) and
+     --scrim stay fixed across every palette. */
   --mark: #f6e05e;
   --mark-soft: #fbf3c9;
   --mark-ink: #6b5c0e;
@@ -28,6 +33,12 @@
   --font-meta: "Cascadia Mono", Consolas, ui-monospace, monospace;
 }
 
+/* Legacy neutral-swap for dark polarity. Superseded by the per-palette blocks
+   below: every dark palette (v2-dark/neon-noir/claude-terminal) redeclares all
+   seven neutrals at higher specificity, and data-theme="dark" is never set
+   without one of them, so these values no longer take visible effect. Kept as a
+   specificity-losing fallback (and the [data-theme="dark"] hook still drives the
+   polarity-only calendar-invert rule further down). */
 [data-theme="dark"] {
   --bg: #1d1c1a;
   --surface: #272623;
@@ -36,6 +47,167 @@
   --line: #3a3833;
   --surround: #131211;
   --outer: #3a3833;
+}
+
+/* Palettes (Plan 11). Two orthogonal axes on <html>, set atomically by App:
+   `data-theme` = polarity (light/dark — keeps the legacy [data-theme="dark"]
+   rules working, e.g. the calendar-invert below), `data-palette` = the accent
+   family + neutrals. Each block below is the AUTHORITATIVE full-token source for
+   its palette; the compound `:root[data-palette=…]` selector (specificity 0,2,0)
+   reliably beats the legacy neutral `[data-theme="dark"]` block (0,1,0) whatever
+   the source order. `--doing`/`--done` stay constant; unlike the pre-Plan-11
+   invariant, `--mark*`, `--danger`, and `--todo` now vary per palette (see DESIGN.md).
+   The "original" (light) palette is the base :root above — no block is needed
+   for it, since no `:root[data-palette=…]` selector matches when it is active. */
+
+:root[data-palette="v2-light"] {
+  --bg: #eef0ef;
+  --surface: #ffffff;
+  --ink: #2b2b2b;
+  --muted: #898989;
+  --line: #d9d9d9;
+  --surround: #d9d9d9;
+  --outer: #c6c6c6;
+  --mark: #4dddbc;
+  --mark-soft: #dcf7f0;
+  --mark-ink: #0f5f50;
+  --danger: #ff4d4d;
+  --todo: #898989;
+  --doing: #d9a441;
+  --done: #4c8a64;
+}
+
+:root[data-palette="v2-dark"] {
+  --bg: #161717;
+  --surface: #1f2020;
+  --ink: #e8e8e8;
+  --muted: #898989;
+  --line: #3a3b3b;
+  --surround: #2a2b2b;
+  --outer: #3a3b3b;
+  --mark: #4dddbc;
+  --mark-soft: #14312b; /* dark teal fill (README swatch's #dcf7f0 is a v2-light copy-paste) */
+  --mark-ink: #7ff0d8;
+  --danger: #ff4d4d;
+  --todo: #898989;
+  --doing: #d9a441;
+  --done: #4c8a64;
+}
+
+:root[data-palette="neon-noir"] {
+  --bg: #000000;
+  --surface: #2d2d2d;
+  --ink: #eaeaea;
+  --muted: #8a8a8a;
+  --line: #3a3a3a;
+  --surround: #141414;
+  --outer: #333333;
+  --mark: #2cff05;
+  --mark-soft: #10240a;
+  --mark-ink: #a6ff8f;
+  --danger: #bf00ff;
+  --todo: #8a8a8a;
+  --doing: #d9a441;
+  --done: #4c8a64;
+}
+
+:root[data-palette="claude-terminal"] {
+  --bg: #1a1714;
+  --surface: #262019;
+  --ink: #ede4d3;
+  --muted: #8c8377;
+  --line: #38322a;
+  --surround: #141110;
+  --outer: #332c24;
+  --mark: #d97757;
+  --mark-soft: #3a251d;
+  --mark-ink: #f0b199;
+  --danger: #c0553a;
+  --todo: #8c8377;
+  --doing: #d9a441;
+  --done: #4c8a64;
+}
+
+/* Per-palette overrides. The dark solid-button hexes and the review-badge text
+   colors are literal (they differ per palette, so one shared dark rule can't
+   serve them). The dark `.btn` fill targets ONLY the bare solid-primary buttons:
+   the `:not()` chain excludes every `.btn-*` modifier so `.btn-quiet` (outline),
+   `.btn-danger`, `.btn-save` (accent), `.btn-pinned`, and `.btn-reusable-on`
+   keep their own treatments — the mock's `[data-theme="dark"] .btn` shorthand
+   over-reached and would have recolored all of them (its stated intent was only
+   "so New note/task aren't a light block"). */
+:root[data-palette="v2-dark"]
+  .btn:not(.btn-quiet):not(.btn-danger):not(.btn-save):not(.btn-pinned):not(.btn-reusable-on) {
+  background: #2a2b2b;
+  border-color: var(--line);
+  color: var(--ink);
+}
+:root[data-palette="v2-dark"]
+  .btn:not(.btn-quiet):not(.btn-danger):not(.btn-save):not(.btn-pinned):not(.btn-reusable-on):hover:not(:disabled) {
+  background: #333434;
+  opacity: 1;
+}
+:root[data-palette="neon-noir"]
+  .btn:not(.btn-quiet):not(.btn-danger):not(.btn-save):not(.btn-pinned):not(.btn-reusable-on) {
+  background: #333434;
+  border-color: var(--line);
+  color: var(--ink);
+}
+:root[data-palette="neon-noir"]
+  .btn:not(.btn-quiet):not(.btn-danger):not(.btn-save):not(.btn-pinned):not(.btn-reusable-on):hover:not(:disabled) {
+  background: #3f4040;
+  opacity: 1;
+}
+:root[data-palette="claude-terminal"]
+  .btn:not(.btn-quiet):not(.btn-danger):not(.btn-save):not(.btn-pinned):not(.btn-reusable-on) {
+  background: #332b23;
+  border-color: var(--line);
+  color: var(--ink);
+}
+:root[data-palette="claude-terminal"]
+  .btn:not(.btn-quiet):not(.btn-danger):not(.btn-save):not(.btn-pinned):not(.btn-reusable-on):hover:not(:disabled) {
+  background: #3f352b;
+  opacity: 1;
+}
+
+/* Review "Proposed rewrite" badge: the base uses var(--mark-ink), correct on
+   Original & v2-light; the three dark palettes need literal dark text for
+   contrast on their brighter accent fill. */
+:root[data-palette="v2-dark"] .review-mark {
+  color: #063a30;
+}
+:root[data-palette="neon-noir"] .review-mark {
+  color: #06210a;
+}
+:root[data-palette="claude-terminal"] .review-mark {
+  color: #3a1c10;
+}
+
+/* Tab close-button hover: the base `.etab-x:hover` puts var(--mark-ink) text on a
+   var(--mark) fill, but in the dark palettes --mark-ink is a LIGHT tone (chosen
+   for dark neutrals), so the × would be near-invisible on the accent. Use the
+   same literal dark text as the review badge above. */
+:root[data-palette="v2-dark"] .etab-x:hover {
+  color: #063a30;
+}
+:root[data-palette="neon-noir"] .etab-x:hover {
+  color: #06210a;
+}
+:root[data-palette="claude-terminal"] .etab-x:hover {
+  color: #3a1c10;
+}
+
+/* Change 5 — soften the New note/New task/New prompt create buttons on v2-light
+   only, from solid ink to a surface fill. Scoped to `.rail-actions .btn` and to
+   v2-light so it never leaks into Original's solid-ink create buttons. */
+:root[data-palette="v2-light"] .rail-actions .btn {
+  background: var(--surface);
+  border-color: var(--line);
+  color: var(--ink);
+}
+:root[data-palette="v2-light"] .rail-actions .btn:hover:not(:disabled) {
+  background: var(--bg);
+  opacity: 1;
 }
 
 * {
@@ -189,7 +361,12 @@ textarea {
   flex: 1;
   min-height: 0;
   display: grid;
-  grid-template-columns: 300px 1fr;
+  /* minmax(0, 1fr), not the default 1fr (= minmax(auto, 1fr)): the `auto` minimum
+     would let wide content in the editor column — the open-item tab strip, whose
+     tabs are `white-space: nowrap` — expand the whole column (and the app window)
+     instead of letting `.editor-tabs` scroll. Capping the track at 0 keeps the
+     column to the available width so the strip's `overflow-x: auto` engages. */
+  grid-template-columns: 300px minmax(0, 1fr);
 }
 
 /* Left rail */
@@ -204,7 +381,7 @@ textarea {
 .rail-actions {
   display: flex;
   gap: 8px;
-  padding: 12px 12px 0;
+  padding: 12px 12px 12px;
 }
 
 .search {
@@ -385,8 +562,19 @@ textarea {
   display: flex;
   flex-direction: column;
   min-height: 0;
+  /* flex:1 so the active editor fills the space below the tab strip when it is a
+     flex child of .editor-pane; harmless (ignored) when it is a bare grid child
+     of .panes (the empty-state / single placeholder case). */
+  flex: 1;
   padding: 18px 22px;
   gap: 12px;
+}
+
+/* Non-active tabs stay mounted (preserving their edit buffer + in-flight stream)
+   but hidden. `.editor` is display:flex, which would otherwise win over the bare
+   `hidden` attribute, so hide it explicitly — mirrors `.page-body[hidden]`. */
+.editor[hidden] {
+  display: none;
 }
 
 .editor-empty {
@@ -394,6 +582,79 @@ textarea {
   justify-content: center;
   color: var(--muted);
 }
+
+/* Column 2 when one or more tabs are open: a flex column holding the single
+   shared tab strip above the stack of mounted-hidden editors. */
+.editor-pane {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  /* Shrink to the grid track (which is capped at minmax(0, 1fr)) rather than to
+     content, so a wide tab strip scrolls inside the pane instead of widening it. */
+  min-width: 0;
+}
+
+/* Open-item tabs: multiple notes/tasks (or prompts) held open at once. Verbatim
+   from the handoff, except the full-bleed is achieved with margin:0 rather than
+   the mock's `-18px -22px 0`: the strip is a sibling ABOVE the padded .editor
+   sections (a direct child of the unpadded .editor-pane), not a child inside a
+   padded .editor, so it already spans the pane. If it were ever moved back
+   inside .editor it would need `margin: -18px -22px 0` to negate that padding. */
+.editor-tabs {
+  display: flex;
+  align-items: flex-end;
+  gap: 4px;
+  margin: 0;
+  padding: 4px 12px 0;
+  border-bottom: 1px solid var(--line);
+  background: var(--bg);
+  overflow-x: auto;
+}
+.etab {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  max-width: 220px;
+  height: 36px;
+  padding: 0 10px 0 14px;
+  border: 1px solid var(--line);
+  border-bottom: none;
+  border-radius: 8px 8px 0 0;
+  border-top: 2px solid transparent;
+  background: var(--surface);
+  color: var(--muted);
+  cursor: pointer;
+  white-space: nowrap;
+}
+.etab:hover { background: var(--bg); color: var(--ink); }
+.etab-on { background: var(--surface); color: var(--ink); border-top-color: var(--mark); margin-bottom: -1px; }
+.etab-title {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 600;
+}
+.etab-unsaved {
+  width: 7px; height: 7px; border-radius: 50%; flex: none;
+  background: var(--mark); border: 1px solid var(--mark-ink);
+}
+.etab-x {
+  display: flex; align-items: center; justify-content: center;
+  width: 20px; height: 20px;
+  border: none; background: var(--line); color: var(--ink);
+  cursor: pointer; font-size: 15px; font-weight: 700; line-height: 1;
+  border-radius: 5px; flex: none;
+}
+.etab-x:hover { background: var(--mark); color: var(--mark-ink); }
+.etab-new {
+  align-self: center; width: 30px; height: 30px; margin-bottom: 6px;
+  border: 1px solid var(--line); border-radius: 7px;
+  background: var(--surface); color: var(--muted);
+  font-size: 17px; line-height: 1; cursor: pointer;
+}
+.etab-new:hover { background: var(--bg); color: var(--ink); }
 
 .editor-head {
   display: flex;
@@ -403,11 +664,11 @@ textarea {
 
 .title {
   flex: 1;
-  padding: 6px 2px;
+  padding: 2px 2px;
   border: none;
   border-bottom: 1px solid transparent;
   background: transparent;
-  font-size: 22px;
+  font-size: 17px;
   font-weight: 650;
 }
 

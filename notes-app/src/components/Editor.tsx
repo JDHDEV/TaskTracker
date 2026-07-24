@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { forwardRef, useEffect, useImperativeHandle, useRef, useState } from "react";
 import type {
   Item,
   NewItem,
@@ -13,15 +13,36 @@ import { getPreferredProvider } from "../lib/aiProvider";
 import { fromDateInputValue, toDateInputValue } from "../lib/dueDate";
 import { resolveTitleForSave } from "../lib/titleForSave";
 import { isRedundantTitle } from "../lib/titleProposal";
+import { tabDomId, tabPanelDomId } from "../lib/openTabs";
 import AiBar from "./AiBar";
 import EditorTags from "./EditorTags";
 import JiraRow from "./JiraRow";
+
+/** Imperative handle: lets the parent persist a background (mounted-hidden,
+ *  non-active) tab from the close-dirty "Save" branch — its buffer lives only in
+ *  this instance's local state and is otherwise unreachable. */
+export interface EditorHandle {
+  save: () => Promise<boolean>;
+}
 
 interface Props {
   item: Item;
   isDraft: boolean;
   loaded: ProjectInfo[];
   activeTags: string[];
+  /** This tab's identity key — derives the tab/panel ARIA ids. */
+  tabKey: string;
+  /** True when this tab is not the active one in its page — the section is
+   *  mounted but display:none (preserving its edit buffer/stream). Distinct from
+   *  `active`, which also requires this page to be the visible one. */
+  hidden: boolean;
+  /** Whether this is the visible, active tab (active tab AND its page visible).
+   *  Gates the window Ctrl+S listener so only ONE editor saves across both the
+   *  N mounted item tabs and the N mounted prompt tabs. */
+  active: boolean;
+  /** Fires on dirty↔clean transitions only (not per keystroke), so the tab strip
+   *  can show the unsaved dot without re-rendering sibling editors. */
+  onDirtyChange: (dirty: boolean) => void;
   onSave: (patch: UpdateItem) => Promise<boolean>;
   onCreate: (input: NewItem) => Promise<boolean>;
   /** Draft only: report the chosen target project up so App's unload-eviction
@@ -43,21 +64,28 @@ interface Props {
 const STATUSES: Status[] = ["todo", "doing", "done"];
 const PRIORITIES: Priority[] = ["low", "normal", "high"];
 
-export default function Editor({
-  item,
-  isDraft,
-  loaded,
-  activeTags,
-  onSave,
-  onCreate,
-  onTargetChange,
-  onDuplicate,
-  onArchive,
-  onPin,
-  onDelete,
-  onError,
-  onResolve,
-}: Props) {
+const Editor = forwardRef<EditorHandle, Props>(function Editor(
+  {
+    item,
+    isDraft,
+    loaded,
+    activeTags,
+    tabKey,
+    hidden,
+    active,
+    onDirtyChange,
+    onSave,
+    onCreate,
+    onTargetChange,
+    onDuplicate,
+    onArchive,
+    onPin,
+    onDelete,
+    onError,
+    onResolve,
+  }: Props,
+  ref,
+) {
   const [title, setTitle] = useState(item.title);
   const [body, setBody] = useState(item.body);
   const [status, setStatus] = useState<Status>(item.status ?? "todo");
@@ -98,6 +126,26 @@ export default function Editor({
   useEffect(() => {
     titleRef.current = title;
   }, [title]);
+
+  // Expose save() so the close-dirty "Save" branch can persist THIS tab even
+  // when it is a background (non-active) tab whose buffer lives only here. No
+  // deps: the factory re-runs each render, so the handle always calls the latest
+  // save closure.
+  useImperativeHandle(ref, () => ({ save: () => save() }));
+
+  // Surface dirty↔clean transitions to the parent tab strip. `dirty` only flips
+  // on real transitions (setDirty(true) on an already-dirty editor is a no-op),
+  // and the ref guard makes this fire ONLY on a change — never per keystroke,
+  // even though onDirtyChange's identity may change each render. Seeded to the
+  // initial value so there is no redundant mount fire (the parent seeds the
+  // tab's dirty bit itself when it opens the tab).
+  const reportedDirty = useRef(dirty);
+  useEffect(() => {
+    if (reportedDirty.current !== dirty) {
+      reportedDirty.current = dirty;
+      onDirtyChange(dirty);
+    }
+  }, [dirty, onDirtyChange]);
 
   // Resolve-on-condition (§5): clear a keyed validation toast the instant its
   // condition is fixed — a project is chosen (#9), or body text exists (#11/#13)
@@ -235,10 +283,14 @@ export default function Editor({
     }
   }
 
-  // Ctrl+S / Cmd+S saves — the identical path, R4 generation included.
+  // Ctrl+S / Cmd+S saves — the identical path, R4 generation included. Gated on
+  // `active`: every open tab keeps a mounted editor (each with this window-level
+  // listener), so without the gate one Ctrl+S would fire N concurrent saves. The
+  // effect re-registers every render (no deps), so `active` is always current.
   useEffect(() => {
     function onKey(e: KeyboardEvent) {
       if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "s") {
+        if (!active) return;
         e.preventDefault();
         void save();
       }
@@ -385,7 +437,13 @@ export default function Editor({
   const cardOpen = proposal !== null || proposedTitle !== null || titlePending;
 
   return (
-    <section className="editor">
+    <section
+      className="editor"
+      role="tabpanel"
+      hidden={hidden}
+      id={tabPanelDomId(tabKey)}
+      aria-labelledby={tabDomId(tabKey)}
+    >
       <header className="editor-head">
         <input
           className="title"
@@ -514,7 +572,23 @@ export default function Editor({
         )}
       </div>
 
+      <textarea
+        className="body"
+        value={body}
+        placeholder="Write here. Select a rework below when it's rough."
+        onChange={(e) => edit(setBody)(e.target.value)}
+      />
+
       <JiraRow url={jiraUrl} onChange={edit(setJiraUrl)} onError={onError} />
+
+      <AiBar
+        busy={aiBusy}
+        dirty={dirty}
+        generatingTitle={generatingTitle}
+        saveBlocked={isDraft && !projectId}
+        onRework={(i, p) => void rework(i, p)}
+        onSave={() => void save()}
+      />
 
       {cardOpen && (
         <div
@@ -579,22 +653,8 @@ export default function Editor({
           </span>
         </div>
       )}
-
-      <textarea
-        className="body"
-        value={body}
-        placeholder="Write here. Select a rework below when it's rough."
-        onChange={(e) => edit(setBody)(e.target.value)}
-      />
-
-      <AiBar
-        busy={aiBusy}
-        dirty={dirty}
-        generatingTitle={generatingTitle}
-        saveBlocked={isDraft && !projectId}
-        onRework={(i, p) => void rework(i, p)}
-        onSave={() => void save()}
-      />
     </section>
   );
-}
+});
+
+export default Editor;
