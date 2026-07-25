@@ -50,6 +50,7 @@ import Editor, { type EditorHandle } from "./components/Editor";
 import EditorTabs, { type EditorTabDescriptor } from "./components/EditorTabs";
 import SettingsDialog from "./components/SettingsDialog";
 import ManageProjectsDialog from "./components/ManageProjectsDialog";
+import AboutDialog from "./components/AboutDialog";
 import PromptsPage from "./components/PromptsPage";
 import Toasts from "./components/Toasts";
 import { useToasts } from "./hooks/useToasts";
@@ -99,6 +100,7 @@ export default function App() {
 
   const [showSettings, setShowSettings] = useState(false);
   const [showProjects, setShowProjects] = useState(false);
+  const [showAbout, setShowAbout] = useState(false);
   // Toasts replace the former single-slot error/notice banners. Errors persist
   // until dismissed/resolved; notices auto-expire at 30s. Resolvable validation
   // toasts are pushed with a stable key and cleared (dismissKey) the instant the
@@ -558,6 +560,9 @@ export default function App() {
         <button className="btn btn-quiet" onClick={() => setShowSettings(true)}>
           Settings
         </button>
+        <button className="btn btn-quiet" onClick={() => setShowAbout(true)}>
+          About
+        </button>
       </header>
 
       <Toasts toasts={toastList} onDismiss={dismissToast} />
@@ -683,6 +688,9 @@ export default function App() {
       )}
       {showSettings && (
         <SettingsDialog onClose={() => setShowSettings(false)} onError={showError} />
+      )}
+      {showAbout && (
+        <AboutDialog onClose={() => setShowAbout(false)} onError={showError} />
       )}
     </div>
   );

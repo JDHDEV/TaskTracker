@@ -402,13 +402,6 @@ const PromptEditor = forwardRef<PromptEditorHandle, Props>(function PromptEditor
         )}
       </div>
 
-      <textarea
-        className="body"
-        value={body}
-        placeholder="Write the prompt text here."
-        onChange={(e) => edit(setBody)(e.target.value)}
-      />
-
       <AiBar
         variant="prompt"
         busy={aiBusy}
@@ -447,6 +440,13 @@ const PromptEditor = forwardRef<PromptEditorHandle, Props>(function PromptEditor
           </span>
         </div>
       )}
+
+      <textarea
+        className="body"
+        value={body}
+        placeholder="Write the prompt text here."
+        onChange={(e) => edit(setBody)(e.target.value)}
+      />
 
       {showHistory && (
         <PromptHistoryDialog

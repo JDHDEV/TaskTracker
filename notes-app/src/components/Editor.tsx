@@ -572,13 +572,6 @@ const Editor = forwardRef<EditorHandle, Props>(function Editor(
         )}
       </div>
 
-      <textarea
-        className="body"
-        value={body}
-        placeholder="Write here. Select a rework below when it's rough."
-        onChange={(e) => edit(setBody)(e.target.value)}
-      />
-
       <JiraRow url={jiraUrl} onChange={edit(setJiraUrl)} onError={onError} />
 
       <AiBar
@@ -653,6 +646,13 @@ const Editor = forwardRef<EditorHandle, Props>(function Editor(
           </span>
         </div>
       )}
+
+      <textarea
+        className="body"
+        value={body}
+        placeholder="Write here. Use a rework when it's rough."
+        onChange={(e) => edit(setBody)(e.target.value)}
+      />
     </section>
   );
 });

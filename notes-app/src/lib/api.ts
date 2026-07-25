@@ -1,4 +1,5 @@
 import { Channel, invoke } from "@tauri-apps/api/core";
+import { getVersion } from "@tauri-apps/api/app";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { ask } from "@tauri-apps/plugin-dialog";
 import { isHttpUrl } from "./jira";
@@ -281,6 +282,13 @@ export async function openExternal(url: string): Promise<void> {
     throw new Error("Refusing to open a non-http(s) URL.");
   }
   await openUrl(url);
+}
+
+// The app version from tauri.conf.json (the same value the OS/installer reports),
+// via the core app plugin. Wrapped here so this non-invoke touchpoint stays
+// greppable like openExternal/copyToClipboard.
+export function getAppVersion(): Promise<string> {
+  return getVersion();
 }
 
 /**
