@@ -310,6 +310,162 @@ async fn delete_files_requires_unload_first_then_removes_store_and_catalog_row()
     assert!(!dir.path().join(".gitignore").exists());
     assert!(mgr.list_projects().await.unwrap().is_empty());
 }
+// ---------------------------------------------------------------------------
+// Rename
+// ---------------------------------------------------------------------------
+
+/// Read a project's own `project_name` marker through a SIDE connection to its
+/// `index.db` (the `pin_prompt_updated_at` idiom): `read_meta` is an inherent
+/// method on the concrete store, not on the trait the manager routes through.
+async fn store_name(project: &ProjectInfo) -> String {
+    let db_path = Path::new(&project.path).join("index.db");
+    let side = SqliteRepository::open_existing(&db_path).await.unwrap();
+    let (_id, name) = side.read_meta().await.unwrap();
+    side.close().await;
+    name
+}
+
+/// The raw git-portable identity file, for asserting on `{id, name}`.
+fn identity_text(project: &ProjectInfo) -> String {
+    std::fs::read_to_string(Path::new(&project.path).join("project.json")).unwrap()
+}
+
+#[tokio::test]
+async fn rename_moves_catalog_store_marker_and_identity_file_together() {
+    // The whole point of the feature: a name lives in THREE places and they must
+    // never drift. Leaving the marker stale is what made an edited project.json
+    // look like it "did not take" — the catalog kept winning.
+    let (mgr, _app) = new_manager().await;
+    let (info, _dir) = create_project(&mgr, "Alpha").await;
+
+    let renamed = mgr.rename(&info.id, "  Renamed  ").await.unwrap();
+
+    assert_eq!(renamed.name, "Renamed", "the name is trimmed, like create_project");
+    assert_eq!(renamed.id, info.id, "rename never mints a new identity");
+    let listed = mgr.list_projects().await.unwrap();
+    assert_eq!(listed[0].name, "Renamed", "the catalog row drives what the UI shows");
+    assert_eq!(store_name(&info).await, "Renamed", "the store's own marker moves too");
+    let identity = identity_text(&info);
+    assert!(identity.contains("\"name\": \"Renamed\""), "project.json carries the new name");
+    assert!(
+        identity.contains(&format!("\"id\": \"{}\"", info.id)),
+        "project.json keeps the ORIGINAL uuid: identity is the id, the name is a label"
+    );
+}
+
+#[tokio::test]
+async fn rename_survives_a_forget_and_reopen() {
+    // The reported bug, as a regression test: renaming then forgetting and
+    // reopening the folder used to resurrect the old name, because the fresh
+    // catalog row was seeded from the store's stale `meta` marker.
+    let (mgr, _app) = new_manager().await;
+    let (info, dir) = create_project(&mgr, "Alpha").await;
+    mgr.rename(&info.id, "Renamed").await.unwrap();
+    mgr.unload(&info.id).await.unwrap();
+    mgr.forget(&info.id).await.unwrap();
+
+    let reopened = mgr.open_project(dir.path().to_str().unwrap()).await.unwrap();
+    assert_eq!(reopened.name, "Renamed", "the rename must outlive the catalog row");
+}
+
+#[tokio::test]
+async fn rename_survives_a_reopen_from_files_alone() {
+    // The move-to-another-machine path: `index.db` is git-ignored and
+    // rebuildable, so a folder that arrives without one resolves its name from
+    // `project.json`. That file has to carry the rename or the old name comes
+    // back on the new machine.
+    let (mgr, _app) = new_manager().await;
+    let (info, dir) = create_project(&mgr, "Alpha").await;
+    mgr.rename(&info.id, "Renamed").await.unwrap();
+    mgr.unload(&info.id).await.unwrap();
+    mgr.forget(&info.id).await.unwrap();
+
+    fs_retry(|| std::fs::remove_file(dir.path().join("index.db")));
+    let _ = std::fs::remove_file(dir.path().join("index.db-wal"));
+    let _ = std::fs::remove_file(dir.path().join("index.db-shm"));
+
+    let reopened = mgr.open_project(dir.path().to_str().unwrap()).await.unwrap();
+    assert_eq!(reopened.name, "Renamed", "project.json is the surviving name source");
+    assert_eq!(reopened.id, info.id, "and the uuid travels with it");
+}
+
+#[tokio::test]
+async fn rename_keeps_every_item_and_prompt_with_the_project() {
+    // Items and prompts are owned by the STORE, not by the name, so a rename is
+    // a pure relabel — nothing is reindexed and nothing is orphaned.
+    let (mgr, _app) = new_manager().await;
+    let (info, _dir) = create_project(&mgr, "Alpha").await;
+    let item = mgr.create(new_item(&info.id, Kind::Note, "keep me")).await.unwrap();
+
+    mgr.rename(&info.id, "Renamed").await.unwrap();
+
+    let listed = mgr
+        .list_all(&ListFilter { project_id: Some(info.id.clone()), ..Default::default() })
+        .await
+        .unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].id, item.id, "the item still belongs to the renamed project");
+}
+
+#[tokio::test]
+async fn rename_to_a_name_another_project_holds_is_refused_and_writes_nothing() {
+    // The catalog's global UNIQUE(name) is checked FIRST, so a clash leaves the
+    // store marker and project.json untouched rather than half-renamed.
+    let (mgr, _app) = new_manager().await;
+    let (a, _dir_a) = create_project(&mgr, "Alpha").await;
+    let (_b, _dir_b) = create_project(&mgr, "Beta").await;
+
+    let err = mgr.rename(&a.id, "Beta").await.unwrap_err();
+    assert!(matches!(err, AppError::Invalid(_)), "a duplicate name must be rejected");
+
+    let listed = mgr.list_projects().await.unwrap();
+    let still_a = listed.iter().find(|p| p.id == a.id).unwrap();
+    assert_eq!(still_a.name, "Alpha", "the catalog row is unchanged");
+    assert_eq!(store_name(&a).await, "Alpha", "the store marker was never touched");
+    assert!(identity_text(&a).contains("\"name\": \"Alpha\""), "project.json was never touched");
+}
+
+#[tokio::test]
+async fn rename_rejects_an_empty_or_whitespace_name() {
+    let (mgr, _app) = new_manager().await;
+    let (info, _dir) = create_project(&mgr, "Alpha").await;
+
+    for blank in ["", "   "] {
+        let err = mgr.rename(&info.id, blank).await.unwrap_err();
+        assert!(matches!(err, AppError::Invalid(_)), "{blank:?} must be rejected");
+    }
+    assert_eq!(mgr.list_projects().await.unwrap()[0].name, "Alpha");
+}
+
+#[tokio::test]
+async fn rename_requires_the_project_to_be_loaded() {
+    // The `meta` write needs the store's open pool; opening a closed store just
+    // to relabel it would re-run the foreign-DB hardening gate and take a lock.
+    let (mgr, _app) = new_manager().await;
+    let (info, _dir) = create_project(&mgr, "Alpha").await;
+    mgr.unload(&info.id).await.unwrap();
+
+    let err = mgr.rename(&info.id, "Renamed").await.unwrap_err();
+    assert!(matches!(err, AppError::Invalid(_)), "renaming an unloaded project is rejected");
+    assert_eq!(mgr.list_projects().await.unwrap()[0].name, "Alpha");
+}
+
+#[tokio::test]
+async fn rename_to_the_same_name_is_a_no_op() {
+    let (mgr, _app) = new_manager().await;
+    let (info, _dir) = create_project(&mgr, "Alpha").await;
+
+    let same = mgr.rename(&info.id, "Alpha").await.unwrap();
+    assert_eq!(same.name, "Alpha", "renaming to the current name is not a UNIQUE clash");
+}
+
+#[tokio::test]
+async fn rename_of_an_unknown_project_is_clean_not_found() {
+    let (mgr, _app) = new_manager().await;
+    let err = mgr.rename("no-such-project", "Renamed").await.unwrap_err();
+    assert!(matches!(err, AppError::NotFound));
+}
+
 
 // ---------------------------------------------------------------------------
 // Routing

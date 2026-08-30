@@ -183,6 +183,19 @@ pub async fn reload_project(state: State<'_, AppState>, id: String) -> Result<Ve
     state.manager.reload(&id).await
 }
 
+/// Rename a project. The catalog row, the store's own `meta` marker, and the
+/// git-portable `project.json` are updated together so no later reopen can
+/// resurrect the old name; the UUID never changes. The project must be loaded,
+/// and the new name must be unique across the catalog.
+#[tauri::command]
+pub async fn rename_project(
+    state: State<'_, AppState>,
+    id: String,
+    name: String,
+) -> Result<ProjectInfo> {
+    state.manager.rename(&id, &name).await
+}
+
 /// Forget a project (removes it from the catalog; files untouched). Must be
 /// unloaded first.
 #[tauri::command]

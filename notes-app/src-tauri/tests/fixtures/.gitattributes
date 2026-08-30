@@ -1,0 +1,5 @@
+# Golden on-disk fixtures: byte-exact copies of the canonical file format as
+# shipped. `-text` disables ALL git line-ending conversion, so `core.autocrlf`
+# can never rewrite these to CRLF on checkout and silently break the
+# byte-identical round-trip assertions in tests/on_disk_compat.rs.
+* -text

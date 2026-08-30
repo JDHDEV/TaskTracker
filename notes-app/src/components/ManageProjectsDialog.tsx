@@ -8,6 +8,7 @@ import {
   loadProject,
   openProject,
   pickProjectFolder,
+  renameProject,
   revealProjectFolder,
 } from "../lib/api";
 
@@ -43,6 +44,10 @@ export default function ManageProjectsDialog({
 }: Props) {
   const [newName, setNewName] = useState("");
   const [busy, setBusy] = useState(false);
+  // Inline rename: which row is in edit mode, plus its draft name. Local state —
+  // App re-fetches the catalog through onChanged() once the rename lands.
+  const [renamingId, setRenamingId] = useState<string | null>(null);
+  const [renameValue, setRenameValue] = useState("");
 
   // Resolve-on-condition (§5): clear the keyed "Enter a project name first."
   // toast (#24) the instant a name is typed.
@@ -108,6 +113,23 @@ export default function ManageProjectsDialog({
     }, null);
   }
 
+  function startRename(p: ProjectInfo) {
+    setRenamingId(p.id);
+    setRenameValue(p.name);
+  }
+
+  // Clears edit mode SYNCHRONOUSLY, before the await, so the input's
+  // blur-cancel cannot fire a second time against an in-flight rename.
+  function commitRename(p: ProjectInfo) {
+    const name = renameValue.trim();
+    setRenamingId(null);
+    if (!name || name === p.name) return; // empty or unchanged: nothing to send
+    void withBusy(async () => {
+      await renameProject(p.id, name);
+      onChanged();
+    }, null);
+  }
+
   function handleForget(p: ProjectInfo) {
     void withBusy(async () => {
       await forgetProject(p.id);
@@ -162,7 +184,28 @@ export default function ManageProjectsDialog({
             return (
               <li key={p.id} className="project-row">
                 <div className="project-ident">
-                  <span className="project-name-text">{p.name}</span>
+                  {renamingId === p.id ? (
+                    <input
+                      className="project-rename-input"
+                      autoFocus
+                      value={renameValue}
+                      disabled={busy}
+                      aria-label={`New name for ${p.name}`}
+                      onChange={(e) => setRenameValue(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter") {
+                          e.preventDefault();
+                          commitRename(p);
+                        } else if (e.key === "Escape") {
+                          e.preventDefault();
+                          setRenamingId(null);
+                        }
+                      }}
+                      onBlur={() => setRenamingId(null)}
+                    />
+                  ) : (
+                    <span className="project-name-text">{p.name}</span>
+                  )}
                   <span className="project-path" title={p.path}>
                     {p.path}
                   </span>
@@ -187,6 +230,19 @@ export default function ManageProjectsDialog({
                     onClick={() => handleOpenFolder(p)}
                   >
                     Open folder
+                  </button>
+                  {/* Rename needs the store's open pool to move its `meta`
+                      marker in step with the catalog row and `project.json`, so
+                      it is gated on `loaded` the way Forget is gated on the
+                      inverse. */}
+                  <button
+                    className="btn btn-quiet"
+                    disabled={busy || !p.loaded}
+                    title={p.loaded ? "Rename this project" : "Load the project first"}
+                    aria-label={`Rename ${p.name}`}
+                    onClick={() => startRename(p)}
+                  >
+                    Rename
                   </button>
                   {p.loaded ? (
                     <>

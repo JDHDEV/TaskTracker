@@ -72,6 +72,7 @@ pub fn run() {
             commands::load_project,
             commands::unload_project,
             commands::reload_project,
+            commands::rename_project,
             commands::forget_project,
             commands::delete_project_files,
             commands::reveal_project_folder,

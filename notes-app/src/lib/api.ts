@@ -87,6 +87,16 @@ export function reloadProject(id: string): Promise<string[]> {
   return invoke("reload_project", { id });
 }
 
+/**
+ * Rename a project. The backend moves the catalog row, the store's own marker
+ * and the git-portable `project.json` together, so the new name survives a
+ * reopen, a folder move, and a clone. The project must be loaded, and names are
+ * unique across the catalog.
+ */
+export function renameProject(id: string, name: string): Promise<ProjectInfo> {
+  return invoke("rename_project", { id, name });
+}
+
 /** Remove a project from the catalog; its files are left on disk. */
 export function forgetProject(id: string): Promise<void> {
   return invoke("forget_project", { id });

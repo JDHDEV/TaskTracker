@@ -251,6 +251,18 @@ impl SqliteRepository {
         }
     }
 
+    /// Rewrite this store's own `project_name` marker (rename). `project_id` is
+    /// never touched — identity is the UUID, the name is a label. Kept in step
+    /// with the catalog row and `project.json` by `ProjectManager::rename`, so a
+    /// forget-then-reopen cannot resurrect the old name from here.
+    pub async fn set_project_name(&self, name: &str) -> Result<()> {
+        sqlx::query("UPDATE meta SET value = ?1 WHERE key = 'project_name'")
+            .bind(name)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     async fn meta_value(&self, key: &str) -> Result<Option<String>> {
         let value = sqlx::query_scalar::<_, String>("SELECT value FROM meta WHERE key = ?1")
             .bind(key)

@@ -89,6 +89,10 @@ const LEGACY_GITIGNORE: &str = "# worknotes keeps the SQLite store and its WAL s
 /// through `PromptRepository`. Closing either view closes the shared pool.
 struct LoadedProject {
     name: String,
+    /// The concrete store behind the two trait views below. Held so `rename` can
+    /// update the store's own `meta` marker through the SAME open pool — the
+    /// manager is already the one layer that knows the app runs on SQLite.
+    store: Arc<SqliteRepository>,
     repo: Arc<dyn ItemRepository>,
     prompts: Arc<dyn PromptRepository>,
 }
@@ -369,6 +373,45 @@ impl ProjectManager {
             return Err(AppError::NotFound);
         }
         self.catalog.remove(id).await
+    }
+
+    /// Rename a project. The three places a name lives move TOGETHER: the
+    /// catalog row (what the UI shows — `project_info` reads it), the store's own
+    /// `meta` marker, and the git-portable `project.json`. Updating only the
+    /// catalog would let a forget-then-reopen resurrect the old name from the
+    /// index; updating only the files would leave the UI showing the old one.
+    /// The UUID never changes — identity is the id, the name is a label, so
+    /// every item and prompt keeps its owner.
+    ///
+    /// Requires the project to be LOADED: the `meta` write needs its open pool,
+    /// and opening a closed store just to rename would re-run the foreign-DB
+    /// hardening gate and take a file lock (the same reason `project_info` never
+    /// opens an unloaded store merely to count it).
+    pub async fn rename(&self, id: &str, name: &str) -> Result<ProjectInfo> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err(AppError::Invalid("project name must not be empty".into()));
+        }
+        let row = self.catalog.get(id).await?.ok_or(AppError::NotFound)?;
+        if row.name == name {
+            return self.project_info(id).await; // no-op: nothing to write
+        }
+        let store = self
+            .loaded_store(id)
+            .ok_or_else(|| AppError::Invalid("load the project before renaming it".into()))?;
+
+        // Catalog FIRST: it owns the global UNIQUE(name), so a clash is rejected
+        // while nothing on disk has been touched yet.
+        self.catalog.set_name(id, name).await?;
+        store.set_project_name(name).await?;
+        write_identity_file(Path::new(&row.path), id, name);
+        {
+            let mut loaded = self.loaded.write().unwrap();
+            if let Some(lp) = loaded.get_mut(id) {
+                lp.name = name.to_string();
+            }
+        }
+        self.project_info(id).await
     }
 
     /// Destructive: delete the project's store files (DB + WAL sidecars + the
@@ -793,6 +836,12 @@ impl ProjectManager {
             .map(|lp| (lp.repo.clone(), lp.prompts.clone()))
     }
 
+    /// The concrete store for a loaded project, for the manager-level operations
+    /// that must reach past the trait views (rename's `meta` write).
+    fn loaded_store(&self, id: &str) -> Option<Arc<SqliteRepository>> {
+        self.loaded.read().unwrap().get(id).map(|lp| lp.store.clone())
+    }
+
     /// Snapshot every loaded (id, prompt repo) so the lock is released before any
     /// `.await` (mirrors `snapshot`).
     fn prompt_snapshot(&self) -> Vec<(String, Arc<dyn PromptRepository>)> {
@@ -896,18 +945,25 @@ fn read_identity(dir: &Path) -> Option<(String, String)> {
     }
 }
 
-/// Write the identity file only when absent — its content is stable in v1
-/// (projects are not renamed), so this never rewrites a committed file and never
-/// clobbers one carried in by a clone.
+/// Write the identity file only when absent, so a load never rewrites a
+/// committed file and never clobbers one carried in by a clone. A deliberate
+/// rename goes through `write_identity_file` instead.
 fn ensure_identity_file(dir: &Path, id: &str, name: &str) {
-    let path = dir.join(IDENTITY_FILE);
-    if path.exists() {
+    if dir.join(IDENTITY_FILE).exists() {
         return;
     }
+    write_identity_file(dir, id, name);
+}
+
+/// Write (or OVERWRITE) the git-portable identity. Only `rename` overwrites:
+/// `project.json` is what a clone — or this folder after its rebuildable
+/// `index.db` is deleted — reads the name back from, so leaving it stale would
+/// resurrect the old name on the next fresh open.
+fn write_identity_file(dir: &Path, id: &str, name: &str) {
     if let Ok(json) =
         serde_json::to_string_pretty(&ProjectIdentity { id: id.to_string(), name: name.to_string() })
     {
-        let _ = std::fs::write(&path, json);
+        let _ = std::fs::write(dir.join(IDENTITY_FILE), json);
     }
 }
 
@@ -988,7 +1044,7 @@ async fn open_store(
 /// `Arc<SqliteRepository>` coerces to each trait object at the field assignment.
 fn loaded_project(name: String, repo: SqliteRepository) -> LoadedProject {
     let repo = Arc::new(repo);
-    LoadedProject { name, repo: repo.clone(), prompts: repo }
+    LoadedProject { name, store: repo.clone(), repo: repo.clone(), prompts: repo }
 }
 
 /// One-time conversion of a directory that has DB rows but no canonical files

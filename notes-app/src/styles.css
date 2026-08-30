@@ -1286,6 +1286,20 @@ textarea {
   white-space: nowrap;
 }
 
+/* Inline rename editor. Borrows the create field's look but sizes to the name
+   column: `.project-name`'s 220px floor would overflow `.project-ident`, which
+   is tighter now that a loaded row carries the extra Rename button. */
+.project-rename-input {
+  width: 100%;
+  min-width: 0;
+  padding: 4px 8px;
+  font-weight: 600;
+  color: inherit;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--bg);
+}
+
 .project-path {
   font-family: var(--font-meta);
   font-size: 11px;

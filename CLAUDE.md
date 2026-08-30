@@ -24,6 +24,7 @@ Stack: Tauri 2 shell · React 19 + TypeScript (Vite) · Rust core · SQLite via 
 - Tag vocabulary is DERIVED, never stored: a tag exists while ≥1 non-archived item that is not a done task carries it. Do not add a tags table.
 - Projects are id-referenced entities (rename-safe). Deleting a project that still has items assigned must fail in the repository with a clear error — the disabled UI button is not the enforcement.
 - Empty string clears optional text fields over IPC (`dueAt`, and once added `jiraUrl`); omitted fields mean "unchanged".
+- **On-disk data is backward compatible, always.** Every build must open any project directory and `catalog.db` written by an earlier build, with no data loss and no manual step. The canonical files (`project.json`, `items/<uuid>.md`, `prompts/**`) and the catalog are the compatibility surface; `index.db` is not (it is rebuilt from the files). Full rules — additive-only frontmatter, no new list-shaped fields, never edit an applied migration — in `notes-app/CLAUDE.md` § "On-disk backward compatibility". Read it before any change to `store/`, `models.rs`, `migrations/`, or `migrations_catalog/`.
 
 ## Conventions
 - IPC DTOs are serde camelCase. `src/types.ts` mirrors `src-tauri/src/models.rs` — change both or neither.

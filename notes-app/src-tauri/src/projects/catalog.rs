@@ -152,6 +152,20 @@ impl Catalog {
         Ok(())
     }
 
+    /// Rename a project. `name` is globally UNIQUE here (the per-project stores
+    /// cannot see across files), so a clash maps to the same clean message
+    /// `insert` produces rather than a raw SQLite error. The id never moves:
+    /// identity is the UUID, the name is a label.
+    pub async fn set_name(&self, id: &str, name: &str) -> Result<()> {
+        sqlx::query("UPDATE projects SET name = ?1 WHERE id = ?2")
+            .bind(name)
+            .bind(id)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| map_unique(e, name))?;
+        Ok(())
+    }
+
     /// Flip the loaded flag; stamp `last_opened` when (re)loading.
     pub async fn set_loaded(&self, id: &str, loaded: bool) -> Result<()> {
         if loaded {
