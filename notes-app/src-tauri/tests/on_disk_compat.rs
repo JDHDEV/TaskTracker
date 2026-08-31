@@ -3,7 +3,10 @@
 //!
 //! `tests/fixtures/v1_0_0/` holds byte-exact copies of the canonical store as
 //! shipped today - `items/<uuid>.md` plus `prompts/<prompt-uuid>/{prompt.md,
-//! <version-uuid>.md}`. Every future build must still read them.
+//! <version-uuid>.md}`, and the root-level scratch pad `scratch.md` (Plan 13).
+//! The pad lives under `v1_0_0/` deliberately: the directory names a
+//! file-format generation, and the scratch pad introduced no new one. Every
+//! future build must still read them.
 //!
 //! This is deliberately NOT what `export_import.rs` does. That file round-trips
 //! items the CURRENT code serialized, so it follows the format wherever it moves
@@ -24,6 +27,9 @@ use std::path::{Path, PathBuf};
 use notes_app_lib::models::{Item, Kind, Priority, Status};
 use notes_app_lib::store::itemfile;
 use notes_app_lib::store::promptfile;
+use notes_app_lib::store::scratchfile;
+
+use tempfile::tempdir;
 
 const NOTE_ID: &str = "11111111-1111-1111-1111-111111111111";
 const TASK_ID: &str = "22222222-2222-2222-2222-222222222222";
@@ -89,6 +95,33 @@ fn fixture_files_are_lf_only() {
             path.display()
         );
     }
+}
+
+#[test]
+fn v1_0_0_scratch_fixture_reads_back_byte_identical() {
+    // scratch.md carries no schema-version marker (D11: this feature never
+    // bumps `CURRENT_SCHEMA_VERSION`), so unlike the item/prompt goldens above
+    // there is no parse/reserialize step to pin — the whole contract is that
+    // `scratchfile::read` returns the file byte-for-byte, verbatim.
+    let fixture_path = fixtures().join("scratch.md");
+    let fixture_bytes = std::fs::read_to_string(&fixture_path)
+        .unwrap_or_else(|e| panic!("fixture {} unreadable: {e}", fixture_path.display()));
+
+    // Guards against a future "normalise on read" change silently passing: the
+    // fixture must genuinely have no trailing newline and genuinely contain a
+    // non-ASCII character, or these two assertions would be vacuous.
+    assert!(!fixture_bytes.ends_with('\n'), "fixture must genuinely have no trailing newline");
+    assert!(!fixture_bytes.is_ascii(), "fixture must genuinely contain a non-ASCII character");
+
+    let dir = tempdir().unwrap();
+    std::fs::copy(&fixture_path, dir.path().join("scratch.md")).unwrap();
+
+    let read_back = scratchfile::read(dir.path()).unwrap();
+    assert_eq!(
+        read_back, fixture_bytes,
+        "scratch.md must read back byte-identical to the v1.0.0 golden — no newline \
+         normalisation, no trailing newline added, ever"
+    );
 }
 
 #[test]

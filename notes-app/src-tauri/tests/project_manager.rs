@@ -111,7 +111,7 @@ fn canonical_string(p: &Path) -> String {
 /// file), so each transfer tolerates a missing/vanished source. The canonical
 /// `items/` tree rounds out a full copy.
 const STORE_ENTRIES: &[&str] =
-    &["project.json", "index.db", "index.db-wal", "index.db-shm", ".gitignore"];
+    &["project.json", "index.db", "index.db-wal", "index.db-shm", ".gitignore", "scratch.md"];
 
 /// Copy a whole Stage-2 project directory (a project IS a directory) into
 /// another — used by the copy/move reconciliation tests.
@@ -296,6 +296,10 @@ async fn delete_files_requires_unload_first_then_removes_store_and_catalog_row()
     let (mgr, _app) = new_manager().await;
     let (info, dir) = create_project(&mgr, "Alpha").await;
     assert!(dir.path().join(".gitignore").exists(), "create_project generates a .gitignore");
+    // Plan 13 §4 H3/M4: the scratch pad and its leftover temp file have no
+    // umbrella directory, so the sweep must name them explicitly.
+    mgr.set_scratch(&info.id, "will be swept by delete_files").await.unwrap();
+    std::fs::write(dir.path().join(".scratch.md.tmp"), "leftover tmp from a crashed save").unwrap();
 
     let err = mgr.delete_files(&info.id).await.unwrap_err();
     assert!(matches!(err, AppError::Invalid(_)), "delete_files while loaded must be rejected");
@@ -308,6 +312,8 @@ async fn delete_files_requires_unload_first_then_removes_store_and_catalog_row()
     assert!(!dir.path().join("index.db-shm").exists());
     assert!(!dir.path().join("items").exists(), "delete_files removes the canonical items/ dir");
     assert!(!dir.path().join(".gitignore").exists());
+    assert!(!dir.path().join("scratch.md").exists(), "delete_files must remove scratch.md");
+    assert!(!dir.path().join(".scratch.md.tmp").exists(), "delete_files must remove the leftover scratch tmp file");
     assert!(mgr.list_projects().await.unwrap().is_empty());
 }
 // ---------------------------------------------------------------------------
@@ -2362,4 +2368,288 @@ fn capabilities_default_grants_no_opener_path_or_reveal_permission() {
              OS-open surface that can execute a file or reveal an unscoped path (plan.8 §4 H1)"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Scratch pad (Plan 13)
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn get_scratch_on_a_freshly_created_project_is_empty_and_creates_no_file() {
+    let (mgr, _app) = new_manager().await;
+    let (info, dir) = create_project(&mgr, "Alpha").await;
+
+    assert_eq!(mgr.get_scratch(&info.id).await.unwrap(), "");
+    assert!(!dir.path().join("scratch.md").exists(), "a read-only get must never create the file");
+}
+
+#[tokio::test]
+async fn set_scratch_then_get_scratch_round_trips_and_writes_scratch_md_at_the_project_root() {
+    let (mgr, _app) = new_manager().await;
+    let (info, dir) = create_project(&mgr, "Alpha").await;
+
+    mgr.set_scratch(&info.id, "quick capture\nsecond line").await.unwrap();
+
+    assert_eq!(mgr.get_scratch(&info.id).await.unwrap(), "quick capture\nsecond line");
+    let path = dir.path().join("scratch.md");
+    assert!(path.exists(), "scratch.md must live at the project root");
+    assert!(!dir.path().join("items").join("scratch.md").exists(), "never written inside items/");
+    let bytes = std::fs::read(&path).unwrap();
+    assert_eq!(bytes, b"quick capture\nsecond line", "bytes on disk must equal the body exactly");
+}
+
+#[tokio::test]
+async fn get_scratch_and_set_scratch_on_an_unloaded_project_are_rejected_as_invalid() {
+    let (mgr, _app) = new_manager().await;
+    let (info, dir) = create_project(&mgr, "Alpha").await;
+    mgr.set_scratch(&info.id, "before unload").await.unwrap();
+    mgr.unload(&info.id).await.unwrap();
+
+    match mgr.get_scratch(&info.id).await.unwrap_err() {
+        AppError::Invalid(msg) => assert!(msg.contains("isn't loaded"), "got: {msg}"),
+        other => panic!("expected Invalid(\"...isn't loaded...\"), got {other:?}"),
+    }
+    match mgr.set_scratch(&info.id, "after unload").await.unwrap_err() {
+        AppError::Invalid(msg) => assert!(msg.contains("isn't loaded"), "got: {msg}"),
+        other => panic!("expected Invalid(\"...isn't loaded...\"), got {other:?}"),
+    }
+
+    let on_disk = std::fs::read_to_string(dir.path().join("scratch.md")).unwrap();
+    assert_eq!(on_disk, "before unload", "a rejected write on an unloaded project must not touch the file");
+}
+
+#[tokio::test]
+async fn get_scratch_and_set_scratch_of_an_unknown_project_id_are_rejected_cleanly_never_panic() {
+    // Naming deviation from the plan's proposed
+    // `get_scratch_and_set_scratch_of_an_unknown_project_id_are_clean_not_found`:
+    // both methods (`projects/mod.rs` ~453/468) check `is_loaded` FIRST, and an
+    // unknown id is trivially "not loaded" — so the ACTUAL behaviour is a clean
+    // `AppError::Invalid("that project isn't loaded")`, never `AppError::NotFound`.
+    // This test pins the real behaviour under a name that says so.
+    let (mgr, _app) = new_manager().await;
+
+    match mgr.get_scratch("does-not-exist").await.unwrap_err() {
+        AppError::Invalid(msg) => assert!(msg.contains("isn't loaded"), "got: {msg}"),
+        other => panic!("expected a clean Invalid(\"...isn't loaded...\"), got {other:?}"),
+    }
+    match mgr.set_scratch("does-not-exist", "x").await.unwrap_err() {
+        AppError::Invalid(msg) => assert!(msg.contains("isn't loaded"), "got: {msg}"),
+        other => panic!("expected a clean Invalid(\"...isn't loaded...\"), got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn set_scratch_rejects_an_oversized_body_and_leaves_prior_content_untouched() {
+    let (mgr, _app) = new_manager().await;
+    let (info, _dir) = create_project(&mgr, "Alpha").await;
+    mgr.set_scratch(&info.id, "the prior content").await.unwrap();
+
+    let oversized = "a".repeat(4 * 1024 * 1024 + 1);
+    match mgr.set_scratch(&info.id, &oversized).await.unwrap_err() {
+        AppError::Invalid(msg) => assert!(msg.contains("too large to save"), "got: {msg}"),
+        other => panic!("expected Invalid(\"...too large to save...\"), got {other:?}"),
+    }
+
+    assert_eq!(mgr.get_scratch(&info.id).await.unwrap(), "the prior content");
+}
+
+#[tokio::test]
+async fn set_scratch_does_not_bump_any_item_updated_at_or_reorder_the_list() {
+    let (mgr, _app) = new_manager().await;
+    let (info, _dir) = create_project(&mgr, "Alpha").await;
+    mgr.create(new_item(&info.id, Kind::Note, "first")).await.unwrap();
+    mgr.create(new_item(&info.id, Kind::Note, "second")).await.unwrap();
+
+    let before: Vec<(String, String)> = mgr
+        .list_all(&ListFilter::default())
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|i| (i.id, i.updated_at))
+        .collect();
+
+    mgr.set_scratch(&info.id, "unrelated pad content").await.unwrap();
+
+    let after: Vec<(String, String)> = mgr
+        .list_all(&ListFilter::default())
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|i| (i.id, i.updated_at))
+        .collect();
+
+    assert_eq!(before, after, "set_scratch must not touch any item's updated_at or the list order");
+}
+
+#[tokio::test]
+async fn scratch_survives_unload_and_load() {
+    let (mgr, _app) = new_manager().await;
+    let (info, dir) = create_project(&mgr, "Alpha").await;
+    mgr.set_scratch(&info.id, "persisted across unload").await.unwrap();
+
+    mgr.unload(&info.id).await.unwrap();
+    // "Load" here is `open_project` on the same folder — reads from disk, not a
+    // cache; `ProjectManager` caches nothing about scratch content in memory.
+    let reopened = mgr.open_project(dir.path().to_str().unwrap()).await.unwrap();
+
+    assert_eq!(mgr.get_scratch(&reopened.id).await.unwrap(), "persisted across unload");
+}
+
+#[tokio::test]
+async fn reload_project_keeps_scratch_content() {
+    let (mgr, _app) = new_manager().await;
+    let (info, _dir) = create_project(&mgr, "Alpha").await;
+    mgr.set_scratch(&info.id, "still here after reload").await.unwrap();
+
+    mgr.reload(&info.id).await.unwrap();
+
+    assert_eq!(mgr.get_scratch(&info.id).await.unwrap(), "still here after reload");
+}
+
+#[tokio::test]
+async fn rename_project_does_not_touch_scratch_md() {
+    let (mgr, _app) = new_manager().await;
+    let (info, dir) = create_project(&mgr, "Alpha").await;
+    mgr.set_scratch(&info.id, "unrelated to the project's name").await.unwrap();
+    let before = std::fs::read(dir.path().join("scratch.md")).unwrap();
+
+    mgr.rename(&info.id, "Renamed").await.unwrap();
+
+    let after = std::fs::read(dir.path().join("scratch.md")).unwrap();
+    assert_eq!(before, after, "rename must not touch scratch.md's bytes");
+}
+
+#[tokio::test]
+async fn forget_project_leaves_scratch_md_on_disk() {
+    let (mgr, _app) = new_manager().await;
+    let (info, dir) = create_project(&mgr, "Alpha").await;
+    mgr.set_scratch(&info.id, "forget must not touch this").await.unwrap();
+
+    mgr.unload(&info.id).await.unwrap();
+    mgr.forget(&info.id).await.unwrap();
+
+    assert!(dir.path().join("scratch.md").exists(), "forget only drops the catalog row");
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("scratch.md")).unwrap(),
+        "forget must not touch this"
+    );
+}
+
+#[tokio::test]
+async fn scratch_is_isolated_per_project() {
+    let (mgr, _app) = new_manager().await;
+    let (a, _dir_a) = create_project(&mgr, "Alpha").await;
+    let (b, _dir_b) = create_project(&mgr, "Beta").await;
+
+    mgr.set_scratch(&a.id, "alpha's pad").await.unwrap();
+    mgr.set_scratch(&b.id, "beta's pad").await.unwrap();
+
+    assert_eq!(mgr.get_scratch(&a.id).await.unwrap(), "alpha's pad");
+    assert_eq!(mgr.get_scratch(&b.id).await.unwrap(), "beta's pad");
+
+    mgr.set_scratch(&a.id, "alpha's pad, edited").await.unwrap();
+    assert_eq!(mgr.get_scratch(&a.id).await.unwrap(), "alpha's pad, edited");
+    assert_eq!(mgr.get_scratch(&b.id).await.unwrap(), "beta's pad", "editing one pad must not touch the other");
+}
+
+#[tokio::test]
+async fn open_project_on_a_moved_directory_serves_the_moved_scratch() {
+    let (mgr, _app) = new_manager().await;
+    let (info, dir_original) = create_project(&mgr, "Alpha").await;
+    mgr.set_scratch(&info.id, "moved with the project").await.unwrap();
+    mgr.unload(&info.id).await.unwrap();
+
+    let dir_moved = tempdir().unwrap();
+    move_store_files(dir_original.path(), dir_moved.path());
+
+    let reopened = mgr.open_project(dir_moved.path().to_str().unwrap()).await.unwrap();
+    assert_eq!(mgr.get_scratch(&reopened.id).await.unwrap(), "moved with the project");
+}
+
+#[tokio::test]
+async fn opening_a_pre_feature_project_directory_with_no_scratch_md_loads_all_items_and_reads_empty_scratch() {
+    // Models an older-build project directory: it never wrote scratch.md, so
+    // this build must open it with no data loss and an empty pad (the
+    // older-build direction of the compatibility rule).
+    let (mgr, _app) = new_manager().await;
+    let (info, dir) = create_project(&mgr, "Alpha").await;
+    mgr.create(new_item(&info.id, Kind::Note, "pre-existing note")).await.unwrap();
+    mgr.create(new_item(&info.id, Kind::Task, "pre-existing task")).await.unwrap();
+    mgr.unload(&info.id).await.unwrap();
+
+    // Defensive: no build in this test ever wrote scratch.md here, but make the
+    // "no scratch.md" premise explicit and true regardless.
+    let _ = std::fs::remove_file(dir.path().join("scratch.md"));
+
+    let reopened = mgr.open_project(dir.path().to_str().unwrap()).await.unwrap();
+
+    let listed = mgr
+        .list_all(&ListFilter { project_id: Some(reopened.id.clone()), ..Default::default() })
+        .await
+        .unwrap();
+    assert_eq!(listed.len(), 2, "both pre-feature items must still be listed");
+    assert_eq!(mgr.get_scratch(&reopened.id).await.unwrap(), "");
+}
+
+#[tokio::test]
+async fn opening_a_directory_with_a_hand_written_scratch_md_next_to_items_loads_items_with_zero_skips_and_reads_the_scratch(
+) {
+    let (mgr, _app) = new_manager().await;
+    let (info, dir) = create_project(&mgr, "Alpha").await;
+    mgr.create(new_item(&info.id, Kind::Note, "one")).await.unwrap();
+    mgr.create(new_item(&info.id, Kind::Note, "two")).await.unwrap();
+
+    std::fs::write(dir.path().join("scratch.md"), "hand-written, not through the app").unwrap();
+
+    // `open_project` discards its internal scan warnings (`projects/mod.rs`
+    // `let (repo, pid, pname, _warnings) = open_store(...)`), so `reload` — which
+    // runs the identical `items/`-scan path and DOES return its warnings — is
+    // used here as the equivalent "zero skips" probe for a hand-planted root file.
+    let warnings = mgr.reload(&info.id).await.unwrap();
+    assert!(
+        warnings.is_empty(),
+        "a root-level scratch.md must never be treated as a malformed item: {warnings:?}"
+    );
+
+    let listed = mgr.list_all(&ListFilter::default()).await.unwrap();
+    assert_eq!(listed.len(), 2, "item count is unchanged by a hand-written scratch.md");
+    assert_eq!(mgr.get_scratch(&info.id).await.unwrap(), "hand-written, not through the app");
+}
+
+#[tokio::test]
+async fn a_scratch_md_containing_git_conflict_markers_is_returned_verbatim() {
+    // Policy pin (Plan 13 §4 M2): unlike items/prompts, a single always-present
+    // pad has no siblings to protect, so conflict markers are surfaced raw
+    // rather than rejected.
+    let (mgr, _app) = new_manager().await;
+    let (info, dir) = create_project(&mgr, "Alpha").await;
+    let conflicted = "<<<<<<< HEAD\nmine\n=======\ntheirs\n>>>>>>> branch\n";
+    std::fs::write(dir.path().join("scratch.md"), conflicted).unwrap();
+
+    assert_eq!(mgr.get_scratch(&info.id).await.unwrap(), conflicted);
+}
+
+#[tokio::test]
+async fn create_project_rollback_leaves_a_pre_existing_scratch_md_untouched() {
+    // Post-review F1: `remove_store_files` doubles as `create_project`'s
+    // unattended rollback. A folder that is not yet a store may already hold a
+    // user's own `scratch.md` (the pad is created lazily, so the app never wrote
+    // it); a failed create must roll back only what the app created.
+    let (mgr, _app) = new_manager().await;
+    let (_alpha, _alpha_dir) = create_project(&mgr, "Alpha").await;
+
+    let dir = tempdir().unwrap();
+    let mine = "my own notes, written before this folder was a project";
+    std::fs::write(dir.path().join("scratch.md"), mine).unwrap();
+
+    // Same name → the catalog's UNIQUE(name) rejects AFTER the store files were
+    // written, so the rollback path runs.
+    let err = mgr.create_project(dir.path().to_str().unwrap(), "Alpha").await.unwrap_err();
+    assert!(matches!(err, AppError::Invalid(_)), "a duplicate name is rejected: {err:?}");
+    assert!(!dir.path().join("index.db").exists(), "the rollback removed what the app created");
+    assert_eq!(
+        std::fs::read_to_string(dir.path().join("scratch.md")).unwrap(),
+        mine,
+        "the rollback must never delete a scratch.md the app did not create"
+    );
 }

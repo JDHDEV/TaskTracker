@@ -6,3 +6,4 @@
 
 pub mod itemfile;
 pub mod promptfile;
+pub mod scratchfile;

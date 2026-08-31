@@ -242,6 +242,24 @@ pub fn startup_warnings(state: State<'_, AppState>) -> Vec<String> {
     state.manager.startup_warnings()
 }
 
+/// The project's scratch pad (Plan 13): the text of the canonical `scratch.md`
+/// at the project root, `""` when absent. The project must be loaded.
+#[tauri::command]
+pub async fn get_scratch(state: State<'_, AppState>, project_id: String) -> Result<String> {
+    state.manager.get_scratch(&project_id).await
+}
+
+/// Replace the project's scratch pad (an empty body deletes the file). The
+/// project must be loaded; the body is capped server-side at 4 MB.
+#[tauri::command]
+pub async fn set_scratch(
+    state: State<'_, AppState>,
+    project_id: String,
+    body: String,
+) -> Result<()> {
+    state.manager.set_scratch(&project_id, &body).await
+}
+
 /// Show the native folder picker and return the chosen directory path (or `None`
 /// if cancelled). Thin by design: the OS picker is UX only — the returned path
 /// is re-validated server-side in `create_project`/`open_project` before any use.

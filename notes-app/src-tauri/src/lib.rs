@@ -78,6 +78,8 @@ pub fn run() {
             commands::reveal_project_folder,
             commands::pick_project_folder,
             commands::startup_warnings,
+            commands::get_scratch,
+            commands::set_scratch,
             commands::ai_rewrite,
             commands::ai_generate_title,
             commands::ai_rewrite_stream,

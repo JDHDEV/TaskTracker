@@ -20,7 +20,7 @@ use crate::models::{
     Item, Kind, ListFilter, NewItem, NewPrompt, Priority, ProjectInfo, Prompt, PromptListFilter,
     PromptVersion, Sort, Status, UpdateItem, UpdatePrompt,
 };
-use crate::store::itemfile;
+use crate::store::{itemfile, scratchfile};
 
 use catalog::Catalog;
 use paths::validate_project_dir;
@@ -423,6 +423,13 @@ impl ProjectManager {
         }
         let row = self.catalog.get(id).await?.ok_or(AppError::NotFound)?;
         remove_store_files(Path::new(&row.path))?;
+        // The scratch pad and its temp file sit at the root with no umbrella
+        // directory (Plan 13 §4 H3/M4). Swept HERE, not in `remove_store_files`:
+        // that sweep is also `create_project`'s unattended rollback, and a
+        // `scratch.md` the user already had in a not-yet-a-store folder must
+        // never be deleted without the confirm this verb carries. Never held
+        // open by our pool, so no retry.
+        scratchfile::remove(Path::new(&row.path));
         self.catalog.remove(id).await
     }
 
@@ -436,6 +443,45 @@ impl ProjectManager {
     pub async fn project_dir(&self, id: &str) -> Result<PathBuf> {
         let row = self.catalog.get(id).await?.ok_or(AppError::NotFound)?;
         Ok(PathBuf::from(row.path))
+    }
+
+    // --- Scratch pad (Plan 13) ---------------------------------------------
+    //
+    // One canonical `scratch.md` at the project root (`store::scratchfile`).
+    // Both verbs gate on the LOADED set (§4 H1): `project_dir` resolves an
+    // unloaded project's directory too, and the user's model of an unloaded
+    // project is "closed". `is_loaded` is private to this type, so the gate
+    // lives here, not in `commands.rs`. Every failure maps to a fixed generic
+    // message — never a path, a project name, or the `io::Error` (§4 M3, L5).
+
+    /// The pad's text — `""` when the file is absent. Read from disk on every
+    /// call (nothing is cached), so a `git pull` is visible on the next open.
+    pub async fn get_scratch(&self, id: &str) -> Result<String> {
+        if !self.is_loaded(id) {
+            return Err(AppError::Invalid("that project isn't loaded".into()));
+        }
+        let dir = self.project_dir(id).await?;
+        scratchfile::read(&dir).map_err(|e| match e {
+            scratchfile::ScratchFileError::TooLarge => {
+                AppError::Invalid("the scratch pad is too large to open (limit 4 MB)".into())
+            }
+            _ => AppError::Invalid("couldn't read the scratch pad".into()),
+        })
+    }
+
+    /// Replace the pad's text (an empty body deletes the file). Touches no item,
+    /// no prompt, and no index row — `updated_at` and list order are unaffected.
+    pub async fn set_scratch(&self, id: &str, body: &str) -> Result<()> {
+        if !self.is_loaded(id) {
+            return Err(AppError::Invalid("that project isn't loaded".into()));
+        }
+        let dir = self.project_dir(id).await?;
+        scratchfile::write(&dir, body).map_err(|e| match e {
+            scratchfile::ScratchFileError::TooLarge => {
+                AppError::Invalid("the scratch pad is too large to save (limit 4 MB)".into())
+            }
+            _ => AppError::Invalid("couldn't save the scratch pad".into()),
+        })
     }
 
     // --- Item routing -----------------------------------------------------
@@ -1167,6 +1213,9 @@ fn remove_store_files(dir: &Path) -> Result<()> {
     }
     let _ = std::fs::remove_file(dir.join(STAGE1_BACKUP));
     let _ = std::fs::remove_file(dir.join(IDENTITY_FILE));
+    // NOT `scratch.md`: this sweep doubles as `create_project`'s rollback, and
+    // the pad is lazily created, so a pre-existing user file there was never
+    // ours to remove. `delete_files` sweeps the pad itself.
     let _ = remove_dir_retrying(&dir.join(ITEMS_STAGING));
     remove_dir_retrying(&dir.join(ITEMS_DIR)).map_err(|_| locked())?;
     // Sweep the canonical prompt subtree too (plan.7 H3), or destructive
