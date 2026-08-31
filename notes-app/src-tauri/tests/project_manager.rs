@@ -18,11 +18,12 @@ use std::path::Path;
 use notes_app_lib::db::{ItemRepository, SqliteRepository};
 use notes_app_lib::error::AppError;
 use notes_app_lib::models::{
-    Kind, ListFilter, NewItem, NewPrompt, ProjectInfo, PromptListFilter, Status, UpdateItem,
-    UpdatePrompt,
+    Kind, ListFilter, NewItem, NewPrompt, Priority, ProjectInfo, PromptListFilter, Sort, Status,
+    UpdateItem, UpdatePrompt,
 };
 use notes_app_lib::projects::catalog::Catalog;
 use notes_app_lib::projects::ProjectManager;
+use notes_app_lib::store::itemfile;
 use notes_app_lib::store::promptfile;
 
 use tempfile::{tempdir, TempDir};
@@ -775,6 +776,65 @@ async fn list_all_pinned_item_in_one_project_leads_items_in_the_other() {
     assert_eq!(order[0].id, to_pin.id, "pinned item from project B must lead a more-recent item in A");
 }
 
+#[tokio::test]
+async fn list_all_status_sort_merges_doing_testing_todo_done_then_notes_across_two_projects() {
+    // plan.14 D3, integration-level: the four statuses (plus a note) split
+    // across TWO loaded stores, all timestamps forced equal so only
+    // `status_rank` differentiates the order — proves the manager's k-way merge
+    // reproduces the single-DB CASE order end to end, not just at the pure
+    // `k_way_merge` unit-test level (projects::merge_tests).
+    let (mgr, _app) = new_manager().await;
+    let dir_a = tempdir().unwrap();
+    let dir_b = tempdir().unwrap();
+    let ts = "2026-07-14T00:00:00.000+00:00";
+
+    {
+        let repo_a = SqliteRepository::create_at(&dir_a.path().join("project.db"), "proj-a", "Alpha")
+            .await
+            .unwrap();
+        let doing = repo_a
+            .create(NewItem { status: Some(Status::Doing), ..new_item("", Kind::Task, "doing") })
+            .await
+            .unwrap();
+        let done = repo_a
+            .create(NewItem { status: Some(Status::Done), ..new_item("", Kind::Task, "done") })
+            .await
+            .unwrap();
+        repo_a.set_timestamps_for_test(&doing.id, ts, ts).await.unwrap();
+        repo_a.set_timestamps_for_test(&done.id, ts, ts).await.unwrap();
+        repo_a.close().await;
+
+        let repo_b = SqliteRepository::create_at(&dir_b.path().join("project.db"), "proj-b", "Beta")
+            .await
+            .unwrap();
+        let testing = repo_b
+            .create(NewItem { status: Some(Status::Testing), ..new_item("", Kind::Task, "testing") })
+            .await
+            .unwrap();
+        let todo = repo_b
+            .create(NewItem { status: Some(Status::Todo), ..new_item("", Kind::Task, "todo") })
+            .await
+            .unwrap();
+        let note = repo_b.create(new_item("", Kind::Note, "note")).await.unwrap();
+        for id in [&testing.id, &todo.id, &note.id] {
+            repo_b.set_timestamps_for_test(id, ts, ts).await.unwrap();
+        }
+        repo_b.close().await;
+    }
+
+    mgr.open_project(dir_a.path().to_str().unwrap()).await.unwrap();
+    mgr.open_project(dir_b.path().to_str().unwrap()).await.unwrap();
+
+    let order: Vec<String> = mgr
+        .list_all(&ListFilter { sort: Some(Sort::Status), ..Default::default() })
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|i| i.title)
+        .collect();
+    assert_eq!(order, vec!["doing", "testing", "todo", "done", "note"]);
+}
+
 // ---------------------------------------------------------------------------
 // Per-store invariant regression against a SECONDARY loaded project (proves
 // the manager isn't wired only to the first store it loads)
@@ -1114,6 +1174,42 @@ async fn create_project_uses_the_index_and_items_layout_and_writes_an_item_file(
 }
 
 #[tokio::test]
+async fn convert_note_to_task_rewrites_the_canonical_file_and_stamps_project_id() {
+    // plan.14 F7 / D8 step 19's on-disk-shape case: repo.rs covers the
+    // in-memory-DB behavior; this covers what actually lands in items/<id>.md
+    // through the real manager routing (ProjectManager::convert_note_to_task).
+    let (mgr, _app) = new_manager().await;
+    let (info, dir) = create_project(&mgr, "Alpha").await;
+
+    let note = mgr.create(new_item(&info.id, Kind::Note, "note to convert")).await.unwrap();
+    assert_eq!(note.kind, Kind::Note);
+    assert_eq!(note.project_id, Some(info.id.clone()));
+
+    let converted = mgr.convert_note_to_task(&note.id).await.unwrap();
+    assert_eq!(converted.kind, Kind::Task);
+    assert_eq!(converted.status, Some(Status::Todo));
+    assert_eq!(converted.priority, Some(Priority::Normal));
+    assert_eq!(
+        converted.project_id,
+        Some(info.id.clone()),
+        "the manager stamps the owning project onto a converted item, like update()"
+    );
+
+    let file = dir.path().join("items").join(format!("{}.md", note.id));
+    let text = std::fs::read_to_string(&file).unwrap();
+    assert!(text.contains("kind: task"), "canonical file's kind line is rewritten: {text}");
+    assert!(text.contains("status: todo"), "canonical file gains a status line: {text}");
+    assert!(text.contains("priority: normal"), "canonical file gains a priority line: {text}");
+
+    let (parsed, warning) = itemfile::parse(&text).unwrap();
+    assert!(warning.is_none(), "a freshly-converted file must parse with no degrade warning: {warning:?}");
+    assert_eq!(parsed.id, note.id);
+    assert_eq!(parsed.kind, Kind::Task);
+    assert_eq!(parsed.status, Some(Status::Todo));
+    assert_eq!(parsed.priority, Some(Priority::Normal));
+}
+
+#[tokio::test]
 async fn stage1_project_db_is_upgraded_in_place_preserving_every_item() {
     // The real on-disk scenario: a Stage-1 store (project.db, no items/) is
     // opened and converted once — data preserved, original kept as a .bak.
@@ -1403,6 +1499,262 @@ async fn reopen_after_migration_to_0006_keeps_a_created_prompt() {
     assert_eq!(listed.len(), 1, "the prompt created before unload survives the reopen");
     assert_eq!(listed[0].id, prompt.id);
     assert_eq!(listed[0].title, "t");
+}
+
+// ---------------------------------------------------------------------------
+// Migration 0008 (plan.14 D4/D5/S-3): drops the status CHECK via a table
+// rebuild. `index.db` is not a compat surface (it is dropped/rebuilt from the
+// canonical `items/*.md` files on every load), so the real risk isn't losing
+// the FILES — it's a migration that bricks opening, or a wrong/missing
+// recreated trigger that silently desyncs FTS. These tests simulate an
+// EXISTING on-disk store this build has never opened.
+// ---------------------------------------------------------------------------
+
+/// Build a fresh index at `path` with ONLY migrations up to (and including)
+/// version 7 applied — the schema shape every store had before 0008 dropped
+/// the status CHECK — then stamp the `meta` identity rows exactly as
+/// `SqliteRepository::create_at` does. `sqlx::migrate::Migrator`'s fields
+/// (`migrations`, `ignore_missing`, `locking`, `no_tx`) are public precisely so
+/// a caller can build a custom subset like this one.
+async fn build_pre_0008_index(path: &Path, project_id: &str, project_name: &str) {
+    let options = sqlx::sqlite::SqliteConnectOptions::new()
+        .filename(path)
+        .create_if_missing(true)
+        .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+        .foreign_keys(true);
+    let pool =
+        sqlx::sqlite::SqlitePoolOptions::new().max_connections(1).connect_with(options).await.unwrap();
+
+    let full = sqlx::migrate!("./migrations");
+    let truncated_migrations: Vec<sqlx::migrate::Migration> =
+        full.migrations.iter().filter(|m| m.version <= 7).cloned().collect();
+    assert!(
+        full.migrations.iter().any(|m| m.version == 8),
+        "sanity: the full migrator must still carry 0008, or this helper tests nothing"
+    );
+    let truncated = sqlx::migrate::Migrator {
+        migrations: std::borrow::Cow::Owned(truncated_migrations),
+        ..full
+    };
+    truncated.run(&pool).await.unwrap();
+
+    let max_version: i64 =
+        sqlx::query_scalar("SELECT COALESCE(MAX(version), 0) FROM _sqlx_migrations")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(max_version, 7, "sanity: exactly migrations 0001..=0007 must be applied");
+
+    // Stamp identity, mirroring create_at's four-row meta commit.
+    let mut tx = pool.begin().await.unwrap();
+    for (key, value) in [
+        ("project_id", project_id.to_string()),
+        ("project_name", project_name.to_string()),
+        ("schema_version", max_version.to_string()),
+        ("created_at", "2026-07-14T00:00:00.000+00:00".to_string()),
+    ] {
+        sqlx::query("INSERT INTO meta (key, value) VALUES (?1, ?2)")
+            .bind(key)
+            .bind(value)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+    }
+    tx.commit().await.unwrap();
+
+    // Sanity: this really is the pre-0008 shape — the CHECK 0008 drops.
+    let items_sql: String = sqlx::query_scalar("SELECT sql FROM sqlite_master WHERE name = 'items'")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert!(
+        items_sql.contains("status IN"),
+        "sanity: the truncated DB must still carry the old status CHECK: {items_sql}"
+    );
+
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn upgrade_0007_store_applies_0008_and_search_survives() {
+    // S-3, the highest-value migration test. A REAL existing store this build
+    // has never opened: items already on disk as canonical files (pre-0008
+    // vocabulary), but its index.db still at migration level 7. Proves the
+    // upgrade is lossless end to end: the hardening gate doesn't reject the
+    // pre-0008 shape, 0008 applies, every item survives with its status
+    // intact, and FTS search still finds them. The rebuild's explicit
+    // `items_fts rebuild` command could mask a wrong/missing recreated trigger
+    // for these EXISTING items, so a task created AFTER the upgrade — which
+    // depends on the LIVE insert trigger, not the rebuild command — is
+    // exercised too (D4/S-3's actual failure mode).
+    let (mgr, _app) = new_manager().await;
+    let (info, dir) = create_project(&mgr, "Legacy").await;
+
+    let todo = mgr
+        .create(NewItem {
+            status: Some(Status::Todo),
+            ..new_item(&info.id, Kind::Task, "renew the lighthouse permit")
+        })
+        .await
+        .unwrap();
+    let doing = mgr
+        .create(NewItem {
+            status: Some(Status::Doing),
+            ..new_item(&info.id, Kind::Task, "chart the harbor depth")
+        })
+        .await
+        .unwrap();
+    let done = mgr
+        .create(NewItem {
+            status: Some(Status::Done),
+            ..new_item(&info.id, Kind::Task, "paint the buoy marker")
+        })
+        .await
+        .unwrap();
+
+    mgr.unload(&info.id).await.unwrap();
+
+    // Roll the index back to a pre-0008 shape, IN PLACE, on the same directory
+    // — the canonical items/*.md files (the actual compat surface) are never
+    // touched, only the rebuildable index.
+    for suffix in ["", "-wal", "-shm"] {
+        let path = dir.path().join(format!("index.db{suffix}"));
+        fs_retry(|| match std::fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e),
+        });
+    }
+    build_pre_0008_index(&dir.path().join("index.db"), &info.id, &info.name).await;
+
+    // (1) First reopen: the hardening gate (trigger names unchanged since
+    // 0001) passes at level 7, THEN `migrate!` applies 0008, THEN
+    // `rebuild_from_dir` repopulates the index from the untouched files.
+    let (reopened, warnings) = mgr.load(&info.id).await.unwrap();
+    assert_eq!(reopened.id, info.id);
+    assert!(warnings.is_empty(), "a clean upgrade must report no per-file warnings: {warnings:?}");
+
+    let items = mgr
+        .list_all(&ListFilter { project_id: Some(info.id.clone()), ..Default::default() })
+        .await
+        .unwrap();
+    assert_eq!(items.len(), 3, "every pre-0008 item must survive the upgrade");
+    let status_of = |id: &str| items.iter().find(|i| i.id == id).unwrap().status;
+    assert_eq!(status_of(&todo.id), Some(Status::Todo));
+    assert_eq!(status_of(&doing.id), Some(Status::Doing));
+    assert_eq!(status_of(&done.id), Some(Status::Done));
+
+    // FTS must still find each pre-existing item post-upgrade.
+    for word in ["lighthouse", "harbor", "buoy"] {
+        let hits = mgr.search_all(word, &ListFilter::default()).await.unwrap();
+        assert_eq!(hits.len(), 1, "search for {word:?} must find exactly the item that carries it");
+    }
+
+    // A NEW task, in the status this migration exists to add, created AFTER
+    // the upgrade — exercises the LIVE insert trigger.
+    let testing = mgr
+        .create(NewItem {
+            status: Some(Status::Testing),
+            ..new_item(&info.id, Kind::Task, "sea-trial the replacement generator")
+        })
+        .await
+        .unwrap();
+    assert_eq!(mgr.get(&testing.id).await.unwrap().status, Some(Status::Testing));
+    let testing_hits = mgr.search_all("sea-trial", &ListFilter::default()).await.unwrap();
+    assert_eq!(testing_hits.len(), 1, "a post-upgrade item must be searchable via the live insert trigger");
+
+    // (2) Second reopen: the KNOWN_TRIGGERS gate runs BEFORE migrations on
+    // every open, so a wrong-named recreated trigger would pass the FIRST
+    // reopen (0008 hadn't run yet when the gate checked) and only be rejected
+    // as foreign here.
+    mgr.unload(&info.id).await.unwrap();
+    let (second, second_warnings) = mgr.load(&info.id).await.unwrap();
+    assert_eq!(second.id, info.id, "the recreated triggers must not be rejected as a foreign DB");
+    assert!(second_warnings.is_empty());
+
+    let survivors = mgr
+        .list_all(&ListFilter { project_id: Some(info.id.clone()), ..Default::default() })
+        .await
+        .unwrap();
+    assert_eq!(survivors.len(), 4, "all four items — three pre-upgrade plus the post-upgrade one — persist");
+}
+
+#[tokio::test]
+async fn migration_0008_preserves_row_count_and_rowids_on_a_raw_pre_0008_db() {
+    // Stage-1 safety property (D4): `migrate_db_to_files` runs migrations on an
+    // existing project.db BEFORE exporting its rows to files, and the
+    // pre-stage2 backup is taken AFTER migration — a truncating rewrite in
+    // 0008 would silently and unrecoverably empty such a store. This pins the
+    // migration ALONE, applied directly to a DB it did not create, preserving
+    // both row COUNT and each row's rowid (items_fts is keyed on rowid).
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("raw.db");
+    build_pre_0008_index(&path, "raw-project", "Raw").await;
+
+    let insert_options = sqlx::sqlite::SqliteConnectOptions::new()
+        .filename(&path)
+        .create_if_missing(false)
+        .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal);
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(insert_options)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO items (id, kind, title, status, created_at, updated_at) \
+         VALUES ('row-one', 'task', 'First raw row', 'todo', ?1, ?1)",
+    )
+    .bind("2026-07-14T00:00:00.000+00:00")
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO items (id, kind, title, created_at, updated_at) \
+         VALUES ('row-two', 'note', 'Second raw row needle', ?1, ?1)",
+    )
+    .bind("2026-07-14T00:00:00.000+00:00")
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let before: Vec<(i64, String)> = sqlx::query_as("SELECT rowid, id FROM items ORDER BY rowid")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    assert_eq!(before.len(), 2, "sanity: both raw rows landed");
+    pool.close().await;
+
+    // Run the FULL migrator (through 0008) directly over this raw DB.
+    let migrate_options = sqlx::sqlite::SqliteConnectOptions::new()
+        .filename(&path)
+        .create_if_missing(false)
+        .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal);
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(migrate_options)
+        .await
+        .unwrap();
+    sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+
+    let after: Vec<(i64, String)> = sqlx::query_as("SELECT rowid, id FROM items ORDER BY rowid")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    assert_eq!(after.len(), before.len(), "row COUNT must be unchanged by the rebuild — never truncated");
+    assert_eq!(after, before, "each row's (rowid, id) pair must survive the rebuild identically");
+
+    // items_fts must still find a title word, joined back on rowid — proves
+    // the external-content index stayed aligned through the table swap.
+    let hit: Option<(i64,)> = sqlx::query_as(
+        "SELECT i.rowid FROM items i JOIN items_fts ON items_fts.rowid = i.rowid \
+         WHERE items_fts MATCH 'needle'",
+    )
+    .fetch_optional(&pool)
+    .await
+    .unwrap();
+    assert!(hit.is_some(), "items_fts must still find a title word by rowid after the migration");
+
+    pool.close().await;
 }
 
 #[tokio::test]

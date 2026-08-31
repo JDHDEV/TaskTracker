@@ -131,7 +131,12 @@ pub fn serialize(item: &Item) -> String {
 /// import (a note drops any status/priority/due_at; a task defaults them) so a
 /// hand-edited or merged file can never introduce an illegal note+status shape.
 /// `project_id` is always `None` — the store stamps ownership.
-pub fn parse(text: &str) -> Result<Item, ItemFileError> {
+///
+/// The second tuple element is an optional DEGRADATION warning (plan.14 S-2):
+/// the item imported fine but a value was mapped to a default (today: an
+/// unknown task status read as `todo`). `scan` surfaces it per-file so the
+/// degrade is never silent, unlike an `Err`, which skips the whole file.
+pub fn parse(text: &str) -> Result<(Item, Option<String>), ItemFileError> {
     if has_conflict_markers(text) {
         return Err(ItemFileError::ConflictMarkers);
     }
@@ -215,12 +220,19 @@ pub fn parse(text: &str) -> Result<Item, ItemFileError> {
         .ok_or_else(|| ItemFileError::Malformed("missing title".into()))?;
 
     // Kind gate on import (mirrors `SqliteRepository::create`): notes never carry
-    // status/priority/due_at; tasks always do (defaulting like create()).
+    // status/priority/due_at; tasks always do (defaulting like create()). A
+    // note carrying a status value — known or unknown — drops it silently here,
+    // so the degrade warning below is task-only by construction.
+    let mut warning = None;
     let (status, priority, due_at) = match kind {
         Kind::Note => (None, None, None),
         Kind::Task => {
             let status = match fields.get("status") {
-                Some(v) => Some(parse_status(v)?),
+                Some(v) => {
+                    let (status, degraded) = parse_status(v);
+                    warning = degraded;
+                    Some(status)
+                }
                 None => Some(Status::Todo),
             };
             let priority = match fields.get("priority") {
@@ -245,23 +257,26 @@ pub fn parse(text: &str) -> Result<Item, ItemFileError> {
         .cloned()
         .unwrap_or_else(|| CURRENT_SCHEMA_VERSION.to_string());
 
-    Ok(Item {
-        id,
-        kind,
-        title,
-        body: body.to_string(),
-        status,
-        priority,
-        due_at,
-        tags: Json(tags),
-        created_at,
-        updated_at,
-        archived,
-        pinned,
-        project_id: None,
-        jira_url,
-        schema_version,
-    })
+    Ok((
+        Item {
+            id,
+            kind,
+            title,
+            body: body.to_string(),
+            status,
+            priority,
+            due_at,
+            tags: Json(tags),
+            created_at,
+            updated_at,
+            archived,
+            pinned,
+            project_id: None,
+            jira_url,
+            schema_version,
+        },
+        warning,
+    ))
 }
 
 /// Read a file into a string, reading AT MOST `MAX_ITEM_FILE_BYTES + 1` bytes so
@@ -313,9 +328,13 @@ pub fn remove_item(items_dir: &Path, id: &str) -> Result<(), ItemFileError> {
 /// The result of scanning an items directory: every file that parsed, plus a
 /// `(filename, reason)` for every file that did not — so a rebuild imports the
 /// good files and reports the bad ones instead of aborting (plan.6 step 18).
+/// `warnings` are per-file DEGRADATIONS (plan.14 S-2): the file imported, but a
+/// value was read as a default (an unknown status → `todo`) — surfaced, never
+/// silent, and never a skip.
 pub struct ScanOutcome {
     pub items: Vec<Item>,
     pub errors: Vec<(String, ItemFileError)>,
+    pub warnings: Vec<String>,
 }
 
 /// Scan every `*.md` in `items_dir`, parsing each independently. Never fails as
@@ -325,10 +344,11 @@ pub struct ScanOutcome {
 pub fn scan(items_dir: &Path) -> ScanOutcome {
     let mut items = Vec::new();
     let mut errors = Vec::new();
+    let mut warnings = Vec::new();
 
     let entries = match std::fs::read_dir(items_dir) {
         Ok(e) => e,
-        Err(_) => return ScanOutcome { items, errors },
+        Err(_) => return ScanOutcome { items, errors, warnings },
     };
 
     let mut files: Vec<std::path::PathBuf> = entries
@@ -359,7 +379,12 @@ pub fn scan(items_dir: &Path) -> ScanOutcome {
         }
         match read_capped(&path) {
             Ok(Some(text)) => match parse(&text) {
-                Ok(item) => items.push(item),
+                Ok((item, degraded)) => {
+                    if let Some(w) = degraded {
+                        warnings.push(format!("{name}: {w}"));
+                    }
+                    items.push(item);
+                }
                 Err(e) => errors.push((name, e)),
             },
             Ok(None) => errors.push((name, ItemFileError::TooLarge)),
@@ -367,7 +392,7 @@ pub fn scan(items_dir: &Path) -> ScanOutcome {
         }
     }
 
-    ScanOutcome { items, errors }
+    ScanOutcome { items, errors, warnings }
 }
 
 // --- Conflict-marker detection ---------------------------------------------
@@ -500,16 +525,39 @@ fn status_str(status: Status) -> &'static str {
     match status {
         Status::Todo => "todo",
         Status::Doing => "doing",
+        Status::Testing => "testing",
         Status::Done => "done",
     }
 }
 
-fn parse_status(s: &str) -> Result<Status, ItemFileError> {
+/// Parse a status value. A genuinely unknown value DEGRADES to `Todo` with a
+/// warning instead of rejecting the file (plan.14 S-2): an `Err` here would
+/// make every FUTURE status addition silently skip the whole item on builds
+/// that predate it — the value-level analogue of "unknown scalar keys keep
+/// being ignored". Caveat (documented in notes-app/CLAUDE.md): a build that
+/// SAVES an item whose status it degraded rewrites the file as `status: todo`
+/// — value loss, never item loss.
+fn parse_status(s: &str) -> (Status, Option<String>) {
     match s {
-        "todo" => Ok(Status::Todo),
-        "doing" => Ok(Status::Doing),
-        "done" => Ok(Status::Done),
-        other => Err(ItemFileError::Malformed(format!("bad status: {other}"))),
+        "todo" => (Status::Todo, None),
+        "doing" => (Status::Doing, None),
+        "testing" => (Status::Testing, None),
+        "done" => (Status::Done, None),
+        other => {
+            // Bound the echoed value: it is untrusted file content on its way
+            // to a toast — a multi-megabyte `status:` line must not become a
+            // multi-megabyte banner.
+            let mut shown: String = other.chars().take(32).collect();
+            if shown.len() < other.len() {
+                shown.push('…');
+            }
+            (
+                Status::Todo,
+                Some(format!(
+                    "unknown status \"{shown}\" (written by a newer worknotes?) shown as todo"
+                )),
+            )
+        }
     }
 }
 
@@ -614,8 +662,73 @@ mod tests {
     #[test]
     fn round_trip_task_preserves_every_field() {
         let original = task();
-        let parsed = parse(&serialize(&original)).unwrap();
+        let (parsed, _) = parse(&serialize(&original)).unwrap();
         assert_item_eq(&original, &parsed);
+    }
+
+    #[test]
+    fn testing_status_round_trips_with_no_degradation_warning() {
+        // plan.14 F2: `testing` is a known value, not a degrade case — it must
+        // serialize verbatim, parse back untouched, and never carry a warning.
+        let mut original = task();
+        original.status = Some(Status::Testing);
+        let text = serialize(&original);
+        assert!(text.contains("status: testing"), "must serialize the new value verbatim: {text}");
+        let (parsed, warning) = parse(&text).unwrap();
+        assert_item_eq(&original, &parsed);
+        assert_eq!(warning, None, "a known status must never produce a degradation warning");
+        // serialize∘parse∘serialize stays a fixed point for the new value too.
+        assert_eq!(serialize(&parsed), text);
+    }
+
+    #[test]
+    fn an_unknown_status_degrades_to_todo_with_a_warning_instead_of_skipping_the_file() {
+        // S-2/D6: a status value this build doesn't know must never reject the
+        // whole file (that would silently vanish the item on an older build) —
+        // it degrades to `todo` and reports why.
+        let text = "---\nid: 550e8400-e29b-41d4-a716-446655440000\nkind: task\n\
+                    title: \"future status\"\nstatus: blocked\npinned: false\narchived: false\n\
+                    tags: []\ncreated_at: 2026-07-17T10:00:00.000+00:00\n\
+                    updated_at: 2026-07-17T10:00:00.000+00:00\n---\n";
+        let (parsed, warning) = parse(text).unwrap();
+        assert_eq!(parsed.status, Some(Status::Todo), "an unknown status degrades to todo, never an Err");
+        let warning = warning.expect("a degraded status must surface a warning");
+        assert!(warning.contains("blocked"), "the warning must name the unknown value: {warning}");
+    }
+
+    #[test]
+    fn a_note_carrying_status_testing_still_imports_as_a_clean_note() {
+        // The kind gate drops a note's status before parse_status ever runs, so
+        // a note can never trigger a degrade warning either — known or unknown
+        // value, it is dropped silently and cleanly.
+        let text = "---\nid: 11111111-2222-3333-4444-555555555555\nkind: note\n\
+                    title: \"sneaky\"\nstatus: testing\npinned: false\narchived: false\n\
+                    tags: []\ncreated_at: 2026-07-17T10:00:00.000+00:00\n\
+                    updated_at: 2026-07-17T10:00:00.000+00:00\n---\nbody";
+        let (parsed, warning) = parse(text).unwrap();
+        assert_eq!(parsed.kind, Kind::Note);
+        assert_eq!(parsed.status, None, "a note must never keep an imported status");
+        assert_eq!(warning, None, "a note's dropped status must never surface a degrade warning");
+    }
+
+    #[test]
+    fn scan_surfaces_a_degraded_status_warning_naming_the_file_without_skipping_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let text = "---\nid: 660e8400-e29b-41d4-a716-446655440000\nkind: task\n\
+                    title: \"future status\"\nstatus: someday\npinned: false\narchived: false\n\
+                    tags: []\ncreated_at: 2026-07-17T10:00:00.000+00:00\n\
+                    updated_at: 2026-07-17T10:00:00.000+00:00\n---\n";
+        std::fs::write(dir.path().join("660e8400-e29b-41d4-a716-446655440000.md"), text).unwrap();
+
+        let outcome = scan(dir.path());
+        assert_eq!(outcome.items.len(), 1, "a degraded-status file must still import, not be skipped");
+        assert!(outcome.errors.is_empty(), "a degrade is a warning, never an error: {:?}", outcome.errors);
+        assert_eq!(outcome.warnings.len(), 1);
+        assert!(
+            outcome.warnings[0].contains("660e8400-e29b-41d4-a716-446655440000.md"),
+            "the warning must name the offending file: {}",
+            outcome.warnings[0]
+        );
     }
 
     #[test]
@@ -626,7 +739,7 @@ mod tests {
         assert!(!text.contains("priority:"), "a note file must not carry priority");
         assert!(!text.contains("due_at:"), "a note file must not carry due_at");
         assert!(text.contains("tags: []"), "an empty tag list is written inline");
-        let parsed = parse(&text).unwrap();
+        let (parsed, _) = parse(&text).unwrap();
         assert_item_eq(&original, &parsed);
     }
 
@@ -636,7 +749,7 @@ mod tests {
         // the exact same bytes, so an unchanged item never shows a git diff.
         for original in [task(), note()] {
             let once = serialize(&original);
-            let twice = serialize(&parse(&once).unwrap());
+            let twice = serialize(&parse(&once).unwrap().0);
             assert_eq!(once, twice, "serialize∘parse∘serialize must be a fixed point");
         }
     }
@@ -650,7 +763,7 @@ mod tests {
                     archived: false\ntags: []\ndue_at: 2026-07-20T00:00:00.000+00:00\n\
                     created_at: 2026-07-17T10:00:00.000+00:00\n\
                     updated_at: 2026-07-17T10:00:00.000+00:00\n---\nbody";
-        let parsed = parse(text).unwrap();
+        let (parsed, _) = parse(text).unwrap();
         assert_eq!(parsed.kind, Kind::Note);
         assert_eq!(parsed.status, None, "a note must never keep an imported status");
         assert_eq!(parsed.priority, None);
@@ -663,7 +776,7 @@ mod tests {
                     title: \"bare task\"\npinned: false\narchived: false\ntags: []\n\
                     created_at: 2026-07-17T10:00:00.000+00:00\n\
                     updated_at: 2026-07-17T10:00:00.000+00:00\n---\n";
-        let parsed = parse(text).unwrap();
+        let (parsed, _) = parse(text).unwrap();
         assert_eq!(parsed.status, Some(Status::Todo));
         assert_eq!(parsed.priority, Some(Priority::Normal));
     }
@@ -679,7 +792,7 @@ mod tests {
                     created_at: 2026-07-17T10:00:00.000+00:00\n\
                     updated_at: 2026-07-17T10:00:00.000+00:00\n---\n";
         assert!(!text.contains("schema_version"), "fixture must genuinely lack the marker");
-        let parsed = parse(text).unwrap();
+        let (parsed, _) = parse(text).unwrap();
         assert_eq!(parsed.schema_version, "1.0.0");
     }
 
@@ -687,7 +800,7 @@ mod tests {
     fn titles_with_quotes_backslashes_and_colons_round_trip() {
         let mut it = note();
         it.title = r#"weird: "quoted" back\slash — value: 2"#.into();
-        let parsed = parse(&serialize(&it)).unwrap();
+        let (parsed, _) = parse(&serialize(&it)).unwrap();
         assert_eq!(parsed.title, it.title);
     }
 
@@ -698,7 +811,7 @@ mod tests {
         // confuse the parser — only whole "---" lines fence, and the body starts
         // after the FIRST closing fence.
         it.body = "intro\n---\nlooks: like frontmatter\nbut is body\n".into();
-        let parsed = parse(&serialize(&it)).unwrap();
+        let (parsed, _) = parse(&serialize(&it)).unwrap();
         assert_eq!(parsed.body, it.body);
     }
 
@@ -706,7 +819,7 @@ mod tests {
     fn empty_body_round_trips() {
         let mut it = note();
         it.body = String::new();
-        let parsed = parse(&serialize(&it)).unwrap();
+        let (parsed, _) = parse(&serialize(&it)).unwrap();
         assert_eq!(parsed.body, "");
     }
 
@@ -725,7 +838,7 @@ mod tests {
         let mut it = note();
         it.body = "setext heading\n=======\nmore".into();
         // No opener, so the equals line is ordinary body text and round-trips.
-        let parsed = parse(&serialize(&it)).unwrap();
+        let (parsed, _) = parse(&serialize(&it)).unwrap();
         assert_eq!(parsed.body, it.body);
     }
 
@@ -736,7 +849,7 @@ mod tests {
         // and must round-trip — a single such line must never block a project.
         let mut it = note();
         it.body = "here is a diff marker line:\n<<<<<<< not really a conflict\ndone".into();
-        let parsed = parse(&serialize(&it)).unwrap();
+        let (parsed, _) = parse(&serialize(&it)).unwrap();
         assert_eq!(parsed.body, it.body);
     }
 

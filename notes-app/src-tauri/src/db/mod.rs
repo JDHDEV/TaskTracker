@@ -31,6 +31,15 @@ pub trait ItemRepository: Send + Sync {
     /// manager stamps the owning project's UUID onto the returned item.
     async fn create(&self, input: NewItem) -> Result<Item>;
     async fn update(&self, id: &str, patch: UpdateItem) -> Result<Item>;
+    /// Convert a NOTE into a task (plan.14 F7/D8) — the single, narrow,
+    /// ONE-WAY exception to "kind is fixed at creation" (task→note would
+    /// silently destroy status/priority/dueAt and has no path here). Same id,
+    /// same file; stamps exactly `create()`'s task defaults (status `todo`,
+    /// priority `normal`, no dueAt); preserves every other field; bumps
+    /// `updatedAt` (a content edit); file-then-index write order. `UpdateItem`
+    /// still carries no `kind` — a patch can never change kind. Errors: unknown
+    /// id → `NotFound`; already a task → `Invalid` with fixed copy.
+    async fn convert_note_to_task(&self, id: &str) -> Result<Item>;
     async fn delete(&self, id: &str) -> Result<()>;
     /// Full-text search over title and body, then the same post-filters as
     /// `list` (status/tags). Archived items are always excluded. Empty query

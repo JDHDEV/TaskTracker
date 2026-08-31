@@ -16,7 +16,7 @@ Stack: Tauri 2 shell · React 19 + TypeScript (Vite) · Rust core · SQLite via 
 
 ## Invariants (enforced in the repository layer — keep them there, not just in UI)
 - The backend owns `id`, `createdAt`, `updatedAt`. `updatedAt` moves ONLY on content edits (title, body, status, priority, dueAt, tags — and once added: project, jiraUrl). Pin and archive flips never move it, and never reorder the list by recency.
-- `kind` is fixed at creation. Notes never carry status, priority, or dueAt — patches attempting it are silently ignored.
+- `kind` is fixed at creation, with ONE narrow exception: `convert_note_to_task` (plan.14 F7) converts a note into a task, one-way — same id and file, `create()`'s task defaults stamped server-side, `updatedAt` bumped. `UpdateItem` still has no `kind` field, so a patch can never change kind; task→note has no path anywhere. Notes never carry status, priority, or dueAt — patches attempting it are silently ignored.
 - List order: `pinned DESC`, then the sort mode, with a monotonic insertion sequence as the tiebreak (SQLite `rowid`; a future Postgres impl an `IDENTITY`/`seq` column) — equal timestamps must never flap. Archived items are excluded from the default list AND from search.
 - All search input goes through `fts_query()` (quoted prefix phrases). Never feed raw user text to `MATCH`.
 - API keys live in the OS credential store (`keyring`). No command returns a key — `has_api_key` returns a boolean only. Saving an empty key deletes it.
@@ -31,7 +31,7 @@ Stack: Tauri 2 shell · React 19 + TypeScript (Vite) · Rust core · SQLite via 
 - sqlx runtime API only (`query`, `query_as`, `QueryBuilder`). No `query!` compile-time macros; the build must never need a live `DATABASE_URL`.
 - Schema changes are additive numbered migrations in `src-tauri/migrations/`; sqlx applies them at startup. Never edit an existing migration.
 - Timestamps are RFC 3339 TEXT end to end (SQLite ↔ Rust ↔ JS), no mapping layers.
-- Styling: CSS custom properties in `src/styles.css`, tokens per `docs/DESIGN.md`. Five named palettes are selected via `data-palette` on `<html>` alongside a polarity `data-theme` (`light`/`dark`), both set atomically; a palette swaps the neutrals **and** the accent/danger family (`--mark*`, `--danger`, and `--todo` all vary per palette). Only the doing/done status-dot colors are constant across all five. (Pre-Plan-11 this read "themes swap neutrals only; accents constant" — that rule is relaxed.)
+- Styling: CSS custom properties in `src/styles.css`, tokens per `docs/DESIGN.md`. Five named palettes are selected via `data-palette` on `<html>` alongside a polarity `data-theme` (`light`/`dark`), both set atomically; a palette swaps the neutrals **and** the accent/danger family (`--mark*`, `--danger`, and `--todo` all vary per palette). Only the doing/testing/done status-dot colors are constant across all five. (Pre-Plan-11 this read "themes swap neutrals only; accents constant" — that rule is relaxed.)
 - AI models are constants: `MODEL` in `src-tauri/src/ai/anthropic.rs` (`claude-sonnet-4-6`; current names at https://docs.claude.com/en/docs/about-claude/models/overview) and `src-tauri/src/ai/openai.rs` (`gpt-4o-mini`).
 
 ## Verify after every change

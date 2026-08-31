@@ -229,6 +229,45 @@ describe("subscribe / getSnapshot", () => {
   });
 });
 
+describe("provider-keyed error toasts (F5 missing-key toasts)", () => {
+  it("two error toasts keyed by different providers are distinct entries, both visible", () => {
+    const a = store.push({
+      kind: "error",
+      message: "Anthropic: no API key",
+      key: "missing-key:anthropic",
+    });
+    const b = store.push({
+      kind: "error",
+      message: "OpenAI: no API key",
+      key: "missing-key:openai",
+    });
+    const snap = store.getSnapshot();
+    expect(snap).toHaveLength(2);
+    expect(snap.some((t) => t.id === a && t.key === "missing-key:anthropic")).toBe(true);
+    expect(snap.some((t) => t.id === b && t.key === "missing-key:openai")).toBe(true);
+  });
+
+  it("dismissKey for one provider's key removes only that toast, leaving the other provider's", () => {
+    store.push({
+      kind: "error",
+      message: "Anthropic: no API key",
+      key: "missing-key:anthropic",
+    });
+    const openaiId = store.push({
+      kind: "error",
+      message: "OpenAI: no API key",
+      key: "missing-key:openai",
+    });
+
+    store.dismissKey("missing-key:anthropic");
+
+    const snap = store.getSnapshot();
+    expect(snap).toHaveLength(1);
+    expect(snap[0].id).toBe(openaiId);
+    expect(snap[0].key).toBe("missing-key:openai");
+  });
+});
+
 describe("edge cases", () => {
   it("two different keys expiring on the same tick both clear without throwing", () => {
     store.push({ kind: "notice", message: "one", key: "k1" });

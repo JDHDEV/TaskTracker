@@ -15,6 +15,8 @@ import type {
   UpdatePrompt,
 } from "../types";
 import { aiRewriteStream, confirmDialog, copyToClipboard } from "../lib/api";
+import { reportAiError } from "../lib/aiErrors";
+import { handleLineClipboardKeyDown, handleLinePaste } from "../lib/lineEdit";
 import { tabDomId, tabPanelDomId } from "../lib/openTabs";
 import {
   captureSelection,
@@ -331,7 +333,7 @@ const PromptEditor = forwardRef<PromptEditorHandle, Props>(function PromptEditor
     } catch (err) {
       if (cancelled) return;
       setProposal(null);
-      onError(String(err));
+      await reportAiError(provider, err, onError); // keyed when no key stored (F5)
     } finally {
       if (!cancelled) {
         setStreaming(false);
@@ -381,7 +383,8 @@ const PromptEditor = forwardRef<PromptEditorHandle, Props>(function PromptEditor
 
   return (
     <section
-      className="editor"
+      // F3 (D2): frame the pane while there are unsaved changes.
+      className={dirty ? "editor is-dirty" : "editor"}
       role="tabpanel"
       hidden={hidden}
       id={tabPanelDomId(tabKey)}
@@ -545,6 +548,19 @@ const PromptEditor = forwardRef<PromptEditorHandle, Props>(function PromptEditor
         onSelect={trackSelection}
         onKeyUp={trackSelection}
         onMouseUp={trackSelection}
+        // F6 (D9): whole-line Ctrl+X/C/V on a collapsed selection.
+        onKeyDown={(e) => {
+          if (bodyRef.current) handleLineClipboardKeyDown(e, bodyRef.current);
+        }}
+        onPaste={(e) => {
+          const ta = bodyRef.current;
+          if (!ta) return;
+          handleLinePaste(e, ta, (nextBody, caret) => {
+            edit(setBody)(nextBody);
+            clearSelection();
+            pendingCaretRef.current = { start: caret, end: caret };
+          });
+        }}
       />
 
       {showHistory && (

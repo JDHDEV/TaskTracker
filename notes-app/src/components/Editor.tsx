@@ -16,10 +16,12 @@ import type {
   UpdateItem,
 } from "../types";
 import { aiGenerateTitle, aiRewriteStream } from "../lib/api";
+import { reportAiError } from "../lib/aiErrors";
 import { getPreferredProvider } from "../lib/aiProvider";
 import { fromDateInputValue, toDateInputValue } from "../lib/dueDate";
 import { resolveTitleForSave } from "../lib/titleForSave";
 import { isRedundantTitle } from "../lib/titleProposal";
+import { handleLineClipboardKeyDown, handleLinePaste } from "../lib/lineEdit";
 import { tabDomId, tabPanelDomId } from "../lib/openTabs";
 import {
   captureSelection,
@@ -58,11 +60,27 @@ interface Props {
    *  can show the unsaved dot without re-rendering sibling editors. */
   onDirtyChange: (dirty: boolean) => void;
   onSave: (patch: UpdateItem) => Promise<boolean>;
+  /** F1 (D1): persist a SAVED task's status immediately — a field-scoped patch
+   *  like Pin/Archive, never the buffered save() path (S-1). Resolves false on
+   *  a rejected patch so the select can revert. Drafts keep the buffered path. */
+  onStatusChange?: (status: Status) => Promise<boolean>;
   onCreate: (input: NewItem) => Promise<boolean>;
   /** Draft only: report the chosen target project up so App's unload-eviction
    *  check reflects the live selection (not just the value seeded at creation). */
   onTargetChange?: (projectId: string) => void;
   onDuplicate: () => void;
+  /** F7 (D8): convert this saved NOTE into a task — one-way; App confirms via
+   *  api.confirmDialog and mutates. Rendered for saved notes only; disabled
+   *  while dirty (the buffer isn't part of the conversion). NOTE a coupling:
+   *  the re-seed effect keys on [item.id, isDraft], so after conversion the
+   *  local status/priority/dueAt state keeps its note-time fallback seeds
+   *  ("todo"/"normal"/"") — correct only because those equal the server-side
+   *  conversion defaults. If convert_note_to_task's defaults ever change,
+   *  re-sync here. */
+  onConvertToTask?: () => void;
+  /** F7 (D8): seed a dirty, unsaved prompt draft on the Prompts page with this
+   *  note's on-screen title+body. The note itself is untouched. */
+  onCreatePromptFromNote?: (title: string, body: string) => void;
   onArchive: (archived: boolean) => void;
   onPin: (pinned: boolean) => void;
   onDelete: () => void;
@@ -75,7 +93,8 @@ interface Props {
   onResolve: (key: string) => void;
 }
 
-const STATUSES: Status[] = ["todo", "doing", "done"];
+// Lifecycle order (todo → doing → testing → done); only "done" is released.
+const STATUSES: Status[] = ["todo", "doing", "testing", "done"];
 const PRIORITIES: Priority[] = ["low", "normal", "high"];
 
 const Editor = forwardRef<EditorHandle, Props>(function Editor(
@@ -89,9 +108,12 @@ const Editor = forwardRef<EditorHandle, Props>(function Editor(
     active,
     onDirtyChange,
     onSave,
+    onStatusChange,
     onCreate,
     onTargetChange,
     onDuplicate,
+    onConvertToTask,
+    onCreatePromptFromNote,
     onArchive,
     onPin,
     onDelete,
@@ -129,6 +151,10 @@ const Editor = forwardRef<EditorHandle, Props>(function Editor(
   // Drives disabling the accept/save controls while a save() runs, so a second
   // click surfaces as a disabled control rather than a silent guarded no-op.
   const [saving, setSaving] = useState(false);
+  // F1 (D1): a status auto-save patch in flight. Disables the status select so
+  // rapid flips can't fire overlapping IPC calls with undefined resolution
+  // order against reconcileTabs.
+  const [statusPatchPending, setStatusPatchPending] = useState(false);
   // Flipped false once this editor instance moves off its item (unmount / item
   // switch). An in-flight R4 save() checks it after the async title call and
   // abandons rather than persisting to — or navigating away from — a stale item.
@@ -245,6 +271,7 @@ const Editor = forwardRef<EditorHandle, Props>(function Editor(
     setGeneratingTitle(false);
     setSuggestingTitle(false);
     setSaving(false);
+    setStatusPatchPending(false);
     savingRef.current = false;
     setSelectionRework(null);
     selRef.current = null;
@@ -270,6 +297,11 @@ const Editor = forwardRef<EditorHandle, Props>(function Editor(
     body?: string;
   }): Promise<boolean> {
     if (savingRef.current) return false; // re-entry guard
+    // The symmetric half of D1's overlap guard: the status select is disabled
+    // while a save runs, and a save must not start while a status patch is in
+    // flight — otherwise flip-then-Ctrl+S races two updateItem calls with
+    // undefined resolution order against reconcileTabs.
+    if (statusPatchPending) return false;
     savingRef.current = true;
     setSaving(true);
     try {
@@ -298,7 +330,14 @@ const Editor = forwardRef<EditorHandle, Props>(function Editor(
       // rather than persist to (or yank selection back toward) the item we left.
       if (!aliveRef.current) return false;
       if ("error" in resolved) {
-        onError(resolved.error);
+        if (needsGeneration && effectiveBody.trim()) {
+          // The error came from the R4 title generation — an AI failure, so key
+          // it by provider when no key is stored (F5; the message is already
+          // stringified by resolveTitleForSave).
+          await reportAiError(getPreferredProvider(), resolved.error, onError);
+        } else {
+          onError(resolved.error);
+        }
         return false; // save aborted; item stays dirty
       }
 
@@ -412,7 +451,7 @@ const Editor = forwardRef<EditorHandle, Props>(function Editor(
       setStreaming(false);
       setAiBusy(false);
       if (stopRef.current === stop) stopRef.current = null;
-      onError(String(err));
+      await reportAiError(provider, err, onError);
       return;
     }
 
@@ -483,7 +522,9 @@ const Editor = forwardRef<EditorHandle, Props>(function Editor(
       proposeTitle(generated); // skipped silently if it matches the title exactly
     } catch (err) {
       if (cancelled) return;
-      onError(String(err)); // an explicit action surfaces its failure (unlike R1)
+      // An explicit action surfaces its failure (unlike R1) — keyed when the
+      // provider has no stored key (F5).
+      await reportAiError(provider, err, onError);
     } finally {
       if (!cancelled) {
         setSuggestingTitle(false);
@@ -513,6 +554,27 @@ const Editor = forwardRef<EditorHandle, Props>(function Editor(
     };
   }
 
+  // F1 (D1): a saved task's status persists immediately, like Pin/Archive —
+  // optimistic set WITHOUT edit() (a persisted flip is not an unsaved change,
+  // so the dirty frame stays honest), then a field-scoped patch; revert on
+  // failure. A draft keeps the buffered path (no IPC until Create). Never
+  // routes through save() — that path can fire an AI title call (S-1).
+  async function changeStatus(next: Status) {
+    if (isDraft || !onStatusChange) {
+      edit(setStatus)(next);
+      return;
+    }
+    const prev = status;
+    setStatus(next);
+    setStatusPatchPending(true);
+    try {
+      const ok = await onStatusChange(next);
+      if (!ok) setStatus(prev); // failed patch → the select reverts
+    } finally {
+      setStatusPatchPending(false);
+    }
+  }
+
   const released = item.kind === "task" && status === "done";
   const cardOpen = proposal !== null || proposedTitle !== null || titlePending;
   // The body moved under a pending selection proposal → the splice would land in
@@ -521,7 +583,10 @@ const Editor = forwardRef<EditorHandle, Props>(function Editor(
 
   return (
     <section
-      className="editor"
+      // F3 (D2): frame the pane while there are unsaved changes. Supplementary
+      // to the tab dot and Save label (WCAG 1.4.1); a status auto-save never
+      // sets dirty, so the frame stays honest.
+      className={dirty ? "editor is-dirty" : "editor"}
       role="tabpanel"
       hidden={hidden}
       id={tabPanelDomId(tabKey)}
@@ -546,6 +611,24 @@ const Editor = forwardRef<EditorHandle, Props>(function Editor(
             Duplicate metadata
           </button>
         )}
+        {!isDraft && item.kind === "note" && (
+          <>
+            <button
+              className="btn btn-quiet"
+              disabled={dirty || saving}
+              title={dirty ? "Save or discard your changes first" : undefined}
+              onClick={() => onConvertToTask?.()}
+            >
+              Convert to task
+            </button>
+            <button
+              className="btn btn-quiet"
+              onClick={() => onCreatePromptFromNote?.(title, body)}
+            >
+              Create prompt from note
+            </button>
+          </>
+        )}
       </header>
 
       <div className="meta">
@@ -555,7 +638,11 @@ const Editor = forwardRef<EditorHandle, Props>(function Editor(
             className="select"
             value={status}
             aria-label="Task status"
-            onChange={(e) => edit(setStatus)(e.target.value as Status)}
+            // Disabled while a save/title-generation is in flight (the save
+            // closure already captured `status`) or while a previous status
+            // patch is still resolving (D1).
+            disabled={saving || generatingTitle || statusPatchPending}
+            onChange={(e) => void changeStatus(e.target.value as Status)}
           >
             {STATUSES.map((s) => (
               <option key={s} value={s}>
@@ -769,6 +856,21 @@ const Editor = forwardRef<EditorHandle, Props>(function Editor(
         onSelect={trackSelection}
         onKeyUp={trackSelection}
         onMouseUp={trackSelection}
+        // F6 (D9): whole-line Ctrl+X/C on a collapsed selection ride the
+        // native path via selection expansion; line-paste is the one
+        // programmatic insert (edit() + pendingCaretRef, not natively undoable).
+        onKeyDown={(e) => {
+          if (bodyRef.current) handleLineClipboardKeyDown(e, bodyRef.current);
+        }}
+        onPaste={(e) => {
+          const ta = bodyRef.current;
+          if (!ta) return;
+          handleLinePaste(e, ta, (nextBody, caret) => {
+            edit(setBody)(nextBody);
+            clearSelection();
+            pendingCaretRef.current = { start: caret, end: caret };
+          });
+        }}
       />
     </section>
   );

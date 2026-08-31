@@ -60,7 +60,7 @@ fn task(id: &str, title: &str) -> Item {
 fn idempotent_export_is_byte_stable() {
     for it in [note(ID_A, "a note"), task(ID_B, "a task")] {
         let once = itemfile::serialize(&it);
-        let twice = itemfile::serialize(&itemfile::parse(&once).unwrap());
+        let twice = itemfile::serialize(&itemfile::parse(&once).unwrap().0);
         assert_eq!(once, twice, "re-exporting a parsed item must be byte-identical");
     }
 }
@@ -73,7 +73,7 @@ fn round_trip_gates_an_injected_task_field_out_of_a_note() {
         "---\nid: {ID_A}\nkind: note\ntitle: \"gated\"\nstatus: doing\npinned: false\n\
          archived: false\ntags: []\ncreated_at: {TS}\nupdated_at: {TS}\n---\nbody\n"
     );
-    let parsed = itemfile::parse(&text).unwrap();
+    let (parsed, _) = itemfile::parse(&text).unwrap();
     assert_eq!(parsed.kind, Kind::Note);
     assert_eq!(parsed.status, None);
     assert!(!itemfile::serialize(&parsed).contains("status:"));
@@ -83,7 +83,7 @@ fn round_trip_gates_an_injected_task_field_out_of_a_note() {
 fn id_and_filename_are_stable_across_reexport() {
     let it = task(ID_A, "stable");
     let before = itemfile::file_name(&it.id).unwrap();
-    let reparsed = itemfile::parse(&itemfile::serialize(&it)).unwrap();
+    let reparsed = itemfile::parse(&itemfile::serialize(&it)).unwrap().0;
     let after = itemfile::file_name(&reparsed.id).unwrap();
     assert_eq!(before, after);
     assert_eq!(before, format!("{ID_A}.md"), "the filename is derived only from the id");
@@ -114,7 +114,7 @@ fn same_item_clean_three_way_merge_imports_both_field_changes() {
          priority: normal\npinned: false\narchived: false\ntags: []\n\
          created_at: {TS}\nupdated_at: {TS}\n---\nbody\n"
     );
-    let it = itemfile::parse(&merged).unwrap();
+    let (it, _) = itemfile::parse(&merged).unwrap();
     assert_eq!(it.title, "renamed on branch A", "branch A's title change survives");
     assert_eq!(it.status, Some(Status::Done), "branch B's status change survives");
 }

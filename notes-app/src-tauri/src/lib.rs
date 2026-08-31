@@ -56,6 +56,7 @@ pub fn run() {
             commands::get_item,
             commands::create_item,
             commands::update_item,
+            commands::convert_note_to_task,
             commands::delete_item,
             commands::search_items,
             commands::list_active_tags,

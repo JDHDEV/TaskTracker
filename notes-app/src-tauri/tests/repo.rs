@@ -143,6 +143,18 @@ async fn crud_search_and_fts() {
 }
 
 #[tokio::test]
+async fn a_task_round_trips_the_testing_status_through_create_and_get() {
+    let repo = SqliteRepository::connect_in_memory().await.unwrap();
+    let created = repo
+        .create(NewItem { status: Some(Status::Testing), ..new_item(Kind::Task, "in QA", "") })
+        .await
+        .unwrap();
+    assert_eq!(created.status, Some(Status::Testing));
+    let fetched = repo.get(&created.id).await.unwrap();
+    assert_eq!(fetched.status, Some(Status::Testing));
+}
+
+#[tokio::test]
 async fn validation_and_serde_shape() {
     let repo = SqliteRepository::connect_in_memory().await.unwrap();
 
@@ -281,6 +293,24 @@ async fn filter_status_alone_excludes_notes() {
         .unwrap();
     assert_eq!(by_status.len(), 1);
     assert_eq!(by_status[0].id, task.id);
+}
+
+#[tokio::test]
+async fn filter_by_testing_status_returns_only_the_testing_task() {
+    let repo = SqliteRepository::connect_in_memory().await.unwrap();
+    let mk = |title, st| NewItem { status: Some(st), ..new_item(Kind::Task, title, "") };
+    repo.create(mk("todo", Status::Todo)).await.unwrap();
+    repo.create(mk("doing", Status::Doing)).await.unwrap();
+    let testing = repo.create(mk("testing", Status::Testing)).await.unwrap();
+    repo.create(mk("done", Status::Done)).await.unwrap();
+    repo.create(new_item(Kind::Note, "note", "")).await.unwrap();
+
+    let got = repo
+        .list(&ListFilter { status: Some(Status::Testing), ..Default::default() })
+        .await
+        .unwrap();
+    assert_eq!(got.len(), 1);
+    assert_eq!(got[0].id, testing.id);
 }
 
 #[tokio::test]
@@ -444,12 +474,15 @@ async fn sort_priority_orders_high_normal_low_then_note() {
 }
 
 #[tokio::test]
-async fn sort_status_orders_doing_todo_done_then_note() {
+async fn sort_status_orders_doing_testing_todo_done_then_note() {
+    // "Active work first" (plan.14 D3): doing, testing, todo, done, then notes
+    // (NULL status) last. Pins the SQL CASE order in push_sort.
     let repo = SqliteRepository::connect_in_memory().await.unwrap();
     let mk = |title, st| NewItem { status: Some(st), ..new_item(Kind::Task, title, "") };
     let done = repo.create(mk("done", Status::Done)).await.unwrap();
     let doing = repo.create(mk("doing", Status::Doing)).await.unwrap();
     let todo = repo.create(mk("todo", Status::Todo)).await.unwrap();
+    let testing = repo.create(mk("testing", Status::Testing)).await.unwrap();
     let note = repo.create(new_item(Kind::Note, "note", "")).await.unwrap();
 
     let order: Vec<String> = repo
@@ -459,7 +492,7 @@ async fn sort_status_orders_doing_todo_done_then_note() {
         .into_iter()
         .map(|i| i.id)
         .collect();
-    assert_eq!(order, vec![doing.id, todo.id, done.id, note.id]);
+    assert_eq!(order, vec![doing.id, testing.id, todo.id, done.id, note.id]);
 }
 
 #[tokio::test]
@@ -839,6 +872,50 @@ async fn due_at_change_on_task_bumps_updated_at() {
     assert!(updated.updated_at > old.to_string(), "setting due_at bumps updated_at");
 }
 
+#[tokio::test]
+async fn status_change_bumps_updated_at() {
+    // CLAUDE.md invariant: updatedAt moves on content edits, and status is
+    // listed as one (title, body, status, priority, dueAt, tags, jiraUrl).
+    let repo = SqliteRepository::connect_in_memory().await.unwrap();
+    let task = repo.create(new_item(Kind::Task, "t", "")).await.unwrap();
+    let old = "2000-01-01T00:00:00+00:00";
+    repo.set_timestamps_for_test(&task.id, old, old).await.unwrap();
+    let updated = repo
+        .update(&task.id, UpdateItem { status: Some(Status::Doing), ..Default::default() })
+        .await
+        .unwrap();
+    assert_eq!(updated.status, Some(Status::Doing));
+    assert!(updated.updated_at > old.to_string(), "setting status bumps updated_at");
+}
+
+#[tokio::test]
+async fn status_and_priority_patch_on_a_note_is_silently_ignored() {
+    // CLAUDE.md invariant: notes never carry status/priority — patches
+    // attempting either must be silently ignored (the status/priority block
+    // in update() is gated on Kind::Task), and since nothing is actually
+    // edited, updated_at must not move either.
+    let repo = SqliteRepository::connect_in_memory().await.unwrap();
+    let note = repo.create(new_item(Kind::Note, "n", "")).await.unwrap();
+    assert_eq!(note.status, None);
+    assert_eq!(note.priority, None);
+    let old = "2000-01-01T00:00:00+00:00";
+    repo.set_timestamps_for_test(&note.id, old, old).await.unwrap();
+
+    let after_status = repo
+        .update(&note.id, UpdateItem { status: Some(Status::Doing), ..Default::default() })
+        .await
+        .unwrap();
+    assert_eq!(after_status.status, None, "a status patch on a note must be silently dropped");
+    assert_eq!(after_status.updated_at, old, "an ignored status patch must not bump updated_at");
+
+    let after_priority = repo
+        .update(&note.id, UpdateItem { priority: Some(Priority::High), ..Default::default() })
+        .await
+        .unwrap();
+    assert_eq!(after_priority.priority, None, "a priority patch on a note must be silently dropped");
+    assert_eq!(after_priority.updated_at, old, "an ignored priority patch must not bump updated_at");
+}
+
 // ---------------------------------------------------------------------------
 // ListFilter camelCase IPC shape (projectId still selects which store to query)
 // ---------------------------------------------------------------------------
@@ -861,6 +938,15 @@ async fn list_filter_deserializes_camelcase() {
     assert!(empty.status.is_none());
     assert!(empty.tags.is_none());
     assert!(empty.sort.is_none());
+}
+
+#[tokio::test]
+async fn list_filter_deserializes_the_testing_status() {
+    // plan.14 F2: the new enum value must round-trip through the same lowercase
+    // wire encoding as the existing statuses — a sibling of
+    // list_filter_deserializes_camelcase so that test's shape stays untouched.
+    let filter: ListFilter = serde_json::from_str(r#"{"status":"testing"}"#).unwrap();
+    assert_eq!(filter.status, Some(Status::Testing));
 }
 
 // ---------------------------------------------------------------------------
@@ -954,4 +1040,119 @@ async fn pin_and_archive_do_not_change_schema_version() {
     assert_eq!(pinned.schema_version, baseline, "pin flip must not change schema_version");
     let archived = repo.update(&item.id, UpdateItem { archived: Some(true), ..Default::default() }).await.unwrap();
     assert_eq!(archived.schema_version, baseline, "archive flip must not change schema_version");
+}
+
+// ---------------------------------------------------------------------------
+// convert_note_to_task (plan.14 F7 / D8): the single, narrow, ONE-WAY
+// exception to "kind is fixed at creation". Step 19's list.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn convert_note_to_task_stamps_create_defaults() {
+    let repo = SqliteRepository::connect_in_memory().await.unwrap();
+    let note = repo.create(new_item(Kind::Note, "a note", "body text")).await.unwrap();
+    assert_eq!(note.kind, Kind::Note);
+
+    let converted = repo.convert_note_to_task(&note.id).await.unwrap();
+    assert_eq!(converted.kind, Kind::Task);
+    assert_eq!(converted.status, Some(Status::Todo), "exactly create()'s task default");
+    assert_eq!(converted.priority, Some(Priority::Normal), "exactly create()'s task default");
+    assert_eq!(converted.due_at, None);
+
+    // A re-fetch must agree with what convert_note_to_task returned.
+    let fetched = repo.get(&note.id).await.unwrap();
+    assert_eq!(fetched.kind, converted.kind);
+    assert_eq!(fetched.status, converted.status);
+    assert_eq!(fetched.priority, converted.priority);
+    assert_eq!(fetched.due_at, converted.due_at);
+}
+
+#[tokio::test]
+async fn convert_note_to_task_preserves_everything_else() {
+    let repo = SqliteRepository::connect_in_memory().await.unwrap();
+    let created = repo
+        .create(NewItem {
+            jira_url: Some("https://jira.example.com/ABC-1".into()),
+            ..item_with_tags(Kind::Note, "keep me", &["alpha", "beta"])
+        })
+        .await
+        .unwrap();
+    let with_body = repo
+        .update(
+            &created.id,
+            UpdateItem { body: Some("distinctive body for conversion".into()), ..Default::default() },
+        )
+        .await
+        .unwrap();
+    let pinned = repo
+        .update(&with_body.id, UpdateItem { pinned: Some(true), ..Default::default() })
+        .await
+        .unwrap();
+    let source = repo
+        .update(&pinned.id, UpdateItem { archived: Some(true), ..Default::default() })
+        .await
+        .unwrap();
+    assert!(source.pinned && source.archived, "fixture setup sanity");
+
+    let converted = repo.convert_note_to_task(&source.id).await.unwrap();
+
+    assert_eq!(converted.id, source.id);
+    assert_eq!(converted.created_at, source.created_at);
+    assert_eq!(converted.title, source.title);
+    assert_eq!(converted.body, source.body);
+    assert_eq!(converted.body, "distinctive body for conversion");
+    assert_eq!(converted.tags.0, source.tags.0);
+    assert_eq!(converted.pinned, source.pinned);
+    assert_eq!(converted.archived, source.archived);
+    assert_eq!(converted.jira_url, source.jira_url);
+    assert_eq!(converted.schema_version, source.schema_version);
+}
+
+#[tokio::test]
+async fn convert_note_to_task_bumps_updated_at_strictly_and_leaves_created_at() {
+    let repo = SqliteRepository::connect_in_memory().await.unwrap();
+    let note = repo.create(new_item(Kind::Note, "n", "")).await.unwrap();
+    let old = "2000-01-01T00:00:00+00:00";
+    repo.set_timestamps_for_test(&note.id, old, old).await.unwrap();
+
+    let converted = repo.convert_note_to_task(&note.id).await.unwrap();
+    assert_eq!(converted.created_at, old, "created_at must not move");
+    assert!(converted.updated_at > old.to_string(), "conversion is a content edit and must bump updated_at");
+}
+
+#[tokio::test]
+async fn convert_note_to_task_on_a_task_errors_invalid_and_leaves_it_unchanged() {
+    let repo = SqliteRepository::connect_in_memory().await.unwrap();
+    let task = repo.create(new_item(Kind::Task, "already a task", "body")).await.unwrap();
+
+    let err = repo.convert_note_to_task(&task.id).await.unwrap_err();
+    assert!(matches!(err, AppError::Invalid(_)), "expected Invalid, got {err:?}");
+    assert_eq!(err.to_string(), "only a note can be converted to a task");
+
+    let after = repo.get(&task.id).await.unwrap();
+    assert_eq!(after.kind, Kind::Task);
+    assert_eq!(after.status, task.status);
+    assert_eq!(after.priority, task.priority);
+    assert_eq!(after.updated_at, task.updated_at, "a rejected conversion must not touch updated_at");
+}
+
+#[tokio::test]
+async fn convert_note_to_task_unknown_id_errors_not_found() {
+    let repo = SqliteRepository::connect_in_memory().await.unwrap();
+    let err = repo.convert_note_to_task("does-not-exist").await.unwrap_err();
+    assert!(matches!(err, AppError::NotFound), "expected NotFound, got {err:?}");
+}
+
+#[tokio::test]
+async fn convert_note_to_task_leaves_tag_vocabulary_unchanged() {
+    let repo = SqliteRepository::connect_in_memory().await.unwrap();
+    let note = repo.create(item_with_tags(Kind::Note, "tagged note", &["x"])).await.unwrap();
+    assert!(repo.list_active_tags().await.unwrap().contains(&"x".to_string()));
+
+    let converted = repo.convert_note_to_task(&note.id).await.unwrap();
+    assert_eq!(converted.status, Some(Status::Todo), "the converted task is todo, not done");
+    assert!(
+        repo.list_active_tags().await.unwrap().contains(&"x".to_string()),
+        "a todo task's tags stay in the vocabulary"
+    );
 }

@@ -16,6 +16,7 @@ import type {
   UpdateItem,
 } from "./types";
 import * as api from "./lib/api";
+import { missingKeyToastKey } from "./lib/aiErrors";
 import { recomputeTagFilter } from "./lib/tags";
 import {
   itemKey,
@@ -25,6 +26,7 @@ import {
   shouldCommit,
 } from "./lib/projects";
 import { duplicateDraft, newDraft } from "./lib/draft";
+import { readSession, tabKeyId, writeSession } from "./lib/session";
 import {
   getStoredPalette,
   isPaletteId,
@@ -125,6 +127,18 @@ export default function App() {
   // below), so switching never discards an in-progress edit on either page.
   const [page, setPage] = useState<Page>("worknotes");
 
+  // F4 (D10) — session restore. The stored blob is read ONCE, synchronously,
+  // at mount (lazy initializer); restore itself waits for the first successful
+  // loadMeta so tab keys / project ids can be validated against what is
+  // actually loaded (the stale-projectFilter and tag-prune effects only fire
+  // on CHANGES, so a stale restore before that data exists would stick).
+  // `sessionRestored` gates the debounced writers below, so the initial empty
+  // state can never clobber the stored session before restore has run.
+  const [initialSession] = useState(readSession);
+  const [metaLoaded, setMetaLoaded] = useState(false);
+  const restoredRef = useRef(false); // StrictMode double-invoke guard
+  const [sessionRestored, setSessionRestored] = useState(false);
+
   // The set of projects with at least one open prompt tab on the Prompts page
   // (reported up by PromptsPage). Lets the unload confirm warn before an unload
   // closes an open prompt — even a dirty background one — not just an item.
@@ -139,11 +153,13 @@ export default function App() {
   const [promptReloadSignal, setPromptReloadSignal] =
     useState<{ projectId: string; n: number } | null>(null);
 
-  // One-shot "send selection to prompt" seed (Plan 13): PromptsPage opens a
-  // dirty draft tab pre-filled with `body` in `projectId`. `n` makes each send a
-  // fresh object so the consuming effect re-fires even for identical text.
+  // One-shot "send to prompt" seed: PromptsPage opens a dirty draft tab
+  // pre-filled with `body` in `projectId`. Plan 13's send-selection passes no
+  // `title`; Plan 14's "Create prompt from note" (F7) passes the note's title.
+  // `n` makes each send a fresh object so the consuming effect re-fires even
+  // for identical text.
   const [promptSeed, setPromptSeed] =
-    useState<{ projectId: string; body: string; n: number } | null>(null);
+    useState<{ projectId: string; body: string; title?: string; n: number } | null>(null);
 
   // Focus target for the empty-editor placeholder, so closing the LAST tab moves
   // focus into the placeholder region instead of dropping it to <body>.
@@ -201,6 +217,7 @@ export default function App() {
       ]);
       setKnownProjects(nextProjects);
       setActiveTags(nextTags);
+      setMetaLoaded(true); // F4: session restore is gated on the FIRST success
     } catch (err) {
       showError(String(err));
     }
@@ -248,6 +265,90 @@ export default function App() {
   useEffect(() => {
     setProjectFilter((pf) => (pf && !knownProjects.some((p) => p.id === pf && p.loaded) ? "" : pf));
   }, [knownProjects]);
+
+  // F4 restore, once, after the first successful loadMeta. Filters and page
+  // restore synchronously (validated against the now-known projects/tags);
+  // item tabs are fetched by id in persisted order, misses dropped silently
+  // (the reconcileTabs rule), then the persisted active tab re-activates —
+  // openTab's own activation of the last-opened tab is the neighbor fallback.
+  // Restored tabs open CLEAN (openTab seeds isDirty false), so the D2 frame
+  // never lights on boot.
+  useEffect(() => {
+    if (!metaLoaded || restoredRef.current) return;
+    restoredRef.current = true;
+    const s = initialSession;
+    if (!s) {
+      setSessionRestored(true);
+      return;
+    }
+    setPage(s.page);
+    setKind(s.worknotes.filters.kind);
+    setStatusFilter(s.worknotes.filters.statusFilter);
+    setSort(s.worknotes.filters.sort);
+    setTagFilter(s.worknotes.filters.tags.filter((t) => activeTags.includes(t)));
+    const pf = s.worknotes.filters.projectFilter;
+    if (pf && knownProjects.some((p) => p.id === pf && p.loaded)) setProjectFilter(pf);
+    void (async () => {
+      const results = await Promise.all(
+        s.worknotes.tabKeys.map((key) => {
+          const id = tabKeyId(key);
+          return id
+            ? api.getItem(id).then(
+                (item): Item | null => item,
+                (): Item | null => null,
+              )
+            : Promise.resolve<Item | null>(null);
+        }),
+      );
+      setTabs((prev) => {
+        let next = prev;
+        for (const item of results) {
+          if (item) next = openTab(next, itemKey(item), item);
+        }
+        const ak = s.worknotes.activeKey;
+        if (ak && hasTab(next, ak)) next = activateTab(next, ak);
+        return next;
+      });
+      setSessionRestored(true);
+    })();
+  }, [metaLoaded, initialSession, knownProjects, activeTags]);
+
+  // F4 persistence: the page + worknotes slice, debounced ~300 ms. Identifiers
+  // only (S-4) — draft tabs (id "") and the search text are never written. Tab
+  // state is already keystroke-decoupled (dirty fires on transitions only), so
+  // this adds no per-keystroke work.
+  const itemTabKeys = useMemo(
+    () => tabs.tabs.filter((t) => t.item.id !== "").map((t) => t.key),
+    [tabs],
+  );
+  const activeItemTabKey = useMemo(() => {
+    const a = activeTab(tabs);
+    return a && a.item.id !== "" ? a.key : null;
+  }, [tabs]);
+  useEffect(() => {
+    if (!sessionRestored) return;
+    const t = window.setTimeout(() => {
+      writeSession({
+        page,
+        worknotes: {
+          tabKeys: itemTabKeys,
+          activeKey: activeItemTabKey,
+          filters: { kind, statusFilter, sort, projectFilter, tags: tagFilter },
+        },
+      });
+    }, 300);
+    return () => window.clearTimeout(t);
+  }, [
+    sessionRestored,
+    page,
+    itemTabKeys,
+    activeItemTabKey,
+    kind,
+    statusFilter,
+    sort,
+    projectFilter,
+    tagFilter,
+  ]);
 
   const active = activeTab(tabs);
   // Rail highlight: the active tab's saved item id (a draft has "" → no row).
@@ -354,6 +455,31 @@ export default function App() {
     setPromptSeed((s) => ({ projectId, body, n: (s?.n ?? 0) + 1 }));
     setPage("prompts");
     document.getElementById("tab-prompts")?.focus();
+  }
+
+  // "Create prompt from note" (F7, D8): seed a dirty, UNSAVED prompt draft on
+  // the Prompts page with the note's on-screen title+body. Copy, not move — the
+  // note is never mutated or deleted, and nothing is written until the prompt
+  // draft's own explicit Save.
+  function sendNoteToPrompt(projectId: string, title: string, body: string) {
+    setPromptSeed((s) => ({ projectId, body, title, n: (s?.n ?? 0) + 1 }));
+    setPage("prompts");
+    document.getElementById("tab-prompts")?.focus();
+  }
+
+  // Convert a saved note into a task (F7, D8): one-way, confirmed. The tab key
+  // (projectId:id) is unchanged, so reconcileTabs (inside mutate) refreshes the
+  // same tab in place and it re-renders as a task.
+  function requestConvertToTask(item: Item) {
+    void (async () => {
+      if (
+        !(await api.confirmDialog(
+          `Convert "${item.title}" to a task? It gets status todo and normal priority; this cannot be converted back.`,
+        ))
+      )
+        return;
+      await mutate(() => api.convertNoteToTask(item.id));
+    })();
   }
 
   function openDuplicateDraft(source: Item) {
@@ -674,11 +800,18 @@ export default function App() {
                   onSave={(patch: UpdateItem) =>
                     mutate(() => api.updateItem(t.item.id, patch))
                   }
+                  onStatusChange={(status) =>
+                    mutate(() => api.updateItem(t.item.id, { status }))
+                  }
                   onCreate={(input) => createFromDraft(t.key, input)}
                   onTargetChange={(id) =>
                     setTabs((s) => setTabItem(s, t.key, { ...t.item, projectId: id || null }))
                   }
                   onDuplicate={() => openDuplicateDraft(t.item)}
+                  onConvertToTask={() => requestConvertToTask(t.item)}
+                  onCreatePromptFromNote={(title, body) =>
+                    t.item.projectId && sendNoteToPrompt(t.item.projectId, title, body)
+                  }
                   onArchive={(archived) =>
                     void mutate(() => api.updateItem(t.item.id, { archived }))
                   }
@@ -720,6 +853,8 @@ export default function App() {
           onResolve={dismissKey}
           onOpenPromptsChange={setOpenPromptProjectIds}
           seed={promptSeed}
+          session={initialSession?.prompts ?? null}
+          sessionReady={metaLoaded}
         />
       </div>
 
@@ -739,6 +874,8 @@ export default function App() {
           onOpenScratchChange={setOpenScratchProjectIds}
           onSendToItem={sendSelectionToItem}
           onSendToPrompt={sendSelectionToPrompt}
+          session={initialSession?.scratch ?? null}
+          sessionReady={metaLoaded}
         />
       </div>
 
@@ -754,7 +891,11 @@ export default function App() {
         />
       )}
       {showSettings && (
-        <SettingsDialog onClose={() => setShowSettings(false)} onError={showError} />
+        <SettingsDialog
+          onClose={() => setShowSettings(false)}
+          onError={showError}
+          onKeySaved={(p) => dismissKey(missingKeyToastKey(p))}
+        />
       )}
       {showAbout && (
         <AboutDialog onClose={() => setShowAbout(false)} onError={showError} />

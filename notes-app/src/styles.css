@@ -18,14 +18,15 @@
 
   /* Accents — Original palette values. As of Plan 11 --mark*, --danger, and
      --todo are re-themed per palette (see the :root[data-palette=…] blocks); do
-     NOT treat them as global constants. Only --doing/--done (status dots) and
-     --scrim stay fixed across every palette. */
+     NOT treat them as global constants. Only --doing/--testing/--done (status
+     dots) and --scrim stay fixed across every palette. */
   --mark: #f6e05e;
   --mark-soft: #fbf3c9;
   --mark-ink: #6b5c0e;
   --danger: #b4533a;
   --todo: #9aa0a6;
   --doing: #d9a441;
+  --testing: #4f7ec2;
   --done: #4c8a64;
   --scrim: rgba(35, 39, 42, 0.35);
 
@@ -55,8 +56,9 @@
    family + neutrals. Each block below is the AUTHORITATIVE full-token source for
    its palette; the compound `:root[data-palette=…]` selector (specificity 0,2,0)
    reliably beats the legacy neutral `[data-theme="dark"]` block (0,1,0) whatever
-   the source order. `--doing`/`--done` stay constant; unlike the pre-Plan-11
-   invariant, `--mark*`, `--danger`, and `--todo` now vary per palette (see DESIGN.md).
+   the source order. `--doing`/`--testing`/`--done` stay constant; unlike the
+   pre-Plan-11 invariant, `--mark*`, `--danger`, and `--todo` now vary per
+   palette (see DESIGN.md).
    The "original" (light) palette is the base :root above — no block is needed
    for it, since no `:root[data-palette=…]` selector matches when it is active. */
 
@@ -74,6 +76,7 @@
   --danger: #ff4d4d;
   --todo: #898989;
   --doing: #d9a441;
+  --testing: #4f7ec2;
   --done: #4c8a64;
 }
 
@@ -91,6 +94,7 @@
   --danger: #ff4d4d;
   --todo: #898989;
   --doing: #d9a441;
+  --testing: #4f7ec2;
   --done: #4c8a64;
 }
 
@@ -108,6 +112,7 @@
   --danger: #bf00ff;
   --todo: #8a8a8a;
   --doing: #d9a441;
+  --testing: #4f7ec2;
   --done: #4c8a64;
 }
 
@@ -125,6 +130,7 @@
   --danger: #c0553a;
   --todo: #8c8377;
   --doing: #d9a441;
+  --testing: #4f7ec2;
   --done: #4c8a64;
 }
 
@@ -529,6 +535,10 @@ textarea {
   background: var(--doing);
 }
 
+.dot-testing {
+  background: var(--testing);
+}
+
 .dot-done {
   background: var(--done);
 }
@@ -575,6 +585,25 @@ textarea {
    `hidden` attribute, so hide it explicitly — mirrors `.page-body[hidden]`. */
 .editor[hidden] {
   display: none;
+}
+
+/* F3 (plan.14 D2): unsaved-changes frame on the active editor pane. `outline`
+   (not border) so dirty↔clean flips never reflow; --mark is deliberately the
+   same unsaved signal as .etab-unsaved and varies per palette. Supplementary to
+   the tab dot and the Save label (WCAG 1.4.1). */
+.editor.is-dirty {
+  outline: 2px solid var(--mark);
+  outline-offset: -2px;
+}
+
+/* The two light palettes' --mark fails WCAG 1.4.11 non-text contrast against
+   their --bg for a 2px boundary (original #f6e05e ≈ 1.17:1, v2-light #4dddbc
+   ≈ 1.48:1 — an invisible frame). Their --mark-ink is the same mark family at
+   readable depth (≈ 5.8:1 / 6.6:1); the three dark palettes keep --mark
+   (5.7–15.4:1). Mirrors the per-palette-override pattern used above. */
+:root[data-palette="original"] .editor.is-dirty,
+:root[data-palette="v2-light"] .editor.is-dirty {
+  outline-color: var(--mark-ink);
 }
 
 .editor-empty {
@@ -660,6 +689,10 @@ textarea {
   display: flex;
   gap: 12px;
   align-items: center;
+  /* The header can now carry up to four buttons beside the title (F7 added
+     two); wrap instead of clipping at narrow widths — the title's flex:1
+     still claims the free space on whichever line it lands. */
+  flex-wrap: wrap;
 }
 
 .title {

@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { Kind, ProjectInfo } from "../types";
 import * as api from "../lib/api";
+import { writeSession, type ScratchSlice } from "../lib/session";
 import {
   activateTab,
   activeTab,
@@ -34,6 +35,10 @@ interface Props {
    *  targeting the pad's own project and issue no write (D5, §4 L3). */
   onSendToItem: (kind: Kind, projectId: string, body: string) => void;
   onSendToPrompt: (projectId: string, body: string) => void;
+  /** F4 (D10): this page's slice of the stored session (null = nothing to
+   *  restore), and the go signal (App flips it after the first loadMeta). */
+  session: ScratchSlice | null;
+  sessionReady: boolean;
 }
 
 // Scratch tab keys are namespaced so they can never collide with item/prompt
@@ -55,6 +60,8 @@ export default function ScratchPage({
   onOpenScratchChange,
   onSendToItem,
   onSendToPrompt,
+  session,
+  sessionReady,
 }: Props) {
   const [tabs, setTabs] = useState<OpenTabsState<ScratchDoc>>(emptyTabs);
   const tabsRef = useRef(tabs);
@@ -91,6 +98,61 @@ export default function ScratchPage({
     const key = scratchTabKey(reloadSignal.projectId);
     setTabs((s) => closeTab(s, key));
   }, [reloadSignal]);
+
+  // F4 (D10) restore, once, when App signals the loaded catalog is known: open
+  // a pad tab per persisted project id still loaded (fetching each scratch.md;
+  // failures dropped silently — unlike a rail click, a restore has no one to
+  // toast at yet), then re-activate the persisted pad. Restored tabs open
+  // clean. `sessionRestored` gates the writer below.
+  const restoredRef = useRef(false);
+  const [sessionRestored, setSessionRestored] = useState(false);
+  useEffect(() => {
+    if (!sessionReady || restoredRef.current) return;
+    restoredRef.current = true;
+    const s = session;
+    if (!s) {
+      setSessionRestored(true);
+      return;
+    }
+    const ids = s.projectIds.filter((id) => loaded.some((p) => p.id === id));
+    void (async () => {
+      const results = await Promise.all(
+        ids.map((id) =>
+          api.getScratch(id).then(
+            (body): ScratchDoc | null => ({ projectId: id, body }),
+            (): ScratchDoc | null => null,
+          ),
+        ),
+      );
+      setTabs((prev) => {
+        let next = prev;
+        for (const doc of results) {
+          if (doc) next = openTab(next, scratchTabKey(doc.projectId), doc);
+        }
+        if (s.activeProjectId) {
+          const key = scratchTabKey(s.activeProjectId);
+          if (next.tabs.some((t) => t.key === key)) next = activateTab(next, key);
+        }
+        return next;
+      });
+      setSessionRestored(true);
+    })();
+  }, [sessionReady, session, loaded]);
+
+  // F4 persistence: this page's slice, debounced ~300 ms; project ids only.
+  const openPadProjectIds = useMemo(() => tabs.tabs.map((t) => t.item.projectId), [tabs]);
+  useEffect(() => {
+    if (!sessionRestored) return;
+    const t = window.setTimeout(() => {
+      writeSession({
+        scratch: {
+          projectIds: openPadProjectIds,
+          activeProjectId: activeTab(tabs)?.item.projectId ?? null,
+        },
+      });
+    }, 300);
+    return () => window.clearTimeout(t);
+  }, [sessionRestored, openPadProjectIds, tabs]);
 
   const emptyEditorRef = useRef<HTMLElement>(null);
   const hadTabsRef = useRef(false);

@@ -54,6 +54,16 @@ pub async fn update_item(
     state.manager.update(&id, patch).await
 }
 
+/// Convert a NOTE into a task (plan.14 F7): id-only input — status/priority
+/// are defaulted SERVER-side exactly as `create()` does, and `id`/`createdAt`/
+/// `updatedAt`/`schemaVersion` are never accepted from the client (S-8). The
+/// one narrow exception to "kind is fixed at creation"; `UpdateItem` still has
+/// no `kind` field.
+#[tauri::command]
+pub async fn convert_note_to_task(state: State<'_, AppState>, id: String) -> Result<Item> {
+    state.manager.convert_note_to_task(&id).await
+}
+
 #[tauri::command]
 pub async fn delete_item(state: State<'_, AppState>, id: String) -> Result<()> {
     state.manager.delete(&id).await
@@ -163,9 +173,14 @@ pub async fn open_project(state: State<'_, AppState>, dir: String) -> Result<Pro
     state.manager.open_project(&dir).await
 }
 
-/// Load a known project by id.
+/// Load a known project by id. Returns the info plus per-file import warnings
+/// (skipped files, degraded values) — the same channel `reload_project` has,
+/// so a load-time skip or degrade is never silent (plan.14 S-2).
 #[tauri::command]
-pub async fn load_project(state: State<'_, AppState>, id: String) -> Result<ProjectInfo> {
+pub async fn load_project(
+    state: State<'_, AppState>,
+    id: String,
+) -> Result<(ProjectInfo, Vec<String>)> {
     state.manager.load(&id).await
 }
 

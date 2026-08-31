@@ -37,6 +37,7 @@ const STATUS_FILTERS: { id: StatusFilter; label: string }[] = [
   { id: "all", label: "All statuses" },
   { id: "todo", label: "todo" },
   { id: "doing", label: "doing" },
+  { id: "testing", label: "testing" },
   { id: "done", label: "done" },
 ];
 

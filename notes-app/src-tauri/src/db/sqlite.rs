@@ -342,6 +342,9 @@ impl SqliteRepository {
         let prompt_outcome = promptfile::scan(prompts_dir);
         let mut warnings: Vec<String> =
             outcome.errors.iter().map(|(name, e)| format!("{name}: {e}")).collect();
+        // Degradation warnings (plan.14 S-2): the file imported, but a value was
+        // read as a default (an unknown status → todo) — surfaced, not silent.
+        warnings.extend(outcome.warnings.iter().cloned());
         warnings.extend(prompt_outcome.errors.iter().map(|(name, e)| format!("{name}: {e}")));
 
         let mut tx = self.pool.begin().await?;
@@ -581,9 +584,12 @@ fn push_sort(qb: &mut QueryBuilder<'_, Sqlite>, sort: Sort) {
         }
         Sort::Status => {
             qb.push(", CASE WHEN i.kind = 'note' THEN 1 ELSE 0 END");
+            // "Active work first" (plan.14 D3). MUST mirror `status_rank` in
+            // projects/mod.rs character-for-character, or the multi-project
+            // k-way merge diverges from the single-project order.
             qb.push(
-                ", CASE i.status WHEN 'doing' THEN 0 WHEN 'todo' THEN 1 \
-                 WHEN 'done' THEN 2 ELSE 3 END",
+                ", CASE i.status WHEN 'doing' THEN 0 WHEN 'testing' THEN 1 \
+                 WHEN 'todo' THEN 2 WHEN 'done' THEN 3 ELSE 4 END",
             );
         }
     }
@@ -775,6 +781,37 @@ impl ItemRepository for SqliteRepository {
         .execute(&self.pool)
         .await?;
 
+        Ok(item)
+    }
+
+    async fn convert_note_to_task(&self, id: &str) -> Result<Item> {
+        let mut item = self.fetch(id).await?; // unknown id → clean NotFound
+        if item.kind != Kind::Note {
+            return Err(AppError::Invalid("only a note can be converted to a task".into()));
+        }
+        item.kind = Kind::Task;
+        // Exactly the `create()` task defaults — never client-supplied (S-8).
+        item.status = Some(Status::Todo);
+        item.priority = Some(Priority::Normal);
+        item.due_at = None; // a note has none by invariant; forced for defense
+        item.updated_at = now_rfc3339(); // a content edit
+
+        // File-then-index (Stage 2), like update().
+        if let Some(dir) = &self.items_dir {
+            itemfile::write_item(dir, &item).map_err(save_file_error)?;
+        }
+        sqlx::query(
+            "UPDATE items SET kind = ?1, status = ?2, priority = ?3, due_at = ?4, \
+             updated_at = ?5 WHERE id = ?6",
+        )
+        .bind(item.kind)
+        .bind(item.status)
+        .bind(item.priority)
+        .bind(&item.due_at)
+        .bind(&item.updated_at)
+        .bind(&item.id)
+        .execute(&self.pool)
+        .await?;
         Ok(item)
     }
 

@@ -42,6 +42,13 @@ export function updateItem(id: string, patch: UpdateItem): Promise<Item> {
   return invoke("update_item", { id, patch });
 }
 
+/** Convert a saved NOTE into a task (plan.14 F7) — one-way, same id/tab key.
+ *  The backend stamps create()'s task defaults (todo/normal, no due date) and
+ *  bumps updatedAt; only the id crosses IPC. */
+export function convertNoteToTask(id: string): Promise<Item> {
+  return invoke("convert_note_to_task", { id });
+}
+
 export function deleteItem(id: string): Promise<void> {
   return invoke("delete_item", { id });
 }
@@ -69,7 +76,9 @@ export function openProject(dir: string): Promise<ProjectInfo> {
   return invoke("open_project", { dir });
 }
 
-export function loadProject(id: string): Promise<ProjectInfo> {
+/** Load a known project. Resolves to the info plus per-file import warnings
+ *  (skipped files, degraded values) — mirror of reloadProject's channel. */
+export function loadProject(id: string): Promise<[ProjectInfo, string[]]> {
   return invoke("load_project", { id });
 }
 

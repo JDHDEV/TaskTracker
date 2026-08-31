@@ -35,6 +35,7 @@ const NOTE_ID: &str = "11111111-1111-1111-1111-111111111111";
 const TASK_ID: &str = "22222222-2222-2222-2222-222222222222";
 const LEGACY_ID: &str = "33333333-3333-3333-3333-333333333333";
 const FUTURE_ID: &str = "44444444-4444-4444-4444-444444444444";
+const TESTING_STATUS_ID: &str = "55555555-5555-5555-5555-555555555555";
 
 const PROMPT_A: &str = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
 const PROMPT_B: &str = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
@@ -135,7 +136,12 @@ fn every_v1_item_fixture_still_scans_without_error() {
         "v1.0.0 item files must still parse; skipped: {:?}",
         outcome.errors
     );
-    assert_eq!(outcome.items.len(), 4, "every fixture item must be imported");
+    assert_eq!(outcome.items.len(), 5, "every fixture item must be imported");
+    assert!(
+        outcome.warnings.is_empty(),
+        "no fixture may degrade on import; warnings: {:?}",
+        outcome.warnings
+    );
 }
 
 #[test]
@@ -181,6 +187,25 @@ fn v1_task_fixture_parses_every_optional_field() {
 }
 
 #[test]
+fn v1_task_with_testing_status_parses_and_reserializes() {
+    // plan.14 F2: the golden fixture carrying the new `status: testing` value
+    // must parse field-for-field like any other current-shape task, with no
+    // degradation warning (it is a KNOWN value, not the degrade case).
+    let outcome = itemfile::scan(&items_dir());
+    let task = find(&outcome.items, TESTING_STATUS_ID);
+
+    assert_eq!(task.kind, Kind::Task);
+    assert_eq!(task.title, "Task in testing");
+    assert_eq!(task.status, Some(Status::Testing));
+    assert_eq!(task.priority, Some(Priority::Normal));
+    assert_eq!(task.tags.0, vec!["release".to_string()]);
+    assert!(!task.pinned);
+    assert!(!task.archived);
+    assert_eq!(task.schema_version, "1.0.0");
+    assert_eq!(task.body, "Verify the installer on a clean VM before marking done.\n");
+}
+
+#[test]
 fn v1_item_without_a_schema_version_marker_defaults_to_1_0_0() {
     // The back-fill contract: files written before the marker existed are
     // already 1.0.0-shaped, so an absent marker is a default, never an error.
@@ -221,15 +246,44 @@ fn current_shape_item_fixtures_reserialize_byte_identically() {
     for name in [
         "items/11111111-1111-1111-1111-111111111111.md",
         "items/22222222-2222-2222-2222-222222222222.md",
+        "items/55555555-5555-5555-5555-555555555555.md",
     ] {
         let bytes = read(name);
-        let parsed = itemfile::parse(&bytes).unwrap_or_else(|e| panic!("{name}: {e}"));
+        let (parsed, _) = itemfile::parse(&bytes).unwrap_or_else(|e| panic!("{name}: {e}"));
         assert_eq!(
             itemfile::serialize(&parsed),
             bytes,
             "{name} must re-export byte-identically or it is a spurious git diff"
         );
     }
+}
+
+#[test]
+fn an_unknown_status_task_degrades_instead_of_being_skipped_on_a_scan() {
+    // Compat-level companion to the itemfile unit test: a task file carrying a
+    // status value NO build yet knows (as an old-format `v1_0_0` fixture never
+    // could, since `testing` postdates it) must still import — degraded to
+    // `todo`, with a warning, never silently dropped from the scan. Written to
+    // a scratch temp dir, NOT the append-only fixtures tree (module docs: the
+    // only legitimate edit there is adding a case, and this is not a golden).
+    let dir = tempdir().unwrap();
+    let items_dir = dir.path().join("items");
+    std::fs::create_dir_all(&items_dir).unwrap();
+    let id = "66666666-6666-6666-6666-666666666666";
+    let text = format!(
+        "---\nid: {id}\nkind: task\ntitle: \"someday task\"\nstatus: someday\n\
+         priority: normal\npinned: false\narchived: false\ntags: []\n\
+         created_at: 2026-07-14T09:00:00.000+00:00\n\
+         updated_at: 2026-07-14T09:00:00.000+00:00\nschema_version: 1.0.0\n---\nbody\n"
+    );
+    std::fs::write(items_dir.join(format!("{id}.md")), text).unwrap();
+
+    let outcome = itemfile::scan(&items_dir);
+    assert!(outcome.errors.is_empty(), "a degrade is a warning, never an error: {:?}", outcome.errors);
+    assert_eq!(outcome.items.len(), 1, "the file must still import, not be skipped");
+    assert_eq!(outcome.items[0].status, Some(Status::Todo));
+    assert_eq!(outcome.warnings.len(), 1);
+    assert!(outcome.warnings[0].contains(id), "the warning must name the offending file: {}", outcome.warnings[0]);
 }
 
 #[test]

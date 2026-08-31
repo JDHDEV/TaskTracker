@@ -13,6 +13,11 @@ import { invalidateJiraEnrichment } from "../hooks/useJiraEnrichment";
 interface Props {
   onClose: () => void;
   onError: (message: string) => void;
+  /** Fires after a NON-EMPTY key/token saved successfully (an empty save is a
+   *  delete and must not fire). Typed `string`, not ProviderId: it also carries
+   *  "atlassian" for the JIRA token, which is not an AI provider. Presence-only
+   *  — the key material itself never leaves this dialog (S-6). */
+  onKeySaved?: (provider: string) => void;
 }
 
 const PROVIDERS: { id: ProviderId; label: string; hint: string }[] = [
@@ -20,7 +25,7 @@ const PROVIDERS: { id: ProviderId; label: string; hint: string }[] = [
   { id: "openai", label: "OpenAI (GPT)", hint: "platform.openai.com" },
 ];
 
-export default function SettingsDialog({ onClose, onError }: Props) {
+export default function SettingsDialog({ onClose, onError, onKeySaved }: Props) {
   const [present, setPresent] = useState<Record<ProviderId, boolean>>({
     anthropic: false,
     openai: false,
@@ -58,8 +63,14 @@ export default function SettingsDialog({ onClose, onError }: Props) {
   async function saveKey(id: ProviderId) {
     try {
       await setApiKey(id, drafts[id]);
-      setPresent((p) => ({ ...p, [id]: drafts[id].trim().length > 0 }));
+      // Presence re-checked through the boolean-only API (S-6): the pill and
+      // the onKeySaved signal are driven by hasApiKey after the save, never by
+      // inspecting the draft string. An empty save deletes the key → false →
+      // no dismiss.
+      const saved = await hasApiKey(id);
+      setPresent((p) => ({ ...p, [id]: saved }));
       setDrafts((d) => ({ ...d, [id]: "" }));
+      if (saved) onKeySaved?.(id);
     } catch (err) {
       onError(String(err));
     }
@@ -79,9 +90,12 @@ export default function SettingsDialog({ onClose, onError }: Props) {
   async function saveJiraToken() {
     try {
       await setJiraToken(jiraTokenDraft);
-      setJiraTokenPresent(jiraTokenDraft.trim().length > 0);
+      // Same presence-only re-check as saveKey (S-6).
+      const saved = await hasJiraToken();
+      setJiraTokenPresent(saved);
       setJiraTokenDraft("");
       invalidateJiraEnrichment();
+      if (saved) onKeySaved?.("atlassian");
     } catch (err) {
       onError(String(err));
     }

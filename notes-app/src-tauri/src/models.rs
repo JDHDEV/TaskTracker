@@ -19,12 +19,20 @@ pub enum Kind {
     Task,
 }
 
+/// Task status. Widening this vocabulary is a ONE-WAY on-disk change for
+/// builds older than the value's introduction (they skip the whole file); from
+/// plan.14 on, `itemfile::parse_status` degrades an unknown value to `Todo`
+/// with a warning instead — see notes-app/CLAUDE.md § "On-disk backward
+/// compatibility". Adding a variant: sweep the non-compiler-caught sites named
+/// there (`parse_status`, the SQL sort CASE, `status_rank`, `types.ts`,
+/// `STATUSES`, `STATUS_FILTERS`, the `--<status>` CSS token + `.dot-<status>`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
 #[serde(rename_all = "lowercase")]
 #[sqlx(rename_all = "lowercase")]
 pub enum Status {
     Todo,
     Doing,
+    Testing,
     Done,
 }
 

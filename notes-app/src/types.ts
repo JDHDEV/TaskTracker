@@ -1,7 +1,7 @@
 // Mirrors src-tauri/src/models.rs. If you change one, change the other.
 
 export type Kind = "note" | "task";
-export type Status = "todo" | "doing" | "done";
+export type Status = "todo" | "doing" | "testing" | "done";
 export type Priority = "low" | "normal" | "high";
 export type Sort = "updated" | "created" | "priority" | "status";
 

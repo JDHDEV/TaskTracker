@@ -99,8 +99,17 @@ export default function ManageProjectsDialog({
 
   function handleLoad(p: ProjectInfo) {
     void withBusy(async () => {
-      await loadProject(p.id);
+      const [, warnings] = await loadProject(p.id);
       onChanged();
+      // Per-file import warnings (skipped or degraded files) — the same
+      // surfacing App.reloadProject gives reload's warnings.
+      if (warnings.length > 0) {
+        const w = warnings.length;
+        onError(
+          `Loaded "${p.name}", but ${w} file${w === 1 ? "" : "s"} had problems:\n` +
+            warnings.join("\n"),
+        );
+      }
     }, null);
   }
 

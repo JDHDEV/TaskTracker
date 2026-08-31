@@ -292,13 +292,15 @@ impl ProjectManager {
     }
 
     /// Load a KNOWN (catalog) project by id — used at startup and by the UI's
-    /// load toggle. Idempotent: loading an already-loaded project is a no-op.
-    pub async fn load(&self, id: &str) -> Result<ProjectInfo> {
+    /// load toggle. Idempotent: loading an already-loaded project is a no-op
+    /// (empty warnings). Returns the per-file import warnings alongside the
+    /// info (plan.14 S-2): previously discarded here, which silenced
+    /// skipped-file AND degraded-status reports on the `load_project` path.
+    pub async fn load(&self, id: &str) -> Result<(ProjectInfo, Vec<String>)> {
         if self.is_loaded(id) {
-            return self.project_info(id).await;
+            return Ok((self.project_info(id).await?, Vec::new()));
         }
-        let (info, _warnings) = self.load_from_catalog(id).await?;
-        Ok(info)
+        self.load_from_catalog(id).await
     }
 
     /// Open a known project's store from its catalog directory, converting a
@@ -513,6 +515,15 @@ impl ProjectManager {
     pub async fn update(&self, id: &str, patch: UpdateItem) -> Result<Item> {
         let (pid, repo) = self.owner(id).await?;
         let mut item = repo.update(id, patch).await?;
+        item.project_id = Some(pid);
+        Ok(item)
+    }
+
+    /// Convert a note into a task (plan.14 F7) — routed to the owning loaded
+    /// store; the owning project is stamped on return, like `update`.
+    pub async fn convert_note_to_task(&self, id: &str) -> Result<Item> {
+        let (pid, repo) = self.owner(id).await?;
+        let mut item = repo.convert_note_to_task(id).await?;
         item.project_id = Some(pid);
         Ok(item)
     }
@@ -1166,7 +1177,11 @@ async fn migrate_db_to_files(dir: &Path) -> Result<Option<(String, String)>> {
     // original as a `.bak` (never deleted), drop stale sidecars, refresh the
     // `.gitignore`. The index is (re)built by the caller from `items/`.
     if from_legacy {
-        let _ = std::fs::rename(&legacy_path, dir.join(STAGE1_BACKUP));
+        // Retried like remove_file_retrying: an AV/indexer scan can briefly
+        // hold the just-closed project.db, and a silently skipped rename left
+        // the backup unmade (the intermittent test failure this fixes). Still
+        // best-effort — the canonical files are already published above.
+        let _ = rename_retrying(&legacy_path, &dir.join(STAGE1_BACKUP));
         for suffix in ["-wal", "-shm"] {
             let _ = remove_file_retrying(&dir.join(format!("{LEGACY_DB_FILE}{suffix}")));
         }
@@ -1249,6 +1264,19 @@ fn remove_file_retrying(path: &Path) -> std::io::Result<()> {
     }
 }
 
+/// Rename, retrying briefly (same Windows transient-handle reason as
+/// `remove_file_retrying` — an AV/indexer scan can hold a just-closed file for
+/// a moment). Callers decide whether a final failure matters.
+fn rename_retrying(from: &Path, to: &Path) -> std::io::Result<()> {
+    for _ in 0..40 {
+        match std::fs::rename(from, to) {
+            Ok(()) => return Ok(()),
+            Err(_) => std::thread::sleep(std::time::Duration::from_millis(25)),
+        }
+    }
+    std::fs::rename(from, to)
+}
+
 /// Remove a directory tree, retrying briefly (same Windows transient-handle
 /// reason as `remove_file_retrying`; a canonical `items/` never holds open file
 /// handles, but an AV/indexer scan can still lag a delete). A missing directory
@@ -1284,12 +1312,16 @@ fn priority_rank(item: &Item) -> u8 {
     }
 }
 
+// "Active work first" (plan.14 D3). MUST mirror the SQL status CASE in
+// `sqlite.rs::push_sort` exactly, or the multi-project merge order diverges
+// from a single project's.
 fn status_rank(item: &Item) -> u8 {
     match item.status {
         Some(Status::Doing) => 0,
-        Some(Status::Todo) => 1,
-        Some(Status::Done) => 2,
-        None => 3,
+        Some(Status::Testing) => 1,
+        Some(Status::Todo) => 2,
+        Some(Status::Done) => 3,
+        None => 4,
     }
 }
 
@@ -1413,6 +1445,13 @@ mod merge_tests {
         }
     }
 
+    /// A task carrying a status, at a fixed timestamp — used only by the
+    /// status-sort merge test, where every item's created/updated are equal so
+    /// `status_rank` alone differentiates the order.
+    fn task_with_status(id: &str, ts: &str, status: Status) -> Item {
+        Item { kind: Kind::Task, status: Some(status), ..item(id, ts, ts, false) }
+    }
+
     fn ids(items: &[Item]) -> Vec<&str> {
         items.iter().map(|i| i.id.as_str()).collect()
     }
@@ -1462,6 +1501,33 @@ mod merge_tests {
         assert_eq!(merged.len(), 2);
         let projects: Vec<&str> = merged.iter().filter_map(|i| i.project_id.as_deref()).collect();
         assert!(projects.contains(&"A") && projects.contains(&"B"));
+    }
+
+    #[test]
+    fn status_sort_merges_doing_testing_todo_done_then_notes_across_stores() {
+        // plan.14 D3: `status_rank` MUST mirror the SQL CASE in
+        // `sqlite.rs::push_sort` exactly, or a multi-project merge order
+        // diverges from a single project's. Every item shares one timestamp, so
+        // only status_rank (and the note bucket) can differentiate the order —
+        // and the four statuses are split across two stores to exercise the
+        // cross-store interleave, not per-store concatenation. `k_way_merge`
+        // only ever compares queue FRONTS, so — mirroring what each store's own
+        // SQL query would already return — each per-store queue below is built
+        // pre-sorted in `item_order`.
+        let ts = "2026-07-14T00:00:00.000+00:00";
+        let store_a = vec![
+            task_with_status("doing", ts, Status::Doing),
+            task_with_status("done", ts, Status::Done),
+        ]
+        .into();
+        let store_b = vec![
+            task_with_status("testing", ts, Status::Testing),
+            task_with_status("todo", ts, Status::Todo),
+            item("note", ts, ts, false),
+        ]
+        .into();
+        let merged = k_way_merge(vec![store_a, store_b], Sort::Status);
+        assert_eq!(ids(&merged), vec!["doing", "testing", "todo", "done", "note"]);
     }
 
     // --- Prompt cross-store merge (plan.9) --------------------------------

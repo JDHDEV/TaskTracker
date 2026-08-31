@@ -9,6 +9,8 @@ import {
 } from "react";
 import type { ProviderId } from "../types";
 import { aiRewriteStream } from "../lib/api";
+import { reportAiError } from "../lib/aiErrors";
+import { handleLineClipboardKeyDown, handleLinePaste } from "../lib/lineEdit";
 import { tabDomId, tabPanelDomId } from "../lib/openTabs";
 import {
   captureSelection,
@@ -214,7 +216,7 @@ const ScratchEditor = forwardRef<ScratchEditorHandle, Props>(function ScratchEdi
     } catch (err) {
       if (cancelled) return;
       setProposal(null);
-      onError(String(err));
+      await reportAiError(provider, err, onError); // keyed when no key stored (F5)
     } finally {
       if (!cancelled) {
         setStreaming(false);
@@ -273,7 +275,8 @@ const ScratchEditor = forwardRef<ScratchEditorHandle, Props>(function ScratchEdi
 
   return (
     <section
-      className="editor"
+      // F3 (D2): frame the pane while there are unsaved changes.
+      className={dirty ? "editor is-dirty" : "editor"}
       role="tabpanel"
       hidden={hidden}
       id={tabPanelDomId(tabKey)}
@@ -353,6 +356,20 @@ const ScratchEditor = forwardRef<ScratchEditorHandle, Props>(function ScratchEdi
         onKeyUp={trackSelection}
         onMouseUp={trackSelection}
         onContextMenu={onContextMenu}
+        // F6 (D9): whole-line Ctrl+X/C/V on a collapsed selection. The native
+        // right-click menu path is untouched — this is keyboard-only.
+        onKeyDown={(e) => {
+          if (bodyRef.current) handleLineClipboardKeyDown(e, bodyRef.current);
+        }}
+        onPaste={(e) => {
+          const ta = bodyRef.current;
+          if (!ta) return;
+          handleLinePaste(e, ta, (nextBody, caret) => {
+            edit(nextBody);
+            clearSelection();
+            pendingCaretRef.current = { start: caret, end: caret };
+          });
+        }}
       />
 
       <SelectionMenu

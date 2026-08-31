@@ -3,6 +3,7 @@ import type { NewPrompt, ProjectInfo, Prompt, UpdatePrompt } from "../types";
 import * as api from "../lib/api";
 import { itemKey, nextToken, shouldCommit } from "../lib/projects";
 import { displayTitle } from "../lib/prompts";
+import { tabKeyId, writeSession, type PromptsSlice } from "../lib/session";
 import {
   activateTab,
   activeTab,
@@ -47,20 +48,27 @@ interface Props {
    *  active one), so App's unload confirm warns before an unload closes any of
    *  them — including a dirty background prompt tab. */
   onOpenPromptsChange: (projectIds: string[]) => void;
-  /** One-shot "send selection to prompt" seed from the Scratch page (Plan 13):
-   *  opens a dirty draft tab in `projectId` pre-filled with `body` (title left
-   *  empty — `displayTitle` derives a label). `n` distinguishes repeat sends;
-   *  the prop starts null and is consumed by the effect below. */
-  seed: { projectId: string; body: string; n: number } | null;
+  /** One-shot "send to prompt" seed: opens a dirty draft tab in `projectId`
+   *  pre-filled with `body`. Plan 13's send-selection passes no `title` (it
+   *  defaults empty — `displayTitle` derives a label); Plan 14's "Create prompt
+   *  from note" (F7) passes the note's title too. `n` distinguishes repeat
+   *  sends; the prop starts null and is consumed by the effect below. */
+  seed: { projectId: string; body: string; title?: string; n: number } | null;
+  /** F4 (D10): this page's slice of the stored session (null = nothing to
+   *  restore), and the go signal — App flips `sessionReady` after the first
+   *  successful loadMeta, so restored ids can be validated against `loaded`. */
+  session: PromptsSlice | null;
+  sessionReady: boolean;
 }
 
 /** A blank local draft targeting `projectId` — mirrors src/lib/draft.ts's
- *  newDraft for items. `body` seeds the body only (send-to). Never sent over
- *  IPC directly (createPrompt takes a NewPrompt built from it at Save time). */
-function newDraft(projectId: string, body = ""): Prompt {
+ *  newDraft for items. `body`/`title` only seed the buffer (send-to / F7 note
+ *  seed). Never sent over IPC directly (createPrompt takes a NewPrompt built
+ *  from it at Save time). */
+function newDraft(projectId: string, body = "", title = ""): Prompt {
   return {
     id: "",
-    title: "",
+    title,
     body,
     reusable: false,
     // Placeholder: the backend mints the real marker on Save (it is not sent).
@@ -89,6 +97,8 @@ export default function PromptsPage({
   onResolve,
   onOpenPromptsChange,
   seed,
+  session,
+  sessionReady,
 }: Props) {
   const [projectId, setProjectId] = useState("");
   const [reusableOnly, setReusableOnly] = useState(false);
@@ -154,8 +164,76 @@ export default function PromptsPage({
     setProjectId(seed.projectId);
     const seq = draftSeq + 1;
     setDraftSeq(seq);
-    setTabs((s) => openTab(s, `prompt-draft-${seq}`, newDraft(seed.projectId, seed.body), true));
+    setTabs((s) =>
+      openTab(s, `prompt-draft-${seq}`, newDraft(seed.projectId, seed.body, seed.title ?? ""), true),
+    );
   }, [seed]);
+
+  // F4 (D10) restore, once, when App signals the loaded catalog is known. The
+  // scope restores only if it names a loaded project; tabs are fetched by id
+  // in persisted order, misses dropped silently, then the persisted active tab
+  // re-activates. Restored tabs open clean. `sessionRestored` gates the writer
+  // below so the initial empty state never clobbers the stored slice.
+  const restoredRef = useRef(false);
+  const [sessionRestored, setSessionRestored] = useState(false);
+  useEffect(() => {
+    if (!sessionReady || restoredRef.current) return;
+    restoredRef.current = true;
+    const s = session;
+    if (!s) {
+      setSessionRestored(true);
+      return;
+    }
+    if (s.projectId && loaded.some((p) => p.id === s.projectId)) setProjectId(s.projectId);
+    setReusableOnly(s.reusableOnly);
+    void (async () => {
+      const results = await Promise.all(
+        s.tabKeys.map((key) => {
+          const id = tabKeyId(key);
+          return id
+            ? api.getPrompt(id).then(
+                (p): Prompt | null => p,
+                (): Prompt | null => null,
+              )
+            : Promise.resolve<Prompt | null>(null);
+        }),
+      );
+      setTabs((prev) => {
+        let next = prev;
+        for (const p of results) {
+          if (p) next = openTab(next, promptTabKey(p), p);
+        }
+        if (s.activeKey && hasTab(next, s.activeKey)) next = activateTab(next, s.activeKey);
+        return next;
+      });
+      setSessionRestored(true);
+    })();
+  }, [sessionReady, session, loaded]);
+
+  // F4 persistence: this page's slice, debounced ~300 ms; identifiers only
+  // (S-4) — draft tabs (id "") are never written.
+  const promptTabKeys = useMemo(
+    () => tabs.tabs.filter((t) => t.item.id !== "").map((t) => t.key),
+    [tabs],
+  );
+  const activePromptTabKey = useMemo(() => {
+    const a = activeTab(tabs);
+    return a && a.item.id !== "" ? a.key : null;
+  }, [tabs]);
+  useEffect(() => {
+    if (!sessionRestored) return;
+    const t = window.setTimeout(() => {
+      writeSession({
+        prompts: {
+          tabKeys: promptTabKeys,
+          activeKey: activePromptTabKey,
+          projectId,
+          reusableOnly,
+        },
+      });
+    }, 300);
+    return () => window.clearTimeout(t);
+  }, [sessionRestored, promptTabKeys, activePromptTabKey, projectId, reusableOnly]);
 
   // Move focus into the empty placeholder when the last prompt tab closes, so
   // focus doesn't drop to <body>.
