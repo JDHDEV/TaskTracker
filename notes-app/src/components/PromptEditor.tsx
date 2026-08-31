@@ -1,4 +1,11 @@
-import { forwardRef, useEffect, useImperativeHandle, useRef, useState } from "react";
+import {
+  forwardRef,
+  useEffect,
+  useImperativeHandle,
+  useLayoutEffect,
+  useRef,
+  useState,
+} from "react";
 import type {
   NewPrompt,
   ProjectInfo,
@@ -9,6 +16,13 @@ import type {
 } from "../types";
 import { aiRewriteStream, confirmDialog, copyToClipboard } from "../lib/api";
 import { tabDomId, tabPanelDomId } from "../lib/openTabs";
+import {
+  captureSelection,
+  isSelectionStale,
+  spliceProposal,
+  type CapturedSelection,
+  type SelectionRange,
+} from "../lib/selection";
 import { usePopover } from "../hooks/usePopover";
 import AiBar from "./AiBar";
 import PromptHistoryDialog from "./PromptHistoryDialog";
@@ -112,6 +126,45 @@ const PromptEditor = forwardRef<PromptEditorHandle, Props>(function PromptEditor
   // Blocks save re-entry (a second Ctrl+S while a save is in flight).
   const savingRef = useRef(false);
 
+  // Rework on a selection (Plan 13) — the same plumbing as Editor.tsx: the live
+  // range in a ref, one derived `selectionLength` state for the AiBar, the
+  // request-time capture `selectionRework` that `Replace text` re-validates,
+  // and a pending caret to re-select the splice after the controlled re-render.
+  const bodyRef = useRef<HTMLTextAreaElement>(null);
+  const selRef = useRef<SelectionRange | null>(null);
+  const [selectionLength, setSelectionLength] = useState(0);
+  const [selectionRework, setSelectionRework] = useState<CapturedSelection | null>(null);
+  const pendingCaretRef = useRef<SelectionRange | null>(null);
+
+  function trackSelection() {
+    const ta = bodyRef.current;
+    if (!ta) return;
+    const { selectionStart: start, selectionEnd: end } = ta;
+    selRef.current = start === end ? null : { start, end };
+    const len = captureSelection(selRef.current, body)?.text.length ?? 0;
+    if (len !== selectionLength) setSelectionLength(len);
+  }
+
+  // Leave selection mode (does not touch an in-flight `selectionRework`).
+  function clearSelection() {
+    selRef.current = null;
+    setSelectionLength(0);
+    const ta = bodyRef.current;
+    if (ta) {
+      const pos = ta.selectionEnd;
+      ta.setSelectionRange(pos, pos);
+    }
+  }
+
+  useLayoutEffect(() => {
+    const c = pendingCaretRef.current;
+    if (c && bodyRef.current) {
+      pendingCaretRef.current = null;
+      bodyRef.current.focus();
+      bodyRef.current.setSelectionRange(c.start, c.end);
+    }
+  }, [body]);
+
   // Expose save() so the close-dirty "Save" branch can persist THIS prompt tab
   // even when it is a background (non-active) tab whose buffer lives only here.
   useImperativeHandle(ref, () => ({ save: () => save() }));
@@ -140,6 +193,10 @@ const PromptEditor = forwardRef<PromptEditorHandle, Props>(function PromptEditor
     setCopied(false);
     setShowMove(false);
     savingRef.current = false;
+    setSelectionRework(null);
+    selRef.current = null;
+    setSelectionLength(0);
+    pendingCaretRef.current = null;
     return () => {
       stopRef.current?.();
       stopRef.current = null;
@@ -236,7 +293,11 @@ const PromptEditor = forwardRef<PromptEditorHandle, Props>(function PromptEditor
   });
 
   async function rework(instruction: string, provider: ProviderId) {
-    if (!body.trim()) {
+    // Selection mode is decided here from the tracked range (D7); only the
+    // selected text is sent (§4 M7).
+    const sel = captureSelection(selRef.current, body);
+    const text = sel ? sel.text : body;
+    if (!text.trim()) {
       onError("There is no text to rework yet.", { key: "prompt-no-text" });
       return;
     }
@@ -244,13 +305,14 @@ const PromptEditor = forwardRef<PromptEditorHandle, Props>(function PromptEditor
     setAiBusy(true);
     setStreaming(true);
     setProposal(""); // instant empty card; tokens accumulate into it
+    setSelectionRework(sel);
 
     // Per-request cancel flag lives in this closure, so a late chunk or the
     // settled promise from THIS request can't touch a newer request's card.
     let cancelled = false;
     const requestId = crypto.randomUUID();
     const { result, cancel } = aiRewriteStream(
-      { requestId, provider, text: body, instruction },
+      { requestId, provider, text, instruction },
       (delta) => {
         if (cancelled) return;
         setProposal((prev) => (prev ?? "") + delta);
@@ -285,6 +347,7 @@ const PromptEditor = forwardRef<PromptEditorHandle, Props>(function PromptEditor
     stopRef.current?.();
     stopRef.current = null;
     setProposal(null);
+    setSelectionRework(null);
     setStreaming(false);
     setAiBusy(false);
   }
@@ -311,6 +374,10 @@ const PromptEditor = forwardRef<PromptEditorHandle, Props>(function PromptEditor
       setDirty(false);
     })();
   }
+
+  // The body moved under a pending selection proposal (D4): disabled eagerly,
+  // re-validated on click.
+  const stale = selectionRework !== null && isSelectionStale(body, selectionRework);
 
   return (
     <section
@@ -411,21 +478,42 @@ const PromptEditor = forwardRef<PromptEditorHandle, Props>(function PromptEditor
         onRework={(i, p) => void rework(i, p)}
         onSave={() => void save()}
         onDiscard={isDraft ? undefined : discardEdits}
+        selectionLength={selectionLength}
+        onClearSelection={clearSelection}
       />
 
       {proposal !== null && (
-        <div className="review" role="region" aria-label="AI rewrite proposal">
+        <div
+          className="review"
+          role="region"
+          aria-label={selectionRework ? "AI selection rewrite proposal" : "AI rewrite proposal"}
+        >
           <div className="review-head">
             <span className="review-mark">
-              {streaming ? "Streaming…" : "Proposed rewrite"}
+              {streaming
+                ? "Streaming…"
+                : selectionRework
+                  ? "Proposed rewrite (selection)"
+                  : "Proposed rewrite"}
             </span>
             <button
               className="btn"
-              disabled={streaming || saving}
+              disabled={streaming || saving || stale}
+              title={stale ? "The selected text changed — discard and rework again." : undefined}
               onClick={async () => {
-                edit(setBody)(proposal);
-                const ok = await save({ body: proposal, source: "aiEnhanced" });
-                if (ok) setProposal(null);
+                // The ONLY splice site (§4 H4): into the captured range or not
+                // at all. A partially-AI body is still `aiEnhanced`.
+                const next = selectionRework
+                  ? spliceProposal(body, selectionRework, proposal)
+                  : { ok: true as const, body: proposal, caret: null };
+                if (!next.ok) return;
+                edit(setBody)(next.body);
+                pendingCaretRef.current = next.caret;
+                const ok = await save({ body: next.body, source: "aiEnhanced" });
+                if (ok) {
+                  setProposal(null);
+                  setSelectionRework(null);
+                }
               }}
             >
               Replace text
@@ -436,16 +524,27 @@ const PromptEditor = forwardRef<PromptEditorHandle, Props>(function PromptEditor
           </div>
           <pre className="review-body">{proposal}</pre>
           <span className="sr-only" role="status" aria-live="polite">
-            {streaming ? "Streaming rewrite" : "Rewrite ready"}
+            {streaming
+              ? "Streaming rewrite"
+              : selectionRework
+                ? "Selection rewrite ready"
+                : "Rewrite ready"}
           </span>
         </div>
       )}
 
       <textarea
         className="body"
+        ref={bodyRef}
         value={body}
         placeholder="Write the prompt text here."
-        onChange={(e) => edit(setBody)(e.target.value)}
+        onChange={(e) => {
+          edit(setBody)(e.target.value);
+          clearSelection(); // a manual edit invalidates the tracked offsets
+        }}
+        onSelect={trackSelection}
+        onKeyUp={trackSelection}
+        onMouseUp={trackSelection}
       />
 
       {showHistory && (

@@ -1,4 +1,11 @@
-import { forwardRef, useEffect, useImperativeHandle, useRef, useState } from "react";
+import {
+  forwardRef,
+  useEffect,
+  useImperativeHandle,
+  useLayoutEffect,
+  useRef,
+  useState,
+} from "react";
 import type {
   Item,
   NewItem,
@@ -14,6 +21,13 @@ import { fromDateInputValue, toDateInputValue } from "../lib/dueDate";
 import { resolveTitleForSave } from "../lib/titleForSave";
 import { isRedundantTitle } from "../lib/titleProposal";
 import { tabDomId, tabPanelDomId } from "../lib/openTabs";
+import {
+  captureSelection,
+  isSelectionStale,
+  spliceProposal,
+  type CapturedSelection,
+  type SelectionRange,
+} from "../lib/selection";
 import AiBar from "./AiBar";
 import EditorTags from "./EditorTags";
 import JiraRow from "./JiraRow";
@@ -127,6 +141,53 @@ const Editor = forwardRef<EditorHandle, Props>(function Editor(
     titleRef.current = title;
   }, [title]);
 
+  // Rework on a selection (Plan 13). The live textarea range lives in a ref
+  // (selectionStart/End persist across the blur caused by clicking the AiBar);
+  // `selectionLength` is the one derived state the AiBar renders, set only when
+  // the length actually changes. `selectionRework` is the range+text captured
+  // at request time — the fingerprint `Replace text` re-validates before it
+  // splices. `pendingCaretRef` carries the inserted range across the controlled
+  // re-render so the splice can be re-selected in the textarea.
+  const bodyRef = useRef<HTMLTextAreaElement>(null);
+  const selRef = useRef<SelectionRange | null>(null);
+  const [selectionLength, setSelectionLength] = useState(0);
+  const [selectionRework, setSelectionRework] = useState<CapturedSelection | null>(null);
+  const pendingCaretRef = useRef<SelectionRange | null>(null);
+
+  function trackSelection() {
+    const ta = bodyRef.current;
+    if (!ta) return;
+    const { selectionStart: start, selectionEnd: end } = ta;
+    selRef.current = start === end ? null : { start, end };
+    const len = captureSelection(selRef.current, body)?.text.length ?? 0;
+    if (len !== selectionLength) setSelectionLength(len);
+  }
+
+  // Leave selection mode: forget the range and collapse the visible highlight to
+  // the caret. Does NOT touch `selectionRework` — a proposal already in flight
+  // keeps the range it was captured for.
+  function clearSelection() {
+    selRef.current = null;
+    setSelectionLength(0);
+    const ta = bodyRef.current;
+    if (ta) {
+      const pos = ta.selectionEnd;
+      ta.setSelectionRange(pos, pos);
+    }
+  }
+
+  // After a splice, re-select the inserted text once the controlled textarea has
+  // re-rendered with the new body (a plain setSelectionRange before the commit
+  // would be clamped against the OLD value).
+  useLayoutEffect(() => {
+    const c = pendingCaretRef.current;
+    if (c && bodyRef.current) {
+      pendingCaretRef.current = null;
+      bodyRef.current.focus();
+      bodyRef.current.setSelectionRange(c.start, c.end);
+    }
+  }, [body]);
+
   // Expose save() so the close-dirty "Save" branch can persist THIS tab even
   // when it is a background (non-active) tab whose buffer lives only here. No
   // deps: the factory re-runs each render, so the handle always calls the latest
@@ -185,6 +246,10 @@ const Editor = forwardRef<EditorHandle, Props>(function Editor(
     setSuggestingTitle(false);
     setSaving(false);
     savingRef.current = false;
+    setSelectionRework(null);
+    selRef.current = null;
+    setSelectionLength(0);
+    pendingCaretRef.current = null;
     // Navigating away mid-stream must kill the backend stream, not just the
     // card — the cleanup marks the in-flight request cancelled (body OR the
     // R1 title phase) and cancels it, and flags a pending R4 save() as stale so
@@ -300,7 +365,11 @@ const Editor = forwardRef<EditorHandle, Props>(function Editor(
   });
 
   async function rework(instruction: string, provider: ProviderId) {
-    if (!body.trim()) {
+    // Selection mode is decided HERE, from the tracked range, never from live
+    // DOM in a click handler (D7). Only the selected text is sent (§4 M7).
+    const sel = captureSelection(selRef.current, body);
+    const text = sel ? sel.text : body;
+    if (!text.trim()) {
       onError("There is no text to rework yet.", { key: "editor-no-text" });
       return;
     }
@@ -311,6 +380,7 @@ const Editor = forwardRef<EditorHandle, Props>(function Editor(
     setProposal(""); // instant empty card; tokens accumulate into it
     setProposedTitle(null); // a fresh rework supersedes any prior title proposal
     setTitlePending(false);
+    setSelectionRework(sel);
 
     // Per-request cancel flag lives in this closure, so a late chunk or the
     // settled promise from THIS request can't touch a newer request's card.
@@ -318,7 +388,7 @@ const Editor = forwardRef<EditorHandle, Props>(function Editor(
     let cancelled = false;
     const requestId = crypto.randomUUID();
     const { result, cancel } = aiRewriteStream(
-      { requestId, provider, text: body, instruction },
+      { requestId, provider, text, instruction },
       (delta) => {
         if (cancelled) return;
         setProposal((prev) => (prev ?? "") + delta);
@@ -343,6 +413,15 @@ const Editor = forwardRef<EditorHandle, Props>(function Editor(
       setAiBusy(false);
       if (stopRef.current === stop) stopRef.current = null;
       onError(String(err));
+      return;
+    }
+
+    // A selection rework is an editing operation on a fragment, not a
+    // re-authoring — a title proposed from a fragment would be wrong, so the R1
+    // phase is skipped (D6). R4 (empty-title on Save) is untouched.
+    if (sel) {
+      setAiBusy(false);
+      if (stopRef.current === stop) stopRef.current = null;
       return;
     }
 
@@ -421,6 +500,7 @@ const Editor = forwardRef<EditorHandle, Props>(function Editor(
     stopRef.current = null;
     setProposal(null);
     setProposedTitle(null);
+    setSelectionRework(null);
     setStreaming(false);
     setTitlePending(false);
     setAiBusy(false);
@@ -435,6 +515,9 @@ const Editor = forwardRef<EditorHandle, Props>(function Editor(
 
   const released = item.kind === "task" && status === "done";
   const cardOpen = proposal !== null || proposedTitle !== null || titlePending;
+  // The body moved under a pending selection proposal → the splice would land in
+  // the wrong place. Disabled eagerly here and re-validated on click (D4).
+  const stale = selectionRework !== null && isSelectionStale(body, selectionRework);
 
   return (
     <section
@@ -581,30 +664,52 @@ const Editor = forwardRef<EditorHandle, Props>(function Editor(
         saveBlocked={isDraft && !projectId}
         onRework={(i, p) => void rework(i, p)}
         onSave={() => void save()}
+        selectionLength={selectionLength}
+        onClearSelection={clearSelection}
       />
 
       {cardOpen && (
         <div
           className="review"
           role="region"
-          aria-label={proposal !== null ? "AI rewrite proposal" : "AI title proposal"}
+          aria-label={
+            proposal !== null
+              ? selectionRework
+                ? "AI selection rewrite proposal"
+                : "AI rewrite proposal"
+              : "AI title proposal"
+          }
         >
           <div className="review-head">
             <span className="review-mark">
               {streaming
                 ? "Streaming…"
                 : proposal !== null
-                  ? "Proposed rewrite"
+                  ? selectionRework
+                    ? "Proposed rewrite (selection)"
+                    : "Proposed rewrite"
                   : "Proposed title"}
             </span>
             {proposal !== null && (
               <button
                 className="btn"
-                disabled={streaming || saving}
+                disabled={streaming || saving || stale}
+                title={stale ? "The selected text changed — discard and rework again." : undefined}
                 onClick={async () => {
-                  edit(setBody)(proposal);
-                  const ok = await save({ body: proposal });
-                  if (ok) setProposal(null); // clear only the body half on success
+                  // The ONLY splice site (§4 H4): a selection proposal lands in
+                  // its captured range or not at all — never whole-body, never
+                  // re-found. A whole-text proposal replaces the body as before.
+                  const next = selectionRework
+                    ? spliceProposal(body, selectionRework, proposal)
+                    : { ok: true as const, body: proposal, caret: null };
+                  if (!next.ok) return;
+                  edit(setBody)(next.body);
+                  pendingCaretRef.current = next.caret;
+                  const ok = await save({ body: next.body });
+                  if (ok) {
+                    setProposal(null); // clear only the body half on success
+                    setSelectionRework(null);
+                  }
                 }}
               >
                 Replace text
@@ -642,16 +747,28 @@ const Editor = forwardRef<EditorHandle, Props>(function Editor(
                 ? "Generating title"
                 : proposedTitle !== null
                   ? "Title proposed"
-                  : "Rewrite ready"}
+                  : selectionRework
+                    ? "Selection rewrite ready"
+                    : "Rewrite ready"}
           </span>
         </div>
       )}
 
       <textarea
         className="body"
+        ref={bodyRef}
         value={body}
         placeholder="Write here. Use a rework when it's rough."
-        onChange={(e) => edit(setBody)(e.target.value)}
+        onChange={(e) => {
+          edit(setBody)(e.target.value);
+          // A manual edit invalidates the tracked offsets. (React's onChange
+          // does not fire for a programmatic setBody, so a splice never clears
+          // its own re-selection.)
+          clearSelection();
+        }}
+        onSelect={trackSelection}
+        onKeyUp={trackSelection}
+        onMouseUp={trackSelection}
       />
     </section>
   );

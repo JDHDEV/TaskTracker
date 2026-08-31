@@ -21,6 +21,12 @@ interface Props {
    *  recently saved version. When provided, a Discard button appears left of
    *  Save; the item editor leaves it undefined. */
   onDiscard?: () => void;
+  /** Plan 13: the length of the body text currently selected. When positive,
+   *  the label reads "Rework selection with" and a count + `Whole text` override
+   *  appear, so the implicit selection mode is visible and escapable. */
+  selectionLength?: number;
+  /** Clear the selection mode (collapse the highlight) — the `Whole text` button. */
+  onClearSelection?: () => void;
 }
 
 const ITEM_PRESETS = [
@@ -51,10 +57,13 @@ export default function AiBar({
   onRework,
   onSave,
   onDiscard,
+  selectionLength,
+  onClearSelection,
 }: Props) {
   const [provider, setProvider] = useState<ProviderId>(getPreferredProvider);
   const [custom, setCustom] = useState("");
   const presets = variant === "prompt" ? PROMPT_PRESETS : ITEM_PRESETS;
+  const hasSelection = typeof selectionLength === "number" && selectionLength > 0;
 
   function pickProvider(next: ProviderId) {
     setProvider(next);
@@ -70,7 +79,9 @@ export default function AiBar({
 
   return (
     <div className="aibar">
-      <span className="aibar-label">Rework with</span>
+      <span className="aibar-label">
+        {hasSelection ? "Rework selection with" : "Rework with"}
+      </span>
       <select
         className="select"
         value={provider}
@@ -105,6 +116,14 @@ export default function AiBar({
       >
         {busy ? "Working…" : "Rework"}
       </button>
+      {hasSelection && (
+        <>
+          <span className="aibar-note">{selectionLength} characters selected</span>
+          <button className="btn btn-quiet" onClick={onClearSelection}>
+            Whole text
+          </button>
+        </>
+      )}
       {onDiscard && (
         <button
           className="btn btn-quiet"
