@@ -19,11 +19,13 @@ interface Props {
   activeKey: string | null;
   onActivate: (key: string) => void;
   onClose: (key: string) => void;
-  onNew: () => void;
+  /** Open a new draft tab. Optional: the scratch strip has no "new" (one pad per
+   *  project), so it omits this and the `+` button is not rendered. */
+  onNew?: () => void;
   /** aria-label for the tablist (e.g. "Open items" / "Open prompts"). */
   listLabel: string;
-  /** aria-label for the "+" new-tab button. */
-  newLabel: string;
+  /** aria-label for the "+" new-tab button (with `onNew`). */
+  newLabel?: string;
 }
 
 // The tab is a `<div role="tab">`, not a `<button>`, so the close control can be
@@ -134,9 +136,11 @@ function EditorTabs({
           </div>
         );
       })}
-      <button className="etab-new" aria-label={newLabel} onClick={onNew}>
-        +
-      </button>
+      {onNew && (
+        <button className="etab-new" aria-label={newLabel} onClick={onNew}>
+          +
+        </button>
+      )}
     </div>
   );
 }

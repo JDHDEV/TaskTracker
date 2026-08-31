@@ -21,6 +21,37 @@ describe("newDraft", () => {
     expect(draft.status).toBeNull();
     expect(draft.priority).toBeNull();
   });
+
+  it("seeds body from the third argument, leaving title/id/tags blank (Plan 13 send-to)", () => {
+    const draft = newDraft("note", "proj-1", "sent from the scratch pad");
+    expect(draft.body).toBe("sent from the scratch pad");
+    expect(draft.title).toBe("");
+    expect(draft.id).toBe("");
+    expect(draft.tags).toEqual([]);
+  });
+
+  it("defaults body to empty string when no third argument is given", () => {
+    const draft = newDraft("task", "proj-1");
+    expect(draft.body).toBe("");
+  });
+
+  it("a seeded body does not change a task's todo/normal defaults", () => {
+    const draft = newDraft("task", "proj-1", "a captured fragment");
+    expect(draft.status).toBe("todo");
+    expect(draft.priority).toBe("normal");
+    expect(draft.body).toBe("a captured fragment");
+  });
+
+  it("a seeded body does not change a note's null/null status and priority", () => {
+    const draft = newDraft("note", "proj-1", "a captured fragment");
+    expect(draft.status).toBeNull();
+    expect(draft.priority).toBeNull();
+  });
+
+  it("threads projectId through unchanged when a body is also seeded", () => {
+    const draft = newDraft("task", "proj-42", "some text");
+    expect(draft.projectId).toBe("proj-42");
+  });
 });
 
 describe("duplicateDraft", () => {

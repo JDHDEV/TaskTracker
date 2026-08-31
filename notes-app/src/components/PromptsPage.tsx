@@ -47,16 +47,21 @@ interface Props {
    *  active one), so App's unload confirm warns before an unload closes any of
    *  them — including a dirty background prompt tab. */
   onOpenPromptsChange: (projectIds: string[]) => void;
+  /** One-shot "send selection to prompt" seed from the Scratch page (Plan 13):
+   *  opens a dirty draft tab in `projectId` pre-filled with `body` (title left
+   *  empty — `displayTitle` derives a label). `n` distinguishes repeat sends;
+   *  the prop starts null and is consumed by the effect below. */
+  seed: { projectId: string; body: string; n: number } | null;
 }
 
 /** A blank local draft targeting `projectId` — mirrors src/lib/draft.ts's
- *  newDraft for items. Never sent over IPC directly (createPrompt takes a
- *  NewPrompt built from it at Save time). */
-function newDraft(projectId: string): Prompt {
+ *  newDraft for items. `body` seeds the body only (send-to). Never sent over
+ *  IPC directly (createPrompt takes a NewPrompt built from it at Save time). */
+function newDraft(projectId: string, body = ""): Prompt {
   return {
     id: "",
     title: "",
-    body: "",
+    body,
     reusable: false,
     // Placeholder: the backend mints the real marker on Save (it is not sent).
     schemaVersion: "",
@@ -83,6 +88,7 @@ export default function PromptsPage({
   onError,
   onResolve,
   onOpenPromptsChange,
+  seed,
 }: Props) {
   const [projectId, setProjectId] = useState("");
   const [reusableOnly, setReusableOnly] = useState(false);
@@ -137,6 +143,19 @@ export default function PromptsPage({
       return next;
     });
   }, [reloadSignal]);
+
+  // A "send selection to prompt" from the Scratch page: scope the rail to the
+  // pad's project and open a seeded, dirty draft tab there. The null check first
+  // makes the mount-time run (and StrictMode's double invoke) a no-op; a
+  // re-render with the same `seed` object doesn't re-fire (App mints a fresh
+  // object with `n + 1` per send).
+  useEffect(() => {
+    if (!seed) return;
+    setProjectId(seed.projectId);
+    const seq = draftSeq + 1;
+    setDraftSeq(seq);
+    setTabs((s) => openTab(s, `prompt-draft-${seq}`, newDraft(seed.projectId, seed.body), true));
+  }, [seed]);
 
   // Move focus into the empty placeholder when the last prompt tab closes, so
   // focus doesn't drop to <body>.

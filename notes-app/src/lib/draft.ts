@@ -10,13 +10,15 @@ const EMPTY_TIMESTAMP = "";
 
 /** A blank draft of the given kind, targeting `projectId` (the project it will
  *  be created into — "" when the rail filter is "All projects", so the editor
- *  must ask for a target before Save). Tasks start todo/normal; notes neither. */
-export function newDraft(kind: Kind, projectId: string = ""): Item {
+ *  must ask for a target before Save). Tasks start todo/normal; notes neither.
+ *  `body` seeds the body only (Plan 13 "send selection to…": the title stays
+ *  empty so R4 generates one on Save). */
+export function newDraft(kind: Kind, projectId: string = "", body: string = ""): Item {
   return {
     id: "",
     kind,
     title: "",
-    body: "",
+    body,
     status: kind === "task" ? "todo" : null,
     priority: kind === "task" ? "normal" : null,
     dueAt: null,

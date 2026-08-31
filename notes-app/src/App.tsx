@@ -52,10 +52,13 @@ import SettingsDialog from "./components/SettingsDialog";
 import ManageProjectsDialog from "./components/ManageProjectsDialog";
 import AboutDialog from "./components/AboutDialog";
 import PromptsPage from "./components/PromptsPage";
+import ScratchPage from "./components/ScratchPage";
 import Toasts from "./components/Toasts";
 import { useToasts } from "./hooks/useToasts";
 
-type Page = "worknotes" | "prompts";
+type Page = "worknotes" | "prompts" | "scratch";
+// Tablist order — the arrow-key walk (with wrap) follows this.
+const PAGES: Page[] = ["worknotes", "prompts", "scratch"];
 
 /** A tab's display title: the saved title, or a kind-based placeholder while an
  *  item/draft is still untitled. */
@@ -126,12 +129,21 @@ export default function App() {
   // (reported up by PromptsPage). Lets the unload confirm warn before an unload
   // closes an open prompt — even a dirty background one — not just an item.
   const [openPromptProjectIds, setOpenPromptProjectIds] = useState<string[]>([]);
+  // Likewise for open scratch-pad tabs on the Scratch page (Plan 13).
+  const [openScratchProjectIds, setOpenScratchProjectIds] = useState<string[]>([]);
 
   // Bumped when a project is reloaded so PromptsPage closes its own open prompt
   // tabs of that project — reload keeps the project `loaded`, so PromptsPage's
-  // loaded-driven close effect won't fire on its own.
+  // loaded-driven close effect won't fire on its own. ScratchPage consumes the
+  // same signal to close that project's pad tab.
   const [promptReloadSignal, setPromptReloadSignal] =
     useState<{ projectId: string; n: number } | null>(null);
+
+  // One-shot "send selection to prompt" seed (Plan 13): PromptsPage opens a
+  // dirty draft tab pre-filled with `body` in `projectId`. `n` makes each send a
+  // fresh object so the consuming effect re-fires even for identical text.
+  const [promptSeed, setPromptSeed] =
+    useState<{ projectId: string; body: string; n: number } | null>(null);
 
   // Focus target for the empty-editor placeholder, so closing the LAST tab moves
   // focus into the placeholder region instead of dropping it to <body>.
@@ -317,13 +329,31 @@ export default function App() {
     if (item) setTabs((s) => openTab(s, itemKey(item), item));
   }
 
-  function openNewDraft(kind: Kind) {
+  // `target`/`body` are the "send selection to…" seeds (Plan 13): the pad's own
+  // project and the selected text. Existing callers pass only `kind`.
+  function openNewDraft(kind: Kind, target?: string, body = "") {
     const seq = draftSeq + 1;
     setDraftSeq(seq);
     // Target the rail's project when it names a loaded project; otherwise ""
     // (All projects), so the editor requires an explicit target before Save.
-    const draftItem = newDraft(kind, resolveCreateTarget(projectFilter, loaded));
+    const draftItem = newDraft(kind, target ?? resolveCreateTarget(projectFilter, loaded), body);
     setTabs((s) => openTab(s, `draft-${seq}`, draftItem, true)); // a fresh draft starts dirty
+  }
+
+  // "Send selection to…" from a scratch pad (D5): a pre-filled, UNSAVED draft in
+  // the pad's project, title empty (R4 titles it on Save); the pad is untouched
+  // (copy, not cut) and nothing is written until the destination's own Save.
+  // Focus lands on the destination page's tab: the pad's panel goes `hidden`,
+  // which would otherwise drop a keyboard user's focus to <body>.
+  function sendSelectionToItem(kind: Kind, projectId: string, body: string) {
+    openNewDraft(kind, projectId, body);
+    setPage("worknotes");
+    document.getElementById("tab-worknotes")?.focus();
+  }
+  function sendSelectionToPrompt(projectId: string, body: string) {
+    setPromptSeed((s) => ({ projectId, body, n: (s?.n ?? 0) + 1 }));
+    setPage("prompts");
+    document.getElementById("tab-prompts")?.focus();
   }
 
   function openDuplicateDraft(source: Item) {
@@ -406,13 +436,15 @@ export default function App() {
   }
 
   // Unload confirms first when the target owns anything open — Worknotes item
-  // tabs (including background/dirty ones) OR an open prompt on the Prompts page
-  // — since unloading silently drops them; then evicts and announces.
+  // tabs (including background/dirty ones), an open prompt on the Prompts page,
+  // OR its scratch pad on the Scratch page — since unloading silently drops
+  // them; then evicts and announces.
   async function unloadProject(p: ProjectInfo) {
     const affectedItemTabs = tabs.tabs.filter((t) => t.item.projectId === p.id);
     const affectsOpenItem = affectedItemTabs.length > 0;
     const affectsOpenPrompt = openPromptProjectIds.includes(p.id);
-    const affectsOpen = affectsOpenItem || affectsOpenPrompt;
+    const affectsOpenScratch = openScratchProjectIds.includes(p.id);
+    const affectsOpen = affectsOpenItem || affectsOpenPrompt || affectsOpenScratch;
     if (affectsOpen) {
       const parts: string[] = [];
       if (affectsOpenItem) {
@@ -420,6 +452,7 @@ export default function App() {
         parts.push(`${n} open item${n === 1 ? "" : "s"}`);
       }
       if (affectsOpenPrompt) parts.push("open prompt(s)");
+      if (affectsOpenScratch) parts.push("its open scratch pad");
       const dirtyN = affectedItemTabs.filter((t) => t.isDirty).length;
       const dirtyWarn = dirtyN > 0 ? ` Unsaved changes in ${dirtyN} of them will be lost.` : "";
       if (
@@ -439,7 +472,7 @@ export default function App() {
       }
       showNotice(
         affectsOpen
-          ? `Unloaded "${p.name}" — closed the items/prompts you had open.`
+          ? `Unloaded "${p.name}" — closed the items/prompts/scratch pad you had open.`
           : `Unloaded "${p.name}".`,
       );
     }
@@ -457,13 +490,15 @@ export default function App() {
     const n = affectedItemTabs.length;
     // Prompts live in the SAME per-project store, which reload tears down and
     // rebuilds — so an open prompt tab of this project would silently clobber the
-    // freshly-reloaded file on a later save, exactly like an item tab. Confirm for
-    // both, and sweep both.
+    // freshly-reloaded file on a later save, exactly like an item tab. The
+    // scratch pad's `scratch.md` may equally have been pulled. Confirm for all
+    // three, and sweep all three.
     const affectsPrompt = openPromptProjectIds.includes(p.id);
+    const affectsScratch = openScratchProjectIds.includes(p.id);
     if (
-      (n > 0 || affectsPrompt) &&
+      (n > 0 || affectsPrompt || affectsScratch) &&
       !(await api.confirmDialog(
-        `Reloading "${p.name}" re-reads its files from disk and will close the item(s) and/or prompt(s) you have open in it (any unsaved edits are discarded). Continue?`,
+        `Reloading "${p.name}" re-reads its files from disk and will close the item(s), prompt(s) and/or scratch pad you have open in it (any unsaved edits are discarded). Continue?`,
       ))
     )
       return;
@@ -476,12 +511,12 @@ export default function App() {
       setTabs((s) => affectedItemTabs.reduce((acc, t) => closeTab(acc, t.key), s));
       affectedItemTabs.forEach((t) => editorRefs.current.delete(t.key));
     }
-    // Nudge PromptsPage to close its own open prompt tabs of this project.
-    if (affectsPrompt)
+    // Nudge PromptsPage / ScratchPage to close their own open tabs of this project.
+    if (affectsPrompt || affectsScratch)
       setPromptReloadSignal((prev) => ({ projectId: p.id, n: (prev?.n ?? 0) + 1 }));
-    if (n > 0 || affectsPrompt) {
+    if (n > 0 || affectsPrompt || affectsScratch) {
       showNotice(
-        `Reloaded "${p.name}" — closed the item(s)/prompt(s) you had open so they can reload.`,
+        `Reloaded "${p.name}" — closed the item(s)/prompt(s)/scratch pad you had open so they can reload.`,
       );
     }
     if (warnings.length > 0) {
@@ -494,16 +529,16 @@ export default function App() {
     }
   }
 
-  // Roving-tab-index page tablist: Left/Right moves to (and activates) the
-  // other tab and moves focus there, matching standard WAI-ARIA tab behavior.
+  // Roving-tab-index page tablist: Left/Right walks PAGES in order (wrapping),
+  // activating the neighbour and moving focus there — standard WAI-ARIA tabs.
   function onPageTabKeyDown(e: KeyboardEvent<HTMLButtonElement>) {
     if (e.key !== "ArrowLeft" && e.key !== "ArrowRight") return;
     e.preventDefault();
-    const next: Page = page === "worknotes" ? "prompts" : "worknotes";
+    const i = PAGES.indexOf(page);
+    const step = e.key === "ArrowLeft" ? -1 : 1;
+    const next = PAGES[(i + step + PAGES.length) % PAGES.length];
     setPage(next);
-    document
-      .getElementById(next === "worknotes" ? "tab-worknotes" : "tab-prompts")
-      ?.focus();
+    document.getElementById(`tab-${next}`)?.focus();
   }
 
   return (
@@ -534,6 +569,18 @@ export default function App() {
             onKeyDown={onPageTabKeyDown}
           >
             Prompts
+          </button>
+          <button
+            id="tab-scratch"
+            role="tab"
+            aria-selected={page === "scratch"}
+            aria-controls="panel-scratch"
+            tabIndex={page === "scratch" ? 0 : -1}
+            className={page === "scratch" ? "page-tab page-tab-on" : "page-tab"}
+            onClick={() => setPage("scratch")}
+            onKeyDown={onPageTabKeyDown}
+          >
+            Scratch
           </button>
         </div>
         <span className="meta-spring" />
@@ -672,6 +719,26 @@ export default function App() {
           onError={showError}
           onResolve={dismissKey}
           onOpenPromptsChange={setOpenPromptProjectIds}
+          seed={promptSeed}
+        />
+      </div>
+
+      <div
+        className="page-body"
+        role="tabpanel"
+        id="panel-scratch"
+        aria-labelledby="tab-scratch"
+        hidden={page !== "scratch"}
+      >
+        <ScratchPage
+          loaded={loaded}
+          pageActive={page === "scratch"}
+          reloadSignal={promptReloadSignal}
+          onError={showError}
+          onResolve={dismissKey}
+          onOpenScratchChange={setOpenScratchProjectIds}
+          onSendToItem={sendSelectionToItem}
+          onSendToPrompt={sendSelectionToPrompt}
         />
       </div>
 

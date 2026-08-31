@@ -130,6 +130,20 @@ export function startupWarnings(): Promise<string[]> {
   return invoke("startup_warnings");
 }
 
+// --- Scratch pad (Plan 13). One canonical, git-tracked `scratch.md` at the
+// project root — plain text, no frontmatter, committed with the project. The
+// project must be loaded; an absent file reads as "". Errors are fixed generic
+// strings (never a path). ---
+
+export function getScratch(projectId: string): Promise<string> {
+  return invoke("get_scratch", { projectId });
+}
+
+/** Replace the pad (an empty body deletes `scratch.md`). Capped at 4 MB server-side. */
+export function setScratch(projectId: string, body: string): Promise<void> {
+  return invoke("set_scratch", { projectId, body });
+}
+
 export function listActiveTags(): Promise<string[]> {
   return invoke("list_active_tags");
 }
