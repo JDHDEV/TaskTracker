@@ -8,18 +8,58 @@ pub mod projects;
 pub mod store;
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use tauri::Manager;
+use tauri::{Emitter, Manager};
 
 use projects::catalog::Catalog;
 use projects::ProjectManager;
+
+/// Plan.15 D10 (the R6 fold-in): whether a window close is already in flight.
+/// The `CloseRequested` handler flips it once, emits `flush-drafts`, and arms a
+/// timeout; a repeated CloseRequested while the flush runs is a prevented
+/// no-op, and the window is destroyed on the frontend's `ack_close` or the
+/// timeout — never hung open by a wedged webview.
+pub struct CloseState {
+    pub closing: AtomicBool,
+}
+
+/// How long the close waits for the webview to flush dirty buffers before
+/// closing anyway. Generous for a handful of ≤4 MiB local writes.
+const CLOSE_FLUSH_TIMEOUT_MS: u64 = 1500;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
+        // Plan.15 Phase 6: graceful window close (Alt+F4 / X) flushes every
+        // dirty editor buffer to the draft store before the window dies —
+        // Rust-side, so no `core:window:allow-close/destroy` capability grant
+        // is needed (app commands are not ACL-gated, and this handler never
+        // traverses the ACL). The frontend listener (api.onFlushDrafts) runs
+        // EditorHandle.flushDraft on every dirty tab — NEVER save(), which
+        // would write items/<uuid>.md on every close (violating D2) and can
+        // fire an AI call — then acks via the `ack_close` command.
+        .on_window_event(|window, event| {
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                api.prevent_close();
+                let state = window.state::<CloseState>();
+                if state.closing.swap(true, Ordering::SeqCst) {
+                    return; // flush already in flight; the ack/timeout closes
+                }
+                let _ = window.emit("flush-drafts", ());
+                // Timeout failsafe: destroy even if the webview never acks. A
+                // plain thread (std only) — destroy() is safe cross-thread and
+                // a no-op error if the ack won the race.
+                let win = window.clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_millis(CLOSE_FLUSH_TIMEOUT_MS));
+                    let _ = win.destroy();
+                });
+            }
+        })
         .setup(|app| {
             // %APPDATA%\<identifier> on Windows.
             let data_dir = app.path().app_data_dir()?;
@@ -49,6 +89,7 @@ pub fn run() {
                 http,
                 cancellations: Mutex::new(HashMap::new()),
             });
+            app.manage(CloseState { closing: AtomicBool::new(false) });
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -81,6 +122,11 @@ pub fn run() {
             commands::startup_warnings,
             commands::get_scratch,
             commands::set_scratch,
+            commands::save_draft,
+            commands::list_drafts,
+            commands::delete_draft,
+            commands::sweep_project_drafts,
+            commands::ack_close,
             commands::ai_rewrite,
             commands::ai_generate_title,
             commands::ai_rewrite_stream,

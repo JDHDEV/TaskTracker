@@ -290,6 +290,69 @@ pub struct PromptListFilter {
     pub reusable_only: Option<bool>,
 }
 
+// --- Draft backups (plan.15): periodic snapshots of unsaved editor buffers.
+// App-private files under `app_data_dir\drafts\<draftId>.md` — explicitly NOT a
+// compatibility surface (same status as `index.db`; see notes-app/CLAUDE.md).
+// The backend owns `v` and `savedAt` (stamped in `save_draft`); everything else
+// is the frontend's honest capture of one editor buffer. ---
+
+/// Which editor surface a draft snapshot belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DraftSurface {
+    Item,
+    Prompt,
+    Scratch,
+}
+
+/// One snapshot of an unsaved editor buffer. `draftId` is always a bare UUID
+/// (the item/prompt UUID for a saved entity, the project UUID for scratch, a
+/// freshly minted one for a never-saved draft — plan.15 D8); filenames derive
+/// ONLY from it after an `is_uuid` check. `entityId` is `""` for a never-saved
+/// draft; `projectId` may be `""` (project-less new draft). `baseUpdatedAt` is
+/// the entity's `updatedAt` the buffer was seeded from; `baseHash` is the
+/// scratch pad's content hash (scratch has no `updatedAt`). Serde camelCase;
+/// mirror in `src/types.ts`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Draft {
+    /// Record version — the backend stamps 1 on save; unknown versions are
+    /// skipped per-file on read (fail-soft), never a boot failure.
+    #[serde(default)]
+    pub v: u32,
+    pub draft_id: String,
+    pub surface: DraftSurface,
+    #[serde(default)]
+    pub project_id: String,
+    #[serde(default)]
+    pub entity_id: String,
+    #[serde(default)]
+    pub kind: Option<Kind>,
+    #[serde(default)]
+    pub base_updated_at: String,
+    #[serde(default)]
+    pub base_hash: String,
+    /// RFC 3339, minted server-side on save — the GC's TTL/eviction key.
+    #[serde(default)]
+    pub saved_at: String,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub status: Option<Status>,
+    #[serde(default)]
+    pub priority: Option<Priority>,
+    /// The editor's date-input buffer string (yyyy-mm-dd), verbatim — a draft
+    /// captures the buffer, not the wire format.
+    #[serde(default)]
+    pub due_at: String,
+    #[serde(default)]
+    pub tags: Vec<String>,
+    #[serde(default)]
+    pub jira_url: String,
+    #[serde(default)]
+    pub body: String,
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ListFilter {

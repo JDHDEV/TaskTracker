@@ -133,6 +133,40 @@ export interface PromptListFilter {
   reusableOnly?: boolean;
 }
 
+// --- Draft backups (plan.15): periodic snapshots of unsaved editor buffers.
+// Mirrors src-tauri/src/models.rs. App-private files in app_data_dir\drafts —
+// NOT a compatibility surface; deleted on save/discard/delete/unload/destroy. ---
+
+export type DraftSurface = "item" | "prompt" | "scratch";
+
+/** One snapshot of an unsaved editor buffer. `draftId` is always a bare UUID
+ *  (the item/prompt UUID for a saved entity, the project UUID for scratch, a
+ *  freshly minted one for a never-saved draft — D8); the prefixed tab-key forms
+ *  (`draft-<uuid>`, `prompt-draft-<uuid>`) are frontend-only. `entityId` is ""
+ *  for a never-saved draft; `projectId` may be "" (project-less). `v`/`savedAt`
+ *  are backend-stamped on save. `dueAt` is the date-INPUT buffer string
+ *  (yyyy-mm-dd), not the RFC 3339 wire value — a draft captures the buffer. */
+export interface Draft {
+  v: number;
+  draftId: string;
+  surface: DraftSurface;
+  projectId: string;
+  entityId: string;
+  kind: Kind | null;
+  /** The entity's updatedAt the buffer was seeded from ("" for a new draft). */
+  baseUpdatedAt: string;
+  /** Scratch only: the pad content's hash at seed time (scratch has no updatedAt). */
+  baseHash: string;
+  savedAt: string;
+  title: string;
+  status: Status | null;
+  priority: Priority | null;
+  dueAt: string;
+  tags: string[];
+  jiraUrl: string;
+  body: string;
+}
+
 export type ProviderId = "anthropic" | "openai";
 
 export interface RewriteRequest {

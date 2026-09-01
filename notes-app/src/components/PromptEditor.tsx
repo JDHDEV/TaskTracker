@@ -7,6 +7,7 @@ import {
   useState,
 } from "react";
 import type {
+  Draft,
   NewPrompt,
   ProjectInfo,
   Prompt,
@@ -15,6 +16,8 @@ import type {
   UpdatePrompt,
 } from "../types";
 import { aiRewriteStream, confirmDialog, copyToClipboard } from "../lib/api";
+import { buildPromptDraft } from "../lib/drafts";
+import { useDraftBackup } from "../hooks/useDraftBackup";
 import { reportAiError } from "../lib/aiErrors";
 import { handleLineClipboardKeyDown, handleLinePaste } from "../lib/lineEdit";
 import { tabDomId, tabPanelDomId } from "../lib/openTabs";
@@ -30,9 +33,13 @@ import AiBar from "./AiBar";
 import PromptHistoryDialog from "./PromptHistoryDialog";
 
 /** Imperative handle: lets the parent persist a background (non-active) prompt
- *  tab from the close-dirty "Save" branch (its buffer lives only here). */
+ *  tab from the close-dirty "Save" branch (its buffer lives only here).
+ *  Plan.15 adds the draft-backup verbs (see EditorHandle in Editor.tsx). */
 export interface PromptEditorHandle {
   save: () => Promise<boolean>;
+  applyDraft: (snapshot: Draft) => void;
+  flushDraft: () => Promise<void>;
+  discardDraft: () => Promise<void>;
 }
 
 interface Props {
@@ -43,6 +50,15 @@ interface Props {
   loaded: ProjectInfo[];
   /** This tab's identity key — derives the tab/panel ARIA ids. */
   tabKey: string;
+  /** The BARE on-disk draft-backup id (plan.15 D8): the prompt's UUID for a
+   *  saved prompt, the minted UUID inside `prompt-draft-<uuid>` for a draft. */
+  draftId: string;
+  /** Boot-restore seed (D5): mounts the buffer from this snapshot, DIRTY.
+   *  Consumed at mount only. */
+  restoredDraft?: Draft | null;
+  /** Orphan-restore handoff: the dead prompt's old draft file, deleted after
+   *  this editor's first successful flush under its fresh id. */
+  supersedesDraftId?: string | null;
   /** True when this tab is not the active one — the section is mounted but
    *  display:none (preserving its buffer/stream). Distinct from `active`. */
   hidden: boolean;
@@ -85,6 +101,9 @@ const PromptEditor = forwardRef<PromptEditorHandle, Props>(function PromptEditor
     isDraft,
     loaded,
     tabKey,
+    draftId,
+    restoredDraft = null,
+    supersedesDraftId = null,
     hidden,
     active,
     onDirtyChange,
@@ -99,9 +118,12 @@ const PromptEditor = forwardRef<PromptEditorHandle, Props>(function PromptEditor
   }: Props,
   ref,
 ) {
-  const [title, setTitle] = useState(prompt.title);
-  const [body, setBody] = useState(prompt.body);
-  const [dirty, setDirty] = useState(isDraft); // a fresh draft starts dirty
+  // Plan.15 D3/D5: a boot-restored draft seeds the INITIAL buffer and the tab
+  // mounts DIRTY; the reseed effect below is guarded so its mount pass can't
+  // wipe this (see Editor.tsx for the full rationale).
+  const [title, setTitle] = useState(restoredDraft ? restoredDraft.title : prompt.title);
+  const [body, setBody] = useState(restoredDraft ? restoredDraft.body : prompt.body);
+  const [dirty, setDirty] = useState(restoredDraft ? true : isDraft); // a fresh draft starts dirty
   const [proposal, setProposal] = useState<string | null>(null);
   const [streaming, setStreaming] = useState(false);
   const [aiBusy, setAiBusy] = useState(false);
@@ -127,6 +149,30 @@ const PromptEditor = forwardRef<PromptEditorHandle, Props>(function PromptEditor
   const stopRef = useRef<(() => void) | null>(null);
   // Blocks save re-entry (a second Ctrl+S while a save is in flight).
   const savingRef = useRef(false);
+
+  // --- Draft backup (plan.15 step 16) — the Editor.tsx wiring, prompt-shaped:
+  // a lastEditRef bumped at the edit() chokepoint, a per-render snapshot
+  // closure (null when buffer == base), and the shared timing hook.
+  const lastEditRef = useRef(0);
+  const snapshotRef = useRef<() => Draft | null>(() => null);
+  useEffect(() => {
+    snapshotRef.current = () => {
+      if (title === prompt.title && body === prompt.body) return null;
+      return buildPromptDraft(draftId, prompt, {
+        title,
+        body,
+        projectId: prompt.projectId ?? "",
+      });
+    };
+  });
+  const draftBackup = useDraftBackup({
+    draftId,
+    dirty,
+    active,
+    getSnapshot: snapshotRef,
+    lastEditRef,
+    supersedesDraftId,
+  });
 
   // Rework on a selection (Plan 13) — the same plumbing as Editor.tsx: the live
   // range in a ref, one derived `selectionLength` state for the AiBar, the
@@ -169,7 +215,18 @@ const PromptEditor = forwardRef<PromptEditorHandle, Props>(function PromptEditor
 
   // Expose save() so the close-dirty "Save" branch can persist THIS prompt tab
   // even when it is a background (non-active) tab whose buffer lives only here.
-  useImperativeHandle(ref, () => ({ save: () => save() }));
+  // applyDraft is the conflict bar's only way into a mounted clean editor (D4).
+  useImperativeHandle(ref, () => ({
+    save: () => save(),
+    applyDraft: (snapshot: Draft) => {
+      setTitle(snapshot.title);
+      setBody(snapshot.body);
+      setDirty(true);
+      lastEditRef.current = Date.now();
+    },
+    flushDraft: () => draftBackup.flushNow(),
+    discardDraft: () => draftBackup.discard(),
+  }));
 
   // Surface dirty↔clean transitions to the parent tab strip (never per keystroke;
   // seeded to the initial value so there is no redundant mount fire).
@@ -181,10 +238,27 @@ const PromptEditor = forwardRef<PromptEditorHandle, Props>(function PromptEditor
     }
   }, [dirty, onDirtyChange]);
 
+  // Plan.15 step 16 reseed guard — identical to Editor.tsx's: this effect also
+  // runs on MOUNT, where it would wipe a restoredDraft-seeded buffer back to
+  // saved content on the mount frame. Identity-compared (StrictMode-safe).
+  const draftSeedRef = useRef(restoredDraft ? { id: prompt.id, isDraft } : null);
+
   // Re-seed local state from the prompt. PromptsPage keys this component by
   // draft-seq/selected-id, so most selections remount it; this effect covers
   // the residual same-instance updates. Navigating away mid-stream stops it.
   useEffect(() => {
+    const seeded = draftSeedRef.current;
+    if (seeded && seeded.id === prompt.id && seeded.isDraft === isDraft) {
+      return () => {
+        stopRef.current?.();
+        stopRef.current = null;
+        if (copiedTimer.current !== null) {
+          window.clearTimeout(copiedTimer.current);
+          copiedTimer.current = null;
+        }
+      };
+    }
+    draftSeedRef.current = null; // identity moved on — normal reseeds from here
     setTitle(prompt.title);
     setBody(prompt.body);
     setDirty(isDraft);
@@ -263,7 +337,10 @@ const PromptEditor = forwardRef<PromptEditorHandle, Props>(function PromptEditor
           source: overrides?.source,
         };
         const created = await onCreate(input);
-        if (created) setDirty(false);
+        if (created) {
+          setDirty(false);
+          draftBackup.clearAfterSave(); // the created prompt owns the content now
+        }
         return created;
       }
       const saved = await onSave({
@@ -271,7 +348,10 @@ const PromptEditor = forwardRef<PromptEditorHandle, Props>(function PromptEditor
         body: effectiveBody,
         source: overrides?.source,
       });
-      if (saved) setDirty(false); // a rejected save stays dirty → "Save", not "Saved"
+      if (saved) {
+        setDirty(false); // a rejected save stays dirty → "Save", not "Saved"
+        draftBackup.clearAfterSave();
+      }
       return saved;
     } finally {
       savingRef.current = false;
@@ -295,6 +375,8 @@ const PromptEditor = forwardRef<PromptEditorHandle, Props>(function PromptEditor
   });
 
   async function rework(instruction: string, provider: ProviderId) {
+    // Plan.15 D6: snapshot before an AI entry point. Fire-and-forget.
+    void draftBackup.flushNow();
     // Selection mode is decided here from the tracked range (D7); only the
     // selected text is sent (§4 M7).
     const sel = captureSelection(selRef.current, body);
@@ -358,6 +440,8 @@ const PromptEditor = forwardRef<PromptEditorHandle, Props>(function PromptEditor
     return (value: T) => {
       setter(value);
       setDirty(true);
+      // The buffered-edit chokepoint — the draft backup keys off it (plan.15 D6).
+      lastEditRef.current = Date.now();
     };
   }
 
@@ -548,6 +632,8 @@ const PromptEditor = forwardRef<PromptEditorHandle, Props>(function PromptEditor
         onSelect={trackSelection}
         onKeyUp={trackSelection}
         onMouseUp={trackSelection}
+        // Plan.15 D6: leaving the field is a natural checkpoint — flush now.
+        onBlur={() => void draftBackup.flushNow()}
         // F6 (D9): whole-line Ctrl+X/C/V on a collapsed selection.
         onKeyDown={(e) => {
           if (bodyRef.current) handleLineClipboardKeyDown(e, bodyRef.current);

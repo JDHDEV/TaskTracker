@@ -4,6 +4,7 @@
 //! `itemfile` owns the canonical serialize/parse/scan; `db::sqlite` mirrors each
 //! write into a file and rebuilds the index from files on load.
 
+pub mod draftfile;
 pub mod itemfile;
 pub mod promptfile;
 pub mod scratchfile;

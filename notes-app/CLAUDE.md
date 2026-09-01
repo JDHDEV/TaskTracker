@@ -40,6 +40,8 @@ Every future build MUST open, without data loss or manual intervention, any proj
 
 `index.db` is explicitly NOT a compatibility surface: it is git-ignored and dropped/rebuilt from the canonical files on every load, so the per-project schema may change freely. The file format may not.
 
+`app_data_dir\drafts\` (plan.15 draft backups) is likewise NOT a compatibility surface: it holds app-private, disposable snapshots of unsaved editor buffers (`<draftId>.md`, written by `store/draftfile.rs`), same status as `index.db` — the format may change freely between builds, a build may skip or GC records it can't parse, and no migration is ever owed. This is a deliberate, narrow move of the plan-14 S-4 boundary ("never persist content outside the project"): unsaved content DOES rest here — never in localStorage, never in the project directory — and the compensating control is the mandatory sweep set: every save/discard/delete clears its draft, Unload/Reload sweep the project's drafts, and `delete_files`/`forget_project` sweep server-side, plus a startup TTL (90 days) + record-cap (50) GC. Drafts never enter `items/`, the index, or search.
+
 **Rules for the item/prompt file format:**
 - **Additive only.** A new field must be a scalar `key: value` line, optional, with a defined default when absent. Never rename, remove, or repurpose an existing key.
 - **No new block/list-shaped fields.** `tags` is the only block field and its handling is hardcoded; `split_field` rejects any line that is neither `key: value` nor `key:`, so an older build hitting a second list field rejects the WHOLE file. Adding one is a one-way break.

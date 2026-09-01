@@ -17,13 +17,82 @@ use std::sync::{Arc, Mutex, RwLock};
 use crate::db::{ItemRepository, PromptRepository, SqliteRepository};
 use crate::error::{AppError, Result};
 use crate::models::{
-    Item, Kind, ListFilter, NewItem, NewPrompt, Priority, ProjectInfo, Prompt, PromptListFilter,
-    PromptVersion, Sort, Status, UpdateItem, UpdatePrompt,
+    Draft, Item, Kind, ListFilter, NewItem, NewPrompt, Priority, ProjectInfo, Prompt,
+    PromptListFilter, PromptVersion, Sort, Status, UpdateItem, UpdatePrompt,
 };
-use crate::store::{itemfile, scratchfile};
+use crate::store::{draftfile, itemfile, scratchfile};
 
 use catalog::Catalog;
 use paths::validate_project_dir;
+
+/// The app-private draft-backup store (plan.15): `<app_data_dir>\drafts\`, one
+/// file per unsaved editor buffer, written by `store::draftfile`. App-level —
+/// NOT per-project and NOT on the `ItemRepository` trait (a draft may even be
+/// project-less). Every failure maps to a fixed generic message here — never a
+/// path or an `io::Error` Display (the `set_scratch` discipline).
+pub struct DraftStore {
+    root: PathBuf,
+}
+
+impl DraftStore {
+    /// The drafts directory name under `app_data_dir`.
+    const DIR: &'static str = "drafts";
+
+    /// Open the store and run the startup GC (TTL + record cap). GC is
+    /// best-effort: a failure must never abort startup — the store is
+    /// disposable snapshots, not canonical data.
+    pub fn new(app_data_dir: &Path) -> Self {
+        let root = app_data_dir.join(Self::DIR);
+        let cutoff = (chrono::Utc::now() - chrono::Duration::days(draftfile::DRAFT_TTL_DAYS))
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, false);
+        let _ = draftfile::gc(&root, &cutoff);
+        Self { root }
+    }
+
+    /// Persist one snapshot. The backend owns `v` and `savedAt` (stamped here,
+    /// like every other backend-owned timestamp) so the GC's TTL/eviction key
+    /// can never be spoofed stale or future by a client bug.
+    pub fn save(&self, mut draft: Draft) -> Result<()> {
+        draft.v = 1;
+        draft.saved_at = crate::db::sqlite::now_rfc3339();
+        draftfile::write_draft(&self.root, &draft).map_err(|e| match e {
+            draftfile::DraftFileError::TooLarge => {
+                AppError::Invalid("this draft is too large to back up (limit 4 MB)".into())
+            }
+            _ => AppError::Invalid("couldn't back up the draft".into()),
+        })
+    }
+
+    /// Every parseable draft on disk. Per-file failures are dropped silently
+    /// here (fail-soft — a corrupt draft must never block boot restore); only
+    /// an unreadable drafts DIRECTORY surfaces as an error.
+    pub fn list(&self) -> Result<Vec<Draft>> {
+        draftfile::list_drafts(&self.root)
+            .map(|scan| scan.drafts)
+            .map_err(|_| AppError::Invalid("couldn't read the draft backups".into()))
+    }
+
+    /// Delete one draft. Idempotent (a missing file is success).
+    pub fn delete(&self, draft_id: &str) -> Result<()> {
+        draftfile::remove_draft(&self.root, draft_id)
+            .map_err(|_| AppError::Invalid("couldn't delete the draft backup".into()))
+    }
+
+    /// Delete every draft bound to `project_id` (§4.3: Unload/Reload, Delete
+    /// files, and Forget all sweep — "delete means gone" must hold for drafts
+    /// too, or the store reinvents the localStorage remanence problem).
+    /// Unparseable files can't reveal their project and are left for the TTL.
+    pub fn sweep_project(&self, project_id: &str) -> Result<()> {
+        let scan = draftfile::list_drafts(&self.root)
+            .map_err(|_| AppError::Invalid("couldn't read the draft backups".into()))?;
+        for draft in scan.drafts {
+            if draft.project_id == project_id {
+                self.delete(&draft.draft_id)?;
+            }
+        }
+        Ok(())
+    }
+}
 
 /// The rebuildable SQLite index inside a project directory (Stage 2). The
 /// canonical store is `items/*.md` beside it; this DB is git-ignored and rebuilt
@@ -110,6 +179,11 @@ pub struct ProjectManager {
     /// Passed to `validate_project_dir` (kept out of `paths.rs` so that stays a
     /// pure function). Also anchors the default projects dir.
     app_data_dir: PathBuf,
+    /// The app-level draft-backup store (plan.15). A field HERE, not on
+    /// `AppState`: the `delete_files`/`forget` sweeps are called from this
+    /// type's own methods, and the integration tests construct a bare
+    /// `ProjectManager` with no `AppState`.
+    drafts: DraftStore,
 }
 
 impl ProjectManager {
@@ -118,6 +192,7 @@ impl ProjectManager {
             catalog,
             loaded: RwLock::new(HashMap::new()),
             startup_warnings: Mutex::new(Vec::new()),
+            drafts: DraftStore::new(&app_data_dir),
             app_data_dir,
         }
     }
@@ -374,6 +449,11 @@ impl ProjectManager {
         if self.catalog.get(id).await?.is_none() {
             return Err(AppError::NotFound);
         }
+        // Forget leaves the project FILES untouched, but its drafts live in
+        // app_data_dir (outside the project) and hold unsaved content for a
+        // project this install no longer knows — swept for the same remanence
+        // reason prompt bodies are swept on delete_files (plan.15 §4.3).
+        self.drafts.sweep_project(id)?;
         self.catalog.remove(id).await
     }
 
@@ -432,6 +512,15 @@ impl ProjectManager {
         // never be deleted without the confirm this verb carries. Never held
         // open by our pool, so no retry.
         scratchfile::remove(Path::new(&row.path));
+        // Draft backups live in app_data_dir, outside the project folder, so
+        // remove_store_files can't reach them — swept HERE by project id, or
+        // "Delete files" would leave unsaved content behind (plan.15 §4.3: a
+        // deleted item's draft can hold MORE than the last saved version).
+        // Best-effort like scratchfile::remove beside it (post-review C2): the
+        // canonical files are already irreversibly gone, so a sweep error must
+        // not abort before catalog.remove and leave a dangling catalog row —
+        // leftover drafts fall to the startup TTL/cap GC instead.
+        let _ = self.drafts.sweep_project(id);
         self.catalog.remove(id).await
     }
 
@@ -486,6 +575,44 @@ impl ProjectManager {
         })
     }
 
+    // --- Draft backups (plan.15) --------------------------------------------
+    //
+    // Thin gates over the app-level `DraftStore`. Writes for a project gate on
+    // the LOADED set like `set_scratch` (§4.8) — a project-less draft
+    // (`projectId == ""`, minted under the "All projects" rail filter) is the
+    // one accepted exception. Reads are ungated: boot restore needs every
+    // draft to decide per-record (an unloaded project's draft is kept on disk
+    // and simply not restored — D5).
+
+    /// Persist one buffer snapshot. `v`/`savedAt` are stamped server-side.
+    pub fn save_draft(&self, draft: Draft) -> Result<()> {
+        if !draft.project_id.is_empty() && !self.is_loaded(&draft.project_id) {
+            return Err(AppError::Invalid("that project isn't loaded".into()));
+        }
+        self.drafts.save(draft)
+    }
+
+    /// Every parseable draft on disk (all projects, loaded or not).
+    pub fn list_drafts(&self) -> Result<Vec<Draft>> {
+        self.drafts.list()
+    }
+
+    /// Delete one draft backup. Idempotent; ungated (clearing a backup is
+    /// always safe — it never touches canonical data).
+    pub fn delete_draft(&self, draft_id: &str) -> Result<()> {
+        self.drafts.delete(draft_id)
+    }
+
+    /// Delete every draft bound to a LOADED project — the frontend calls this
+    /// BEFORE Unload/Reload (both confirm "unsaved edits are discarded").
+    /// `delete_files`/`forget` sweep unloaded projects server-side themselves.
+    pub fn sweep_project_drafts(&self, project_id: &str) -> Result<()> {
+        if !self.is_loaded(project_id) {
+            return Err(AppError::Invalid("that project isn't loaded".into()));
+        }
+        self.drafts.sweep_project(project_id)
+    }
+
     // --- Item routing -----------------------------------------------------
 
     /// Create an item into the project named by `input.project_id` (the routing
@@ -530,7 +657,15 @@ impl ProjectManager {
 
     pub async fn delete(&self, id: &str) -> Result<()> {
         let (_pid, repo) = self.owner(id).await?;
-        repo.delete(id).await
+        repo.delete(id).await?;
+        // Plan.15 §4.3 (post-review M3): the draft backup dies WITH the item,
+        // server-side — its draftId is the item's UUID (D8), so no lookup is
+        // needed, and "delete means gone" no longer depends on the frontend's
+        // follow-up call landing (which stays as belt-and-braces). Best-effort:
+        // the item is already gone; a failed backup delete must not turn a
+        // succeeded delete into an error (the frontend retry + GC cover it).
+        let _ = self.drafts.delete(id);
+        Ok(())
     }
 
     // --- Prompt routing (plan.7 / plan.9) ---------------------------------
@@ -630,7 +765,10 @@ impl ProjectManager {
 
     pub async fn delete_prompt(&self, id: &str) -> Result<()> {
         let (_pid, repo) = self.prompt_owner(id).await?;
-        repo.delete(id).await
+        repo.delete(id).await?;
+        // The prompt's draft backup dies with it — same rationale as `delete`.
+        let _ = self.drafts.delete(id);
+        Ok(())
     }
 
     /// Move a prompt — with its FULL version history — from its current loaded

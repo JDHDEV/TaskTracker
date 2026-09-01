@@ -1239,6 +1239,34 @@ textarea {
   gap: 10px;
 }
 
+/* Draft-recovery conflict bar (plan.15 D4): hairline, no icons, sentence case
+   — the JiraRow voice. Sits between the tab strip and the editor pane; hidden
+   tracks its background tab like the editor panels do. */
+.draft-conflict {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 8px 22px 0;
+  padding: 6px 10px;
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  background: var(--bg);
+  color: var(--ink);
+  font-family: var(--font-meta);
+  font-size: 12px;
+}
+
+.draft-conflict[hidden] {
+  display: none;
+}
+
+.draft-conflict-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .jira-input {
   flex: 0 1 420px;
   min-width: 0;

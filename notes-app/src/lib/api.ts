@@ -1,9 +1,11 @@
 import { Channel, invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import { getVersion } from "@tauri-apps/api/app";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { ask } from "@tauri-apps/plugin-dialog";
 import { isHttpUrl } from "./jira";
 import type {
+  Draft,
   GenerateTitleRequest,
   Item,
   JiraConfig,
@@ -151,6 +153,56 @@ export function getScratch(projectId: string): Promise<string> {
 /** Replace the pad (an empty body deletes `scratch.md`). Capped at 4 MB server-side. */
 export function setScratch(projectId: string, body: string): Promise<void> {
   return invoke("set_scratch", { projectId, body });
+}
+
+// --- Draft backups (plan.15). App-private snapshots of unsaved editor buffers
+// in app_data_dir\drafts (never localStorage, never the project dir). Backup,
+// not autosave: nothing here ever writes items/<uuid>.md or scratch.md. Errors
+// are fixed generic strings. ---
+
+/** Persist one buffer snapshot. Refused for a project that isn't loaded (a
+ *  project-less draft, projectId "", is accepted). Fire-and-forget callers
+ *  must swallow rejections — a failed backup never interrupts typing. */
+export function saveDraft(draft: Draft): Promise<void> {
+  return invoke("save_draft", { draft });
+}
+
+/** Every draft backup on disk (all projects), for boot restore. Corrupt files
+ *  are skipped server-side — this never fails because one draft is bad. */
+export function listDrafts(): Promise<Draft[]> {
+  return invoke("list_drafts");
+}
+
+/** Delete one draft backup (idempotent) — every buffer-discarding path calls
+ *  this: save, discard, item delete. */
+export function deleteDraft(draftId: string): Promise<void> {
+  return invoke("delete_draft", { draftId });
+}
+
+/** Delete every draft of a LOADED project — call BEFORE unload/reload (their
+ *  confirms promise "unsaved edits are discarded"). Delete files / Forget
+ *  sweep server-side on their own. */
+export function sweepProjectDrafts(projectId: string): Promise<void> {
+  return invoke("sweep_project_drafts", { projectId });
+}
+
+/**
+ * Plan.15 Phase 6 (D10): subscribe to the Rust-side `flush-drafts` event, sent
+ * when the window's close was intercepted so every dirty buffer can snapshot
+ * before the window dies. The IPC-only-through-api.ts rule covers events too —
+ * components never touch `listen` directly. Returns an unsubscribe.
+ */
+export function onFlushDrafts(handler: () => void | Promise<void>): () => void {
+  const unlisten = listen("flush-drafts", () => void handler());
+  return () => {
+    void unlisten.then((un) => un()).catch(() => {});
+  };
+}
+
+/** Tell Rust the flush is done; it destroys the window (or its ~1.5 s timeout
+ *  does — this must never hang the close). */
+export function ackClose(): Promise<void> {
+  return invoke("ack_close");
 }
 
 export function listActiveTags(): Promise<string[]> {

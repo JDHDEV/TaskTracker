@@ -1,7 +1,9 @@
-import { useEffect, useMemo, useRef, useState } from "react";
-import type { Kind, ProjectInfo } from "../types";
+import { Fragment, useEffect, useMemo, useRef, useState } from "react";
+import type { Draft, Kind, ProjectInfo } from "../types";
 import * as api from "../lib/api";
+import { classifyScratchRestore, sanitizeDraft } from "../lib/drafts";
 import { writeSession, type ScratchSlice } from "../lib/session";
+import DraftConflictBar from "./DraftConflictBar";
 import {
   activateTab,
   activeTab,
@@ -27,6 +29,8 @@ interface Props {
    *  freshly-pulled `scratch.md` — a re-click re-fetches it. */
   reloadSignal: { projectId: string; n: number } | null;
   onError: (message: string, opts?: { key?: string }) => void;
+  /** Auto-expiring notice (plan.15 D3: the restore toast is informational). */
+  onNotice: (message: string, opts?: { key?: string }) => void;
   onResolve: (key: string) => void;
   /** Report the projects with an open pad tab, so App's unload/reload confirms
    *  can warn before closing one (including a dirty background pad). */
@@ -56,6 +60,7 @@ export default function ScratchPage({
   pageActive,
   reloadSignal,
   onError,
+  onNotice,
   onResolve,
   onOpenScratchChange,
   onSendToItem,
@@ -106,15 +111,29 @@ export default function ScratchPage({
   // clean. `sessionRestored` gates the writer below.
   const restoredRef = useRef(false);
   const [sessionRestored, setSessionRestored] = useState(false);
+
+  // Plan.15 restore bookkeeping (see App.tsx): consumed-once snapshot seeds
+  // and the conflict-bar state. Scratch has no orphan case, so no superseded
+  // map — the draftId is the project UUID itself.
+  const restoredDraftsRef = useRef(new Map<string, Draft>());
+  const [conflicts, setConflicts] = useState<Map<string, Draft>>(new Map());
+  useEffect(() => {
+    for (const key of Array.from(restoredDraftsRef.current.keys()))
+      if (!tabs.tabs.some((t) => t.key === key)) restoredDraftsRef.current.delete(key);
+    setConflicts((m) => {
+      if (![...m.keys()].some((key) => !tabs.tabs.some((t) => t.key === key))) return m;
+      const next = new Map(m);
+      for (const key of Array.from(next.keys()))
+        if (!tabs.tabs.some((t) => t.key === key)) next.delete(key);
+      return next;
+    });
+  }, [tabs]);
+
   useEffect(() => {
     if (!sessionReady || restoredRef.current) return;
     restoredRef.current = true;
     const s = session;
-    if (!s) {
-      setSessionRestored(true);
-      return;
-    }
-    const ids = s.projectIds.filter((id) => loaded.some((p) => p.id === id));
+    const ids = (s?.projectIds ?? []).filter((id) => loaded.some((p) => p.id === id));
     void (async () => {
       const results = await Promise.all(
         ids.map((id) =>
@@ -124,20 +143,86 @@ export default function ScratchPage({
           ),
         ),
       );
+
+      // Plan.15 step 17: union in the scratch-surface draft backups. The
+      // conflict key is a content hash (scratch has no updatedAt): equal body
+      // → clean; hash matches current content → restore; else the D4 bar. A
+      // pad we can't read is skipped — never restore over unknown content.
+      const drafts = await api.listDrafts().then(
+        (list) => list.map(sanitizeDraft).filter((d): d is Draft => d !== null),
+        (): Draft[] => [],
+      );
+      const outcomes = await Promise.all(
+        drafts
+          .filter((d) => d.surface === "scratch")
+          .map(async (d) => {
+            const projectLoaded = loaded.some((p) => p.id === d.projectId);
+            const current = projectLoaded
+              ? await api.getScratch(d.projectId).then(
+                  (body): string | null => body,
+                  (): string | null => null,
+                )
+              : null;
+            return { draft: d, current, outcome: classifyScratchRestore(d, current, projectLoaded) };
+          }),
+      );
+      const toOpen: Array<{ key: string; doc: ScratchDoc; dirty: boolean }> = [];
+      const newConflicts = new Map<string, Draft>();
+      let restoredCount = 0;
+      for (const { draft, current, outcome } of outcomes) {
+        const key = scratchTabKey(draft.projectId);
+        switch (outcome) {
+          case "skip":
+          case "orphan": // unreachable for scratch; keep the switch exhaustive
+            break;
+          case "clean":
+            void api.deleteDraft(draft.draftId).catch(() => {});
+            break;
+          case "restore": {
+            restoredDraftsRef.current.set(key, draft);
+            toOpen.push({ key, doc: { projectId: draft.projectId, body: current ?? "" }, dirty: true });
+            restoredCount += 1;
+            break;
+          }
+          case "conflict": {
+            newConflicts.set(key, draft);
+            toOpen.push({ key, doc: { projectId: draft.projectId, body: current ?? "" }, dirty: false });
+            break;
+          }
+        }
+      }
+
       setTabs((prev) => {
         let next = prev;
         for (const doc of results) {
           if (doc) next = openTab(next, scratchTabKey(doc.projectId), doc);
         }
-        if (s.activeProjectId) {
+        for (const entry of toOpen) {
+          next = openTab(next, entry.key, entry.doc, entry.dirty);
+          if (entry.dirty) next = setDirty(next, entry.key, true);
+        }
+        if (s?.activeProjectId) {
           const key = scratchTabKey(s.activeProjectId);
           if (next.tabs.some((t) => t.key === key)) next = activateTab(next, key);
         }
         return next;
       });
+      if (newConflicts.size > 0) {
+        setConflicts(newConflicts);
+        onNotice(
+          `${newConflicts.size} scratch pad${newConflicts.size === 1 ? "" : "s"} changed on disk since your unsaved edits — open the tab to choose.`,
+          { key: "scratch-draft-conflicts" },
+        );
+      }
+      if (restoredCount > 0) {
+        onNotice(
+          `Restored unsaved edits to ${restoredCount} scratch pad${restoredCount === 1 ? "" : "s"}.`,
+          { key: "scratch-draft-restore" },
+        );
+      }
       setSessionRestored(true);
     })();
-  }, [sessionReady, session, loaded]);
+  }, [sessionReady, session, loaded, onNotice]);
 
   // F4 persistence: this page's slice, debounced ~300 ms; project ids only.
   const openPadProjectIds = useMemo(() => tabs.tabs.map((t) => t.item.projectId), [tabs]);
@@ -248,6 +333,10 @@ export default function ScratchPage({
         ) {
           const saved = await editorRefs.current.get(key)?.save();
           if (!saved) return;
+          // (a successful save cleared the draft backup itself)
+        } else {
+          // Plan.15 §4.3: the Discard branch clears the on-disk backup too.
+          await editorRefs.current.get(key)?.discardDraft();
         }
       }
       closeTabByKey(key);
@@ -294,24 +383,51 @@ export default function ScratchPage({
             onClose={requestCloseTab}
             listLabel="Open scratch pads"
           />
-          {tabs.tabs.map((t) => (
-            <ScratchEditor
-              key={t.key}
-              ref={(h) => {
-                if (h) editorRefs.current.set(t.key, h);
-                else editorRefs.current.delete(t.key);
-              }}
-              tabKey={t.key}
-              hidden={t.key !== tabs.activeKey}
-              active={pageActive && t.key === tabs.activeKey}
-              doc={t.item}
-              onDirtyChange={(dirty) => setTabs((s) => setDirty(s, t.key, dirty))}
-              onSave={(body) => savePad(t.key, t.item.projectId, body)}
-              onSendTo={(dest, text) => sendTo(t.item.projectId, dest, text)}
-              onError={onError}
-              onResolve={onResolve}
-            />
-          ))}
+          {tabs.tabs.map((t) => {
+            const conflict = conflicts.get(t.key);
+            return (
+              <Fragment key={t.key}>
+              {conflict && (
+                <DraftConflictBar
+                  title={`${projectName(t.item.projectId)} scratch pad`}
+                  hidden={t.key !== tabs.activeKey}
+                  onKeep={() => {
+                    void api.deleteDraft(conflict.draftId).catch(() => {});
+                    setConflicts((m) => {
+                      const next = new Map(m);
+                      next.delete(t.key);
+                      return next;
+                    });
+                  }}
+                  onRestore={() => {
+                    editorRefs.current.get(t.key)?.applyDraft(conflict);
+                    setConflicts((m) => {
+                      const next = new Map(m);
+                      next.delete(t.key);
+                      return next;
+                    });
+                  }}
+                />
+              )}
+              <ScratchEditor
+                ref={(h) => {
+                  if (h) editorRefs.current.set(t.key, h);
+                  else editorRefs.current.delete(t.key);
+                }}
+                tabKey={t.key}
+                restoredDraft={restoredDraftsRef.current.get(t.key) ?? null}
+                hidden={t.key !== tabs.activeKey}
+                active={pageActive && t.key === tabs.activeKey}
+                doc={t.item}
+                onDirtyChange={(dirty) => setTabs((s) => setDirty(s, t.key, dirty))}
+                onSave={(body) => savePad(t.key, t.item.projectId, body)}
+                onSendTo={(dest, text) => sendTo(t.item.projectId, dest, text)}
+                onError={onError}
+                onResolve={onResolve}
+              />
+              </Fragment>
+            );
+          })}
         </div>
       ) : (
         <section className="editor editor-empty" tabIndex={-1} ref={emptyEditorRef}>

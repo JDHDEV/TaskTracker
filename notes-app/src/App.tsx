@@ -1,4 +1,5 @@
 import {
+  Fragment,
   useCallback,
   useEffect,
   useMemo,
@@ -7,6 +8,7 @@ import {
   type KeyboardEvent,
 } from "react";
 import type {
+  Draft,
   Item,
   Kind,
   ListFilter,
@@ -26,6 +28,13 @@ import {
   shouldCommit,
 } from "./lib/projects";
 import { duplicateDraft, newDraft } from "./lib/draft";
+import {
+  classifyRestore,
+  draftIdFromTabKey,
+  draftTabKey,
+  flushAllDrafts,
+  sanitizeDraft,
+} from "./lib/drafts";
 import { readSession, tabKeyId, writeSession } from "./lib/session";
 import {
   getStoredPalette,
@@ -48,6 +57,7 @@ import {
   type OpenTabsState,
 } from "./lib/openTabs";
 import ItemList, { KindFilter, StatusFilter } from "./components/ItemList";
+import DraftConflictBar from "./components/DraftConflictBar";
 import Editor, { type EditorHandle } from "./components/Editor";
 import EditorTabs, { type EditorTabDescriptor } from "./components/EditorTabs";
 import SettingsDialog from "./components/SettingsDialog";
@@ -89,11 +99,10 @@ export default function App() {
   // Open editor tabs (Plan 11). Each tab holds a snapshot Item + an unsaved flag;
   // the active tab is the visible editor. Every open item keeps a mounted-hidden
   // <Editor>, so per-tab edits and in-flight AI streams survive a tab switch.
-  // Drafts get a synthetic `draft-<seq>` key (real items key on itemKey()); on
+  // Drafts get a synthetic `draft-<uuid>` key (real items key on itemKey()); on
   // save the draft key is promoted to the created item's key so the tab stays
   // open and re-clicking its row activates it instead of duplicating it.
   const [tabs, setTabs] = useState<OpenTabsState<Item>>(emptyTabs);
-  const [draftSeq, setDraftSeq] = useState(0);
   // Latest tabs, so async reconciliation reads the current set after an await.
   const tabsRef = useRef(tabs);
   useEffect(() => {
@@ -138,6 +147,33 @@ export default function App() {
   const [metaLoaded, setMetaLoaded] = useState(false);
   const restoredRef = useRef(false); // StrictMode double-invoke guard
   const [sessionRestored, setSessionRestored] = useState(false);
+
+  // Plan.15 boot restore (D5). `restoredDraftsRef` maps tab key → the draft
+  // snapshot its editor consumes ONCE at mount (a ref: it must never re-render
+  // App, and a mount is the only consumer); `supersededRef` maps an orphan's
+  // fresh tab key → the dead item's old draft file id (deleted only after the
+  // first successful flush under the new id — step 13). `conflicts` is state:
+  // the two-button bar renders from it (D4).
+  const restoredDraftsRef = useRef(new Map<string, Draft>());
+  const supersededRef = useRef(new Map<string, string>());
+  const [conflicts, setConflicts] = useState<Map<string, Draft>>(new Map());
+
+  // Drop restore bookkeeping for tabs that are no longer open, whatever path
+  // closed them — a re-opened tab must never re-seed from a stale snapshot,
+  // and a closed conflict tab keeps its draft FILE (closing is not choosing)
+  // but loses its bar until the next boot re-offers it.
+  useEffect(() => {
+    for (const key of Array.from(restoredDraftsRef.current.keys()))
+      if (!hasTab(tabs, key)) restoredDraftsRef.current.delete(key);
+    for (const key of Array.from(supersededRef.current.keys()))
+      if (!hasTab(tabs, key)) supersededRef.current.delete(key);
+    setConflicts((m) => {
+      if (![...m.keys()].some((key) => !hasTab(tabs, key))) return m;
+      const next = new Map(m);
+      for (const key of Array.from(next.keys())) if (!hasTab(tabs, key)) next.delete(key);
+      return next;
+    });
+  }, [tabs]);
 
   // The set of projects with at least one open prompt tab on the Prompts page
   // (reported up by PromptsPage). Lets the unload confirm warn before an unload
@@ -233,6 +269,20 @@ export default function App() {
     void loadMeta();
   }, [loadMeta]);
 
+  // Plan.15 Phase 6 (R6): Rust intercepts the window close, emits
+  // `flush-drafts`, and waits for our ack (or its ~1.5 s timeout). Flush every
+  // registered dirty editor — item, prompt, AND scratch, via the module-level
+  // registry their shared hook maintains — through flushDraft (NEVER save():
+  // that would write items/<uuid>.md on every close and can fire an AI call),
+  // then ack. StrictMode's dev double-subscribe is harmless: the second flush
+  // is a serialized no-op and the second destroy is ignored.
+  useEffect(() => {
+    return api.onFlushDrafts(async () => {
+      await flushAllDrafts();
+      void api.ackClose().catch(() => {});
+    });
+  }, []);
+
   // Surface one-time startup warnings (a moved/corrupt/newer project file).
   useEffect(() => {
     void (async () => {
@@ -271,26 +321,27 @@ export default function App() {
   // item tabs are fetched by id in persisted order, misses dropped silently
   // (the reconcileTabs rule), then the persisted active tab re-activates —
   // openTab's own activation of the last-opened tab is the neighbor fallback.
-  // Restored tabs open CLEAN (openTab seeds isDirty false), so the D2 frame
-  // never lights on boot.
+  // Restored session tabs open CLEAN (openTab seeds isDirty false), so the D2
+  // frame never lights on boot — with plan.15's one narrow, deliberate
+  // exception: a tab carrying RECOVERED UNSAVED EDITS opens dirty (D3, restore
+  // is visible), unioned in from the on-disk draft backups below whether or
+  // not the session remembered its tab (the Notepad++ guarantee).
   useEffect(() => {
     if (!metaLoaded || restoredRef.current) return;
     restoredRef.current = true;
     const s = initialSession;
-    if (!s) {
-      setSessionRestored(true);
-      return;
+    if (s) {
+      setPage(s.page);
+      setKind(s.worknotes.filters.kind);
+      setStatusFilter(s.worknotes.filters.statusFilter);
+      setSort(s.worknotes.filters.sort);
+      setTagFilter(s.worknotes.filters.tags.filter((t) => activeTags.includes(t)));
+      const pf = s.worknotes.filters.projectFilter;
+      if (pf && knownProjects.some((p) => p.id === pf && p.loaded)) setProjectFilter(pf);
     }
-    setPage(s.page);
-    setKind(s.worknotes.filters.kind);
-    setStatusFilter(s.worknotes.filters.statusFilter);
-    setSort(s.worknotes.filters.sort);
-    setTagFilter(s.worknotes.filters.tags.filter((t) => activeTags.includes(t)));
-    const pf = s.worknotes.filters.projectFilter;
-    if (pf && knownProjects.some((p) => p.id === pf && p.loaded)) setProjectFilter(pf);
     void (async () => {
-      const results = await Promise.all(
-        s.worknotes.tabKeys.map((key) => {
+      const sessionItems = await Promise.all(
+        (s?.worknotes.tabKeys ?? []).map((key) => {
           const id = tabKeyId(key);
           return id
             ? api.getItem(id).then(
@@ -300,18 +351,137 @@ export default function App() {
             : Promise.resolve<Item | null>(null);
         }),
       );
+
+      // Plan.15 step 13: the draft-backup union. Whitelist-validated records
+      // only (sanitizeDraft — session.ts discipline); each classified per the
+      // D5 matrix AFTER its item is fetched, so the decision lands on the
+      // correct base. Fetch/list failures degrade to "no drafts restored" —
+      // never a boot failure.
+      const drafts = await api.listDrafts().then(
+        (list) => list.map(sanitizeDraft).filter((d): d is Draft => d !== null),
+        (): Draft[] => [],
+      );
+      const outcomes = await Promise.all(
+        drafts
+          .filter((d) => d.surface === "item")
+          .map(async (d) => {
+            const projectLoaded =
+              !d.projectId || knownProjects.some((p) => p.id === d.projectId && p.loaded);
+            const item =
+              d.entityId && projectLoaded
+                ? await api.getItem(d.entityId).then(
+                    (it): Item | null => it,
+                    (): Item | null => null,
+                  )
+                : null;
+            return { draft: d, item, outcome: classifyRestore(d, item, projectLoaded) };
+          }),
+      );
+
+      // Decide everything BEFORE touching state, so the setTabs updater stays
+      // pure (StrictMode re-invokes updaters; side effects in one would fire
+      // twice). `dirty: true` entries are recovered buffers (D3).
+      const toOpen: Array<{ key: string; item: Item; dirty: boolean }> = [];
+      const newConflicts = new Map<string, Draft>();
+      let restoredCount = 0;
+      let orphanCount = 0;
+      for (const { draft, item, outcome } of outcomes) {
+        switch (outcome) {
+          case "skip":
+            break; // unloaded project: keep the file, restore nothing (D5)
+          case "clean":
+            // Buffer == saved content: self-heal the leftover file (a crash
+            // between save and draft-delete, or type-then-revert).
+            void api.deleteDraft(draft.draftId).catch(() => {});
+            break;
+          case "restore": {
+            if (item) {
+              const key = itemKey(item);
+              restoredDraftsRef.current.set(key, draft);
+              toOpen.push({ key, item, dirty: true });
+            } else {
+              // Never-saved draft: reopen under its persistent draft-<uuid>
+              // key with an EMPTY template as base (the buffer seeds from the
+              // snapshot; base stays empty so the backup keeps maintaining
+              // itself until a real save).
+              const key = draftTabKey(draft.draftId);
+              restoredDraftsRef.current.set(key, draft);
+              toOpen.push({ key, item: newDraft(draft.kind ?? "note", draft.projectId), dirty: true });
+            }
+            restoredCount += 1;
+            break;
+          }
+          case "conflict": {
+            if (!item) break; // defensive: conflict implies a live item
+            // D4: open CLEAN on disk content, keep the draft file, offer the
+            // two-button bar. Never auto-restore over changed content.
+            const key = itemKey(item);
+            newConflicts.set(key, draft);
+            toOpen.push({ key, item, dirty: false });
+            break;
+          }
+          case "orphan": {
+            // The owning item is gone: reopen the content as a NEW draft tab
+            // (D5 — resurrecting typed text beats silently discarding it; the
+            // notice below keeps it honest). The dead item's draft file is
+            // kept until the new tab's first successful flush under its
+            // freshly minted id, then deleted (step 13).
+            const freshId = crypto.randomUUID();
+            const key = draftTabKey(freshId);
+            restoredDraftsRef.current.set(key, {
+              ...draft,
+              draftId: freshId,
+              entityId: "",
+              baseUpdatedAt: "",
+            });
+            supersededRef.current.set(key, draft.draftId);
+            toOpen.push({ key, item: newDraft(draft.kind ?? "note", draft.projectId), dirty: true });
+            orphanCount += 1;
+            break;
+          }
+        }
+      }
+
       setTabs((prev) => {
         let next = prev;
-        for (const item of results) {
+        for (const item of sessionItems) {
           if (item) next = openTab(next, itemKey(item), item);
         }
-        const ak = s.worknotes.activeKey;
+        for (const entry of toOpen) {
+          next = openTab(next, entry.key, entry.item, entry.dirty);
+          // openTab on an already-open key (a session tab that also carries a
+          // draft) is activation-only — set the recovered-dirty flag explicitly.
+          if (entry.dirty) next = setDirty(next, entry.key, true);
+        }
+        const ak = s?.worknotes.activeKey;
         if (ak && hasTab(next, ak)) next = activateTab(next, ak);
         return next;
       });
+      if (newConflicts.size > 0) {
+        setConflicts(newConflicts);
+        // D3 applies to conflicts too (post-review): a bar on a background tab
+        // is invisible until that tab is visited — announce it.
+        showNotice(
+          `${newConflicts.size} item${newConflicts.size === 1 ? "" : "s"} changed on disk since your unsaved edits — open the tab to choose.`,
+          { key: "draft-conflicts" },
+        );
+      }
+      if (restoredCount > 0) {
+        // D3: restore is visible, never silent.
+        showNotice(
+          `Restored unsaved edits to ${restoredCount} item${restoredCount === 1 ? "" : "s"}.`,
+          { key: "draft-restore" },
+        );
+      }
+      if (orphanCount > 0) {
+        showNotice(
+          `${orphanCount} recovered draft${orphanCount === 1 ? " belongs" : "s belong"} to an item that no longer exists — reopened as a new draft.`,
+          { key: "draft-orphans" },
+        );
+      }
       setSessionRestored(true);
     })();
-  }, [metaLoaded, initialSession, knownProjects, activeTags]);
+  }, [metaLoaded, initialSession, knownProjects, activeTags, showNotice]);
 
   // F4 persistence: the page + worknotes slice, debounced ~300 ms. Identifiers
   // only (S-4) — draft tabs (id "") and the search text are never written. Tab
@@ -432,13 +602,16 @@ export default function App() {
 
   // `target`/`body` are the "send selection to…" seeds (Plan 13): the pad's own
   // project and the selected text. Existing callers pass only `kind`.
+  // Keys are `draft-<uuid>` (plan.15 D8): the bare UUID inside the key is the
+  // draft's persistent on-disk draftId, so a key survives a restart without
+  // colliding (the old per-boot `draft-<seq>` counter reset every launch, and
+  // openTab treats an existing key as activation — a collision would silently
+  // drop a restored buffer).
   function openNewDraft(kind: Kind, target?: string, body = "") {
-    const seq = draftSeq + 1;
-    setDraftSeq(seq);
     // Target the rail's project when it names a loaded project; otherwise ""
     // (All projects), so the editor requires an explicit target before Save.
     const draftItem = newDraft(kind, target ?? resolveCreateTarget(projectFilter, loaded), body);
-    setTabs((s) => openTab(s, `draft-${seq}`, draftItem, true)); // a fresh draft starts dirty
+    setTabs((s) => openTab(s, `draft-${crypto.randomUUID()}`, draftItem, true)); // a fresh draft starts dirty
   }
 
   // "Send selection to…" from a scratch pad (D5): a pre-filled, UNSAVED draft in
@@ -483,9 +656,7 @@ export default function App() {
   }
 
   function openDuplicateDraft(source: Item) {
-    const seq = draftSeq + 1;
-    setDraftSeq(seq);
-    setTabs((s) => openTab(s, `draft-${seq}`, duplicateDraft(source), true));
+    setTabs((s) => openTab(s, `draft-${crypto.randomUUID()}`, duplicateDraft(source), true));
   }
 
   async function createFromDraft(draftKey: string, input: NewItem): Promise<boolean> {
@@ -515,6 +686,27 @@ export default function App() {
     editorRefs.current.delete(key);
   }
 
+  // Conflict-bar resolutions (plan.15 D4). "Keep saved version" deletes the
+  // kept draft file and dismisses the bar; "Restore unsaved edits" seeds the
+  // mounted editor through its applyDraft handle (the only way content enters
+  // an already-mounted clean editor) and keeps the file until save/discard.
+  function resolveConflictKeep(key: string, draft: Draft) {
+    void api.deleteDraft(draft.draftId).catch(() => {});
+    setConflicts((m) => {
+      const next = new Map(m);
+      next.delete(key);
+      return next;
+    });
+  }
+  function resolveConflictRestore(key: string, draft: Draft) {
+    editorRefs.current.get(key)?.applyDraft(draft);
+    setConflicts((m) => {
+      const next = new Map(m);
+      next.delete(key);
+      return next;
+    });
+  }
+
   // Close × / Delete-key on a tab. A clean tab closes immediately. A dirty tab
   // prompts first (never window.confirm — the webview suppresses it): a brand-new
   // draft offers Discard/keep; a saved item offers the three-way Cancel / Discard
@@ -529,6 +721,10 @@ export default function App() {
         if (tab.item.id === "") {
           // A scratch draft has no saved version to save back to on close.
           if (!(await api.confirmDialog(`Discard this unsaved ${tab.item.kind}?`))) return;
+          // Plan.15 §4.3: an explicit Discard clears the on-disk backup too —
+          // via the editor's handle, which seals its queue first so a straggler
+          // snapshot can never land after this delete and resurrect the draft.
+          await editorRefs.current.get(key)?.discardDraft();
         } else {
           // api.confirmDialog renders the dialog plugin's ask() — a two-button
           // Yes/No dialog — so the three-way choice is two chained Yes/No prompts.
@@ -543,6 +739,10 @@ export default function App() {
           ) {
             const saved = await editorRefs.current.get(key)?.save();
             if (!saved) return; // save failed → keep the tab open, edits intact
+            // (a successful save cleared the draft backup itself)
+          } else {
+            // The Discard branch of the three-way choice (plan.15 §4.3).
+            await editorRefs.current.get(key)?.discardDraft();
           }
         }
       }
@@ -557,7 +757,16 @@ export default function App() {
       const ok = await mutate(() => api.deleteItem(item.id));
       // reconcileTabs (inside mutate) already closes the deleted item's tab; this
       // is the explicit, immediate close of the tab the user acted on.
-      if (ok) closeTabByKey(key);
+      if (ok) {
+        // Plan.15 §4.3: "delete means gone" — the draft can hold MORE than the
+        // last saved version, so it goes with the item. Through the handle
+        // (queue sealed first) when the editor is still mounted; directly by
+        // id when reconcileTabs already unmounted it.
+        const handle = editorRefs.current.get(key);
+        if (handle) await handle.discardDraft();
+        else await api.deleteDraft(item.id).catch(() => {});
+        closeTabByKey(key);
+      }
     })();
   }
 
@@ -588,6 +797,14 @@ export default function App() {
       )
         return;
     }
+    // Plan.15 step 12: sweep the project's draft backups BEFORE the unload
+    // (the command requires a loaded project) and UNCONDITIONALLY — not gated
+    // on affectsOpen: drafts can exist on disk for a project with no open tab
+    // (an earlier crash, never reopened this session), and the confirm above
+    // promised "unsaved changes will be lost". Best-effort: a failed sweep
+    // must not block the unload (leftover drafts for an unloaded project are
+    // the kept-on-disk case D5 already defines, bounded by TTL/cap).
+    await api.sweepProjectDrafts(p.id).catch(() => {});
     const ok = await mutate(() => api.unloadProject(p.id));
     if (ok) {
       if (affectsOpenItem) {
@@ -628,6 +845,12 @@ export default function App() {
       ))
     )
       return;
+    // Plan.15 step 12: unconditional draft sweep before the reload, mirroring
+    // unloadProject — a reload's fresh disk state makes every existing draft
+    // of this project stale. (An open never-saved draft tab survives a reload
+    // and simply re-flushes its live buffer on the next tick — correct: its
+    // content exists nowhere on disk but in the backup.)
+    await api.sweepProjectDrafts(p.id).catch(() => {});
     let warnings: string[] = [];
     const ok = await mutate(async () => {
       warnings = await api.reloadProject(p.id);
@@ -782,14 +1005,30 @@ export default function App() {
             />
             {tabs.tabs.map((t) => {
               const isDraft = t.item.id === "";
+              // The on-disk draft-backup id (plan.15 D8): the item's UUID for
+              // a saved item, the bare UUID inside a `draft-<uuid>` key for a
+              // new draft. "" disables backup (an unexpected key shape).
+              const draftId = isDraft ? (draftIdFromTabKey(t.key) ?? "") : t.item.id;
+              const conflict = conflicts.get(t.key);
               return (
+                <Fragment key={t.key}>
+                {conflict && (
+                  <DraftConflictBar
+                    title={itemTabTitle(t.item)}
+                    hidden={t.key !== tabs.activeKey}
+                    onKeep={() => resolveConflictKeep(t.key, conflict)}
+                    onRestore={() => resolveConflictRestore(t.key, conflict)}
+                  />
+                )}
                 <Editor
-                  key={t.key}
                   ref={(h) => {
                     if (h) editorRefs.current.set(t.key, h);
                     else editorRefs.current.delete(t.key);
                   }}
                   tabKey={t.key}
+                  draftId={draftId}
+                  restoredDraft={restoredDraftsRef.current.get(t.key) ?? null}
+                  supersedesDraftId={supersededRef.current.get(t.key) ?? null}
                   hidden={t.key !== tabs.activeKey}
                   active={page === "worknotes" && t.key === tabs.activeKey}
                   item={t.item}
@@ -822,6 +1061,7 @@ export default function App() {
                   onError={showError}
                   onResolve={dismissKey}
                 />
+                </Fragment>
               );
             })}
           </div>
@@ -850,6 +1090,7 @@ export default function App() {
           reloadSignal={promptReloadSignal}
           onProjectsChanged={() => void loadMeta()}
           onError={showError}
+          onNotice={showNotice}
           onResolve={dismissKey}
           onOpenPromptsChange={setOpenPromptProjectIds}
           seed={promptSeed}
@@ -870,6 +1111,7 @@ export default function App() {
           pageActive={page === "scratch"}
           reloadSignal={promptReloadSignal}
           onError={showError}
+          onNotice={showNotice}
           onResolve={dismissKey}
           onOpenScratchChange={setOpenScratchProjectIds}
           onSendToItem={sendSelectionToItem}

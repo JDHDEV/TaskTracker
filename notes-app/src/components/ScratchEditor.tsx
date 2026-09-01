@@ -7,8 +7,10 @@ import {
   useState,
   type MouseEvent,
 } from "react";
-import type { ProviderId } from "../types";
+import type { Draft, ProviderId } from "../types";
 import { aiRewriteStream } from "../lib/api";
+import { buildScratchDraft, contentHash } from "../lib/drafts";
+import { useDraftBackup } from "../hooks/useDraftBackup";
 import { reportAiError } from "../lib/aiErrors";
 import { handleLineClipboardKeyDown, handleLinePaste } from "../lib/lineEdit";
 import { tabDomId, tabPanelDomId } from "../lib/openTabs";
@@ -30,15 +32,23 @@ export interface ScratchDoc {
 }
 
 /** Imperative handle: lets ScratchPage persist a background (non-active) pad
- *  tab from the close-dirty "Save" branch (its buffer lives only here). */
+ *  tab from the close-dirty "Save" branch (its buffer lives only here).
+ *  Plan.15 adds the draft-backup verbs (see EditorHandle in Editor.tsx). */
 export interface ScratchEditorHandle {
   save: () => Promise<boolean>;
+  applyDraft: (snapshot: Draft) => void;
+  flushDraft: () => Promise<void>;
+  discardDraft: () => Promise<void>;
 }
 
 interface Props {
   doc: ScratchDoc;
   /** This tab's identity key — derives the tab/panel ARIA ids. */
   tabKey: string;
+  /** Boot-restore seed (plan.15 D5): mounts the buffer from this snapshot,
+   *  DIRTY. Consumed at mount only. The scratch draftId is the project UUID
+   *  (doc.projectId), so no separate prop is needed. */
+  restoredDraft?: Draft | null;
   /** Mounted but display:none (preserving its buffer/stream). */
   hidden: boolean;
   /** The visible, active pad tab (active tab AND the Scratch page visible) —
@@ -61,11 +71,24 @@ interface Props {
  *  and no R4), the body textarea with rework-on-selection, and the right-click
  *  `SelectionMenu` for a non-empty selection. */
 const ScratchEditor = forwardRef<ScratchEditorHandle, Props>(function ScratchEditor(
-  { doc, tabKey, hidden, active, onDirtyChange, onSave, onSendTo, onError, onResolve }: Props,
+  {
+    doc,
+    tabKey,
+    restoredDraft = null,
+    hidden,
+    active,
+    onDirtyChange,
+    onSave,
+    onSendTo,
+    onError,
+    onResolve,
+  }: Props,
   ref,
 ) {
-  const [body, setBody] = useState(doc.body);
-  const [dirty, setDirty] = useState(false);
+  // Plan.15 D3/D5: a boot-restored draft seeds the INITIAL buffer, dirty; the
+  // reseed effect below is guarded so its mount pass can't wipe this.
+  const [body, setBody] = useState(restoredDraft ? restoredDraft.body : doc.body);
+  const [dirty, setDirty] = useState(restoredDraft !== null);
   const [proposal, setProposal] = useState<string | null>(null);
   const [streaming, setStreaming] = useState(false);
   const [aiBusy, setAiBusy] = useState(false);
@@ -74,6 +97,25 @@ const ScratchEditor = forwardRef<ScratchEditorHandle, Props>(function ScratchEdi
   const stopRef = useRef<(() => void) | null>(null);
   // Blocks save re-entry (a second Ctrl+S while a save is in flight).
   const savingRef = useRef(false);
+
+  // --- Draft backup (plan.15 step 16) — the shared wiring, scratch-shaped:
+  // draftId = the project UUID (one pad, one draft per project); the conflict
+  // key is a content hash of the base (scratch has no updatedAt).
+  const lastEditRef = useRef(0);
+  const snapshotRef = useRef<() => Draft | null>(() => null);
+  useEffect(() => {
+    snapshotRef.current = () => {
+      if (body === doc.body) return null;
+      return buildScratchDraft(doc.projectId, contentHash(doc.body), body);
+    };
+  });
+  const draftBackup = useDraftBackup({
+    draftId: doc.projectId,
+    dirty,
+    active,
+    getSnapshot: snapshotRef,
+    lastEditRef,
+  });
 
   // Rework on a selection — the same plumbing as Editor/PromptEditor.
   const bodyRef = useRef<HTMLTextAreaElement>(null);
@@ -116,7 +158,16 @@ const ScratchEditor = forwardRef<ScratchEditorHandle, Props>(function ScratchEdi
     }
   }, [body]);
 
-  useImperativeHandle(ref, () => ({ save: () => save() }));
+  useImperativeHandle(ref, () => ({
+    save: () => save(),
+    applyDraft: (snapshot: Draft) => {
+      setBody(snapshot.body);
+      setDirty(true);
+      lastEditRef.current = Date.now();
+    },
+    flushDraft: () => draftBackup.flushNow(),
+    discardDraft: () => draftBackup.discard(),
+  }));
 
   const reportedDirty = useRef(dirty);
   useEffect(() => {
@@ -126,11 +177,23 @@ const ScratchEditor = forwardRef<ScratchEditorHandle, Props>(function ScratchEdi
     }
   }, [dirty, onDirtyChange]);
 
+  // Plan.15 step 16 reseed guard — identical to Editor.tsx's: this effect also
+  // runs on MOUNT, where it would wipe a restoredDraft-seeded buffer back to
+  // the pad's saved content. Identity-compared (StrictMode-safe).
+  const draftSeedRef = useRef(restoredDraft ? doc.projectId : null);
+
   // Re-seed when the tab is (re)opened for a project. A successful Save updates
   // `doc.body` with the same projectId, so this deliberately does NOT re-fire
   // then (it would clobber edits typed during the save). Navigating away
   // mid-stream stops the backend stream.
   useEffect(() => {
+    if (draftSeedRef.current === doc.projectId) {
+      return () => {
+        stopRef.current?.();
+        stopRef.current = null;
+      };
+    }
+    draftSeedRef.current = null; // identity moved on — normal reseeds from here
     setBody(doc.body);
     setDirty(false);
     setProposal(null);
@@ -160,7 +223,10 @@ const ScratchEditor = forwardRef<ScratchEditorHandle, Props>(function ScratchEdi
     setSaving(true);
     try {
       const saved = await onSave(overrides?.body ?? body);
-      if (saved) setDirty(false); // a rejected save stays dirty → "Save"
+      if (saved) {
+        setDirty(false); // a rejected save stays dirty → "Save"
+        draftBackup.clearAfterSave(); // scratch.md owns the content now
+      }
       return saved;
     } finally {
       savingRef.current = false;
@@ -182,6 +248,7 @@ const ScratchEditor = forwardRef<ScratchEditorHandle, Props>(function ScratchEdi
   });
 
   async function rework(instruction: string, provider: ProviderId) {
+    void draftBackup.flushNow(); // plan.15 D6: snapshot before an AI entry point
     const sel = captureSelection(selRef.current, body);
     const text = sel ? sel.text : body;
     if (!text.trim()) {
@@ -238,6 +305,8 @@ const ScratchEditor = forwardRef<ScratchEditorHandle, Props>(function ScratchEdi
   function edit(value: string) {
     setBody(value);
     setDirty(true);
+    // The buffered-edit chokepoint — the draft backup keys off it (plan.15 D6).
+    lastEditRef.current = Date.now();
   }
 
   // Right-click: a non-empty, non-whitespace selection opens the custom menu;
@@ -355,6 +424,8 @@ const ScratchEditor = forwardRef<ScratchEditorHandle, Props>(function ScratchEdi
         onSelect={trackSelection}
         onKeyUp={trackSelection}
         onMouseUp={trackSelection}
+        // Plan.15 D6: leaving the field is a natural checkpoint — flush now.
+        onBlur={() => void draftBackup.flushNow()}
         onContextMenu={onContextMenu}
         // F6 (D9): whole-line Ctrl+X/C/V on a collapsed selection. The native
         // right-click menu path is untouched — this is keyboard-only.

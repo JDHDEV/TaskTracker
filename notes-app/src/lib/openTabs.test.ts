@@ -260,6 +260,35 @@ describe("setTabItem", () => {
   });
 });
 
+// --- plan.15 (draft restore): pins on EXISTING openTab/setDirty behavior that
+// the boot-time draft-restore union code relies on. These are regression pins
+// on already-implemented openTabs.ts, not new behavior, so — unlike
+// drafts.test.ts — they are expected to PASS immediately (exempt from the
+// fail-first check that applies to the not-yet-implemented drafts module).
+describe("plan.15 draft-restore pins", () => {
+  it("a restored draft tab opens dirty immediately via openTab's initialDirty, keyed draft-<uuid>", () => {
+    const key = "draft-550e8400-e29b-41d4-a716-446655440000";
+    const result = openTab(emptyTabs<string>(), key, "Restored draft content", true);
+    expect(result.tabs).toEqual([{ key, item: "Restored draft content", isDirty: true }]);
+    expect(result.activeKey).toBe(key);
+  });
+
+  it("openTab on an ALREADY-OPEN key ignores initialDirty: activation only, dirty flag untouched (restore-union code must call setDirty explicitly)", () => {
+    let state = openTab(emptyTabs<string>(), "a", "Item A"); // isDirty: false
+    state = openTab(state, "b", "Item B"); // "b" becomes active
+
+    // Re-"opening" "a" as if restoring it dirty must NOT flip its dirty flag.
+    const result = openTab(state, "a", "IGNORED SNAPSHOT", true);
+
+    expect(result.tabs.find((t) => t.key === "a")).toEqual({
+      key: "a",
+      item: "Item A",
+      isDirty: false,
+    });
+    expect(result.activeKey).toBe("a"); // activation still happens
+  });
+});
+
 describe("tabDomId / tabPanelDomId", () => {
   it("return distinct, stable, prefixed strings for the same key", () => {
     expect(tabDomId("a:1")).toBe("etab-a:1");

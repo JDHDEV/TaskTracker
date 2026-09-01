@@ -18,8 +18,8 @@ use std::path::Path;
 use notes_app_lib::db::{ItemRepository, SqliteRepository};
 use notes_app_lib::error::AppError;
 use notes_app_lib::models::{
-    Kind, ListFilter, NewItem, NewPrompt, Priority, ProjectInfo, PromptListFilter, Sort, Status,
-    UpdateItem, UpdatePrompt,
+    Draft, DraftSurface, Kind, ListFilter, NewItem, NewPrompt, Priority, ProjectInfo, PromptListFilter, Sort,
+    Status, UpdateItem, UpdatePrompt,
 };
 use notes_app_lib::projects::catalog::Catalog;
 use notes_app_lib::projects::ProjectManager;
@@ -3004,4 +3004,72 @@ async fn create_project_rollback_leaves_a_pre_existing_scratch_md_untouched() {
         mine,
         "the rollback must never delete a scratch.md the app did not create"
     );
+}
+
+// ---------------------------------------------------------------------------
+// plan.15 draft sweeps: `delete_files`/`forget` each sweep their OWN project's
+// draft backups (app_data_dir\drafts\*.md, outside the project folder) and
+// must never touch another loaded project's drafts. `store::draftfile`'s
+// bodies are `todo!("plan.15 phase 1")` as of this writing, so these are
+// EXPECTED to fail with that panic until phase 1 lands (RED before GREEN).
+// ---------------------------------------------------------------------------
+
+/// A fully-populated `Draft` for `project_id`, with fresh random `draftId`/
+/// `entityId` — the content itself is irrelevant to these sweep tests, only
+/// which project a draft is attributed to.
+fn plan15_sample_draft(project_id: &str) -> Draft {
+    Draft {
+        v: 0,
+        draft_id: uuid::Uuid::new_v4().to_string(),
+        surface: DraftSurface::Item,
+        project_id: project_id.into(),
+        entity_id: uuid::Uuid::new_v4().to_string(),
+        kind: Some(Kind::Task),
+        base_updated_at: String::new(),
+        base_hash: String::new(),
+        saved_at: String::new(),
+        title: "draft title".into(),
+        status: Some(Status::Doing),
+        priority: Some(Priority::Normal),
+        due_at: String::new(),
+        tags: Vec::new(),
+        jira_url: String::new(),
+        body: "draft body".into(),
+    }
+}
+
+#[tokio::test]
+async fn delete_files_sweeps_only_that_projects_drafts() {
+    let (mgr, _app) = new_manager().await;
+    let (a, _dir_a) = create_project(&mgr, "Alpha").await;
+    let (b, _dir_b) = create_project(&mgr, "Beta").await;
+
+    mgr.save_draft(plan15_sample_draft(&a.id)).unwrap();
+    mgr.save_draft(plan15_sample_draft(&b.id)).unwrap();
+    assert_eq!(mgr.list_drafts().unwrap().len(), 2);
+
+    mgr.unload(&a.id).await.unwrap();
+    mgr.delete_files(&a.id).await.unwrap();
+
+    let listed = mgr.list_drafts().unwrap();
+    assert_eq!(listed.len(), 1, "delete_files must sweep A's draft");
+    assert_eq!(listed[0].project_id, b.id, "B's draft must be untouched by A's delete_files");
+}
+
+#[tokio::test]
+async fn forget_sweeps_only_that_projects_drafts() {
+    let (mgr, _app) = new_manager().await;
+    let (a, _dir_a) = create_project(&mgr, "Alpha").await;
+    let (b, _dir_b) = create_project(&mgr, "Beta").await;
+
+    mgr.save_draft(plan15_sample_draft(&a.id)).unwrap();
+    mgr.save_draft(plan15_sample_draft(&b.id)).unwrap();
+    assert_eq!(mgr.list_drafts().unwrap().len(), 2);
+
+    mgr.unload(&a.id).await.unwrap();
+    mgr.forget(&a.id).await.unwrap();
+
+    let listed = mgr.list_drafts().unwrap();
+    assert_eq!(listed.len(), 1, "forget must sweep A's draft");
+    assert_eq!(listed[0].project_id, b.id, "B's draft must be untouched by A's forget");
 }

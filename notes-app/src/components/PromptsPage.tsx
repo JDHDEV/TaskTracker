@@ -1,9 +1,16 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import type { NewPrompt, ProjectInfo, Prompt, UpdatePrompt } from "../types";
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import type { Draft, NewPrompt, ProjectInfo, Prompt, UpdatePrompt } from "../types";
 import * as api from "../lib/api";
+import {
+  classifyPromptRestore,
+  draftIdFromTabKey,
+  promptDraftTabKey,
+  sanitizeDraft,
+} from "../lib/drafts";
 import { itemKey, nextToken, shouldCommit } from "../lib/projects";
 import { displayTitle } from "../lib/prompts";
 import { tabKeyId, writeSession, type PromptsSlice } from "../lib/session";
+import DraftConflictBar from "./DraftConflictBar";
 import {
   activateTab,
   activeTab,
@@ -42,6 +49,9 @@ interface Props {
   /** Widened for keyed (resolvable) validation toasts; transient sites still
    *  call it one-arg (assignable). */
   onError: (message: string, opts?: { key?: string }) => void;
+  /** Auto-expiring notice (plan.15 D3: the restore toast is informational,
+   *  never an error). Keyed like onError. */
+  onNotice: (message: string, opts?: { key?: string }) => void;
   /** Clear a keyed toast on resolution — threaded down to PromptEditor. */
   onResolve: (key: string) => void;
   /** Report the set of owning projects across ALL open prompt tabs (not just the
@@ -94,6 +104,7 @@ export default function PromptsPage({
   reloadSignal,
   onProjectsChanged,
   onError,
+  onNotice,
   onResolve,
   onOpenPromptsChange,
   seed,
@@ -109,7 +120,6 @@ export default function PromptsPage({
   // a switch; a draft gets a synthetic `prompt-draft-<seq>` key, promoted to the
   // created prompt's key on save.
   const [tabs, setTabs] = useState<OpenTabsState<Prompt>>(emptyTabs);
-  const [draftSeq, setDraftSeq] = useState(0);
   const tabsRef = useRef(tabs);
   useEffect(() => {
     tabsRef.current = tabs;
@@ -162,33 +172,58 @@ export default function PromptsPage({
   useEffect(() => {
     if (!seed) return;
     setProjectId(seed.projectId);
-    const seq = draftSeq + 1;
-    setDraftSeq(seq);
+    // `prompt-draft-<uuid>` (plan.15 D8): the bare UUID is the persistent
+    // on-disk draftId — per-boot counters would collide across restarts.
     setTabs((s) =>
-      openTab(s, `prompt-draft-${seq}`, newDraft(seed.projectId, seed.body, seed.title ?? ""), true),
+      openTab(
+        s,
+        `prompt-draft-${crypto.randomUUID()}`,
+        newDraft(seed.projectId, seed.body, seed.title ?? ""),
+        true,
+      ),
     );
   }, [seed]);
 
   // F4 (D10) restore, once, when App signals the loaded catalog is known. The
   // scope restores only if it names a loaded project; tabs are fetched by id
   // in persisted order, misses dropped silently, then the persisted active tab
-  // re-activates. Restored tabs open clean. `sessionRestored` gates the writer
-  // below so the initial empty state never clobbers the stored slice.
+  // re-activates. Restored session tabs open clean — except tabs carrying
+  // RECOVERED UNSAVED EDITS (plan.15 D3), unioned in from the on-disk draft
+  // backups below. `sessionRestored` gates the writer below so the initial
+  // empty state never clobbers the stored slice.
   const restoredRef = useRef(false);
   const [sessionRestored, setSessionRestored] = useState(false);
+
+  // Plan.15 restore bookkeeping — the App.tsx trio, prompt-shaped: a ref of
+  // tab key → snapshot (consumed once at editor mount), a ref of orphan key →
+  // superseded old draft id, and the conflict-bar state (D4).
+  const restoredDraftsRef = useRef(new Map<string, Draft>());
+  const supersededRef = useRef(new Map<string, string>());
+  const [conflicts, setConflicts] = useState<Map<string, Draft>>(new Map());
+  useEffect(() => {
+    for (const key of Array.from(restoredDraftsRef.current.keys()))
+      if (!hasTab(tabs, key)) restoredDraftsRef.current.delete(key);
+    for (const key of Array.from(supersededRef.current.keys()))
+      if (!hasTab(tabs, key)) supersededRef.current.delete(key);
+    setConflicts((m) => {
+      if (![...m.keys()].some((key) => !hasTab(tabs, key))) return m;
+      const next = new Map(m);
+      for (const key of Array.from(next.keys())) if (!hasTab(tabs, key)) next.delete(key);
+      return next;
+    });
+  }, [tabs]);
+
   useEffect(() => {
     if (!sessionReady || restoredRef.current) return;
     restoredRef.current = true;
     const s = session;
-    if (!s) {
-      setSessionRestored(true);
-      return;
+    if (s) {
+      if (s.projectId && loaded.some((p) => p.id === s.projectId)) setProjectId(s.projectId);
+      setReusableOnly(s.reusableOnly);
     }
-    if (s.projectId && loaded.some((p) => p.id === s.projectId)) setProjectId(s.projectId);
-    setReusableOnly(s.reusableOnly);
     void (async () => {
       const results = await Promise.all(
-        s.tabKeys.map((key) => {
+        (s?.tabKeys ?? []).map((key) => {
           const id = tabKeyId(key);
           return id
             ? api.getPrompt(id).then(
@@ -198,17 +233,114 @@ export default function PromptsPage({
             : Promise.resolve<Prompt | null>(null);
         }),
       );
+
+      // Plan.15 step 17: union in the prompt-surface draft backups (the same
+      // choreography as App.tsx's item restore — see there for the rationale).
+      const drafts = await api.listDrafts().then(
+        (list) => list.map(sanitizeDraft).filter((d): d is Draft => d !== null),
+        (): Draft[] => [],
+      );
+      const outcomes = await Promise.all(
+        drafts
+          .filter((d) => d.surface === "prompt")
+          .map(async (d) => {
+            const projectLoaded = !d.projectId || loaded.some((p) => p.id === d.projectId);
+            const prompt =
+              d.entityId && projectLoaded
+                ? await api.getPrompt(d.entityId).then(
+                    (p): Prompt | null => p,
+                    (): Prompt | null => null,
+                  )
+                : null;
+            return { draft: d, prompt, outcome: classifyPromptRestore(d, prompt, projectLoaded) };
+          }),
+      );
+      const toOpen: Array<{ key: string; prompt: Prompt; dirty: boolean }> = [];
+      const newConflicts = new Map<string, Draft>();
+      let restoredCount = 0;
+      let orphanCount = 0;
+      for (const { draft, prompt, outcome } of outcomes) {
+        switch (outcome) {
+          case "skip":
+            break;
+          case "clean":
+            void api.deleteDraft(draft.draftId).catch(() => {});
+            break;
+          case "restore": {
+            if (prompt) {
+              const key = promptTabKey(prompt);
+              restoredDraftsRef.current.set(key, draft);
+              toOpen.push({ key, prompt, dirty: true });
+            } else {
+              const key = promptDraftTabKey(draft.draftId);
+              restoredDraftsRef.current.set(key, draft);
+              toOpen.push({ key, prompt: newDraft(draft.projectId), dirty: true });
+            }
+            restoredCount += 1;
+            break;
+          }
+          case "conflict": {
+            if (!prompt) break;
+            const key = promptTabKey(prompt);
+            newConflicts.set(key, draft);
+            toOpen.push({ key, prompt, dirty: false });
+            break;
+          }
+          case "orphan": {
+            const freshId = crypto.randomUUID();
+            const key = promptDraftTabKey(freshId);
+            restoredDraftsRef.current.set(key, {
+              ...draft,
+              draftId: freshId,
+              entityId: "",
+              baseUpdatedAt: "",
+            });
+            supersededRef.current.set(key, draft.draftId);
+            toOpen.push({ key, prompt: newDraft(draft.projectId), dirty: true });
+            orphanCount += 1;
+            break;
+          }
+        }
+      }
+
       setTabs((prev) => {
         let next = prev;
         for (const p of results) {
           if (p) next = openTab(next, promptTabKey(p), p);
         }
-        if (s.activeKey && hasTab(next, s.activeKey)) next = activateTab(next, s.activeKey);
+        for (const entry of toOpen) {
+          next = openTab(next, entry.key, entry.prompt, entry.dirty);
+          if (entry.dirty) next = setDirty(next, entry.key, true);
+        }
+        if (s?.activeKey && hasTab(next, s.activeKey)) next = activateTab(next, s.activeKey);
         return next;
       });
+      if (newConflicts.size > 0) {
+        setConflicts(newConflicts);
+        onNotice(
+          `${newConflicts.size} prompt${newConflicts.size === 1 ? "" : "s"} changed on disk since your unsaved edits — open the tab to choose.`,
+          { key: "prompt-draft-conflicts" },
+        );
+      }
+      if (restoredCount > 0) {
+        // D3: visible, never silent — the item side has its own toast; this
+        // one names prompts so the user knows which page to look at.
+        onNotice(
+          `Restored unsaved edits to ${restoredCount} prompt${restoredCount === 1 ? "" : "s"}.`,
+          { key: "prompt-draft-restore" },
+        );
+      }
+      if (orphanCount > 0) {
+        // Post-review: mirror the item side's honest orphan notice — the
+        // owning prompt is GONE; folding this into "restored" hid that.
+        onNotice(
+          `${orphanCount} recovered draft${orphanCount === 1 ? " belongs" : "s belong"} to a prompt that no longer exists — reopened as a new draft.`,
+          { key: "prompt-draft-orphans" },
+        );
+      }
       setSessionRestored(true);
     })();
-  }, [sessionReady, session, loaded]);
+  }, [sessionReady, session, loaded, onNotice]);
 
   // F4 persistence: this page's slice, debounced ~300 ms; identifiers only
   // (S-4) — draft tabs (id "") are never written.
@@ -359,9 +491,7 @@ export default function PromptsPage({
 
   function openNewDraft() {
     if (!projectId) return; // All scope has no concrete create target
-    const seq = draftSeq + 1;
-    setDraftSeq(seq);
-    setTabs((s) => openTab(s, `prompt-draft-${seq}`, newDraft(projectId), true));
+    setTabs((s) => openTab(s, `prompt-draft-${crypto.randomUUID()}`, newDraft(projectId), true));
   }
 
   // Rail click: open-or-activate (look the row up in `prompts` for its snapshot).
@@ -399,6 +529,9 @@ export default function PromptsPage({
         const title = displayTitle(tab.item.title, tab.item.body);
         if (tab.item.id === "") {
           if (!(await api.confirmDialog("Discard this unsaved prompt?"))) return;
+          // Plan.15 §4.3: an explicit Discard clears the on-disk backup too,
+          // through the handle so the queue seals before the delete.
+          await editorRefs.current.get(key)?.discardDraft();
         } else {
           // Two chained Yes/No prompts (api.confirmDialog → the plugin's ask(),
           // a Yes/No dialog) give the Cancel / Discard / Save choice.
@@ -411,6 +544,9 @@ export default function PromptsPage({
           ) {
             const saved = await editorRefs.current.get(key)?.save();
             if (!saved) return;
+            // (a successful save cleared the draft backup itself)
+          } else {
+            await editorRefs.current.get(key)?.discardDraft(); // the Discard branch
           }
         }
       }
@@ -451,7 +587,14 @@ export default function PromptsPage({
       )
         return;
       const ok = await mutate(() => api.deletePrompt(prompt.id));
-      if (ok) closeTabByKey(key);
+      if (ok) {
+        // Plan.15 §4.3: "delete means gone" — the prompt's draft backup goes
+        // with it (it can hold MORE than the last saved version).
+        const handle = editorRefs.current.get(key);
+        if (handle) await handle.discardDraft();
+        else await api.deleteDraft(prompt.id).catch(() => {});
+        closeTabByKey(key);
+      }
     })();
   }
 
@@ -482,14 +625,43 @@ export default function PromptsPage({
           />
           {tabs.tabs.map((t) => {
             const isDraft = t.item.id === "";
+            // The on-disk draft-backup id (plan.15 D8): the prompt's UUID for
+            // a saved prompt, the bare UUID inside `prompt-draft-<uuid>` else.
+            const draftId = isDraft ? (draftIdFromTabKey(t.key) ?? "") : t.item.id;
+            const conflict = conflicts.get(t.key);
             return (
+              <Fragment key={t.key}>
+              {conflict && (
+                <DraftConflictBar
+                  title={displayTitle(t.item.title, t.item.body)}
+                  hidden={t.key !== tabs.activeKey}
+                  onKeep={() => {
+                    void api.deleteDraft(conflict.draftId).catch(() => {});
+                    setConflicts((m) => {
+                      const next = new Map(m);
+                      next.delete(t.key);
+                      return next;
+                    });
+                  }}
+                  onRestore={() => {
+                    editorRefs.current.get(t.key)?.applyDraft(conflict);
+                    setConflicts((m) => {
+                      const next = new Map(m);
+                      next.delete(t.key);
+                      return next;
+                    });
+                  }}
+                />
+              )}
               <PromptEditor
-                key={t.key}
                 ref={(h) => {
                   if (h) editorRefs.current.set(t.key, h);
                   else editorRefs.current.delete(t.key);
                 }}
                 tabKey={t.key}
+                draftId={draftId}
+                restoredDraft={restoredDraftsRef.current.get(t.key) ?? null}
+                supersedesDraftId={supersededRef.current.get(t.key) ?? null}
                 hidden={t.key !== tabs.activeKey}
                 active={pageActive && t.key === tabs.activeKey}
                 prompt={t.item}
@@ -511,6 +683,7 @@ export default function PromptsPage({
                 onError={onError}
                 onResolve={onResolve}
               />
+              </Fragment>
             );
           })}
         </div>

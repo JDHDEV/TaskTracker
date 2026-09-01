@@ -7,6 +7,7 @@ import {
   useState,
 } from "react";
 import type {
+  Draft,
   Item,
   NewItem,
   Priority,
@@ -16,6 +17,8 @@ import type {
   UpdateItem,
 } from "../types";
 import { aiGenerateTitle, aiRewriteStream } from "../lib/api";
+import { buildItemDraft, bufferEqualsItem, type ItemBuffer } from "../lib/drafts";
+import { useDraftBackup } from "../hooks/useDraftBackup";
 import { reportAiError } from "../lib/aiErrors";
 import { getPreferredProvider } from "../lib/aiProvider";
 import { fromDateInputValue, toDateInputValue } from "../lib/dueDate";
@@ -36,9 +39,19 @@ import JiraRow from "./JiraRow";
 
 /** Imperative handle: lets the parent persist a background (mounted-hidden,
  *  non-active) tab from the close-dirty "Save" branch — its buffer lives only in
- *  this instance's local state and is otherwise unreachable. */
+ *  this instance's local state and is otherwise unreachable. Plan.15 adds the
+ *  draft-backup verbs: `applyDraft` is the ONLY way content enters an
+ *  already-mounted clean editor (the conflict bar's "Restore unsaved edits" —
+ *  the reseed effect fires only on [item.id, isDraft] changes); `flushDraft`
+ *  snapshots without any of save()'s behavior (no item write, no R4 AI title —
+ *  the window-close flush depends on that); `discardDraft` permanently stops
+ *  backups and deletes the draft, ordered behind in-flight writes, so the
+ *  buffer-discarding paths can never be raced by a straggler snapshot. */
 export interface EditorHandle {
   save: () => Promise<boolean>;
+  applyDraft: (snapshot: Draft) => void;
+  flushDraft: () => Promise<void>;
+  discardDraft: () => Promise<void>;
 }
 
 interface Props {
@@ -48,6 +61,17 @@ interface Props {
   activeTags: string[];
   /** This tab's identity key — derives the tab/panel ARIA ids. */
   tabKey: string;
+  /** The BARE on-disk draft-backup id (plan.15 D8): the item's UUID for a
+   *  saved item, the minted UUID inside the `draft-<uuid>` tab key for a new
+   *  draft — never the prefixed tab key itself. */
+  draftId: string;
+  /** Boot-restore seed (D5): when set, the buffer mounts from this snapshot,
+   *  DIRTY — the one narrow exception to "restored tabs open clean". Consumed
+   *  at mount only; later prop changes are ignored. */
+  restoredDraft?: Draft | null;
+  /** Orphan-restore handoff (step 13): the dead item's old draft file, deleted
+   *  only after this editor's first successful flush under its fresh id. */
+  supersedesDraftId?: string | null;
   /** True when this tab is not the active one in its page — the section is
    *  mounted but display:none (preserving its edit buffer/stream). Distinct from
    *  `active`, which also requires this page to be the visible one. */
@@ -104,6 +128,9 @@ const Editor = forwardRef<EditorHandle, Props>(function Editor(
     loaded,
     activeTags,
     tabKey,
+    draftId,
+    restoredDraft = null,
+    supersedesDraftId = null,
     hidden,
     active,
     onDirtyChange,
@@ -122,16 +149,33 @@ const Editor = forwardRef<EditorHandle, Props>(function Editor(
   }: Props,
   ref,
 ) {
-  const [title, setTitle] = useState(item.title);
-  const [body, setBody] = useState(item.body);
-  const [status, setStatus] = useState<Status>(item.status ?? "todo");
-  const [priority, setPriority] = useState<Priority>(item.priority ?? "normal");
-  // Holds the input's yyyy-mm-dd string, not the RFC 3339 wire value.
-  const [dueAt, setDueAt] = useState(toDateInputValue(item.dueAt));
-  const [tags, setTags] = useState<string[]>(item.tags);
-  const [projectId, setProjectId] = useState(item.projectId ?? "");
-  const [jiraUrl, setJiraUrl] = useState(item.jiraUrl ?? "");
-  const [dirty, setDirty] = useState(isDraft); // a fresh draft starts dirty (DESIGN.md:65)
+  // Plan.15 D3/D5: a boot-restored draft seeds the INITIAL buffer (state
+  // initializers, not an effect — so the restored content is never on screen a
+  // frame late) and the tab mounts DIRTY. `restoredDraft` is read here once;
+  // the reseed effect below is guarded so its mount pass can't wipe this.
+  const [title, setTitle] = useState(restoredDraft ? restoredDraft.title : item.title);
+  const [body, setBody] = useState(restoredDraft ? restoredDraft.body : item.body);
+  const [status, setStatus] = useState<Status>(
+    restoredDraft ? (restoredDraft.status ?? "todo") : (item.status ?? "todo"),
+  );
+  const [priority, setPriority] = useState<Priority>(
+    restoredDraft ? (restoredDraft.priority ?? "normal") : (item.priority ?? "normal"),
+  );
+  // Holds the input's yyyy-mm-dd string, not the RFC 3339 wire value (a draft
+  // snapshot captures this buffer form verbatim).
+  const [dueAt, setDueAt] = useState(
+    restoredDraft ? restoredDraft.dueAt : toDateInputValue(item.dueAt),
+  );
+  const [tags, setTags] = useState<string[]>(restoredDraft ? restoredDraft.tags : item.tags);
+  const [projectId, setProjectId] = useState(
+    restoredDraft ? restoredDraft.projectId : (item.projectId ?? ""),
+  );
+  const [jiraUrl, setJiraUrl] = useState(
+    restoredDraft ? restoredDraft.jiraUrl : (item.jiraUrl ?? ""),
+  );
+  // A fresh draft starts dirty (DESIGN.md:65); a restored buffer mounts dirty
+  // (D3 — restore is visible, never silent).
+  const [dirty, setDirty] = useState(restoredDraft ? true : isDraft);
   const [proposal, setProposal] = useState<string | null>(null);
   const [streaming, setStreaming] = useState(false);
   const [aiBusy, setAiBusy] = useState(false);
@@ -166,6 +210,41 @@ const Editor = forwardRef<EditorHandle, Props>(function Editor(
   useEffect(() => {
     titleRef.current = title;
   }, [title]);
+
+  // --- Draft backup (plan.15 step 11) --------------------------------------
+  // Bumped at the edit() chokepoint; the hook's schedule reads it. A ref, so a
+  // keystroke never adds render work beyond what edit() already does.
+  const lastEditRef = useRef(0);
+  // Snapshot closure, reassigned every render so the hook's ticks always read
+  // the live buffer (the titleRef mirror pattern, widened to every buffered
+  // field). Returns null when buffer == base — the hook then deletes any
+  // draft on disk instead of writing one (D6).
+  const snapshotRef = useRef<() => Draft | null>(() => null);
+  useEffect(() => {
+    snapshotRef.current = () => {
+      const isTask = item.kind === "task";
+      const buffer: ItemBuffer = {
+        title,
+        body,
+        status: isTask ? status : null,
+        priority: isTask ? priority : null,
+        dueAt: isTask ? dueAt : "",
+        tags,
+        projectId,
+        jiraUrl,
+      };
+      if (bufferEqualsItem(buffer, item)) return null;
+      return buildItemDraft(draftId, item, buffer);
+    };
+  });
+  const draftBackup = useDraftBackup({
+    draftId,
+    dirty,
+    active,
+    getSnapshot: snapshotRef,
+    lastEditRef,
+    supersedesDraftId,
+  });
 
   // Rework on a selection (Plan 13). The live textarea range lives in a ref
   // (selectionStart/End persist across the blur caused by clicking the AiBar);
@@ -217,8 +296,28 @@ const Editor = forwardRef<EditorHandle, Props>(function Editor(
   // Expose save() so the close-dirty "Save" branch can persist THIS tab even
   // when it is a background (non-active) tab whose buffer lives only here. No
   // deps: the factory re-runs each render, so the handle always calls the latest
-  // save closure.
-  useImperativeHandle(ref, () => ({ save: () => save() }));
+  // save closure. applyDraft is the conflict bar's only way into a mounted
+  // clean editor (D4); flushDraft/discardDraft are the plan.15 backup verbs.
+  useImperativeHandle(ref, () => ({
+    save: () => save(),
+    applyDraft: (snapshot: Draft) => {
+      setTitle(snapshot.title);
+      setBody(snapshot.body);
+      if (item.kind === "task") {
+        setStatus(snapshot.status ?? "todo");
+        setPriority(snapshot.priority ?? "normal");
+        setDueAt(snapshot.dueAt);
+      }
+      setTags([...snapshot.tags]);
+      setJiraUrl(snapshot.jiraUrl);
+      // No setProjectId: a saved item's project is fixed (v1), and the
+      // conflict bar exists only for saved items.
+      setDirty(true);
+      lastEditRef.current = Date.now();
+    },
+    flushDraft: () => draftBackup.flushNow(),
+    discardDraft: () => draftBackup.discard(),
+  }));
 
   // Surface dirty↔clean transitions to the parent tab strip. `dirty` only flips
   // on real transitions (setDirty(true) on an already-dirty editor is a no-op),
@@ -247,12 +346,32 @@ const Editor = forwardRef<EditorHandle, Props>(function Editor(
     }
   }, [body, onResolve]);
 
+  // Plan.15 step 11 reseed guard: this [item.id, isDraft] effect ALSO runs on
+  // first mount, where it would overwrite a restoredDraft-seeded buffer with
+  // saved content and reset dirty on the very frame the tab mounts — defeating
+  // the entire restore path. Skip the reseed while this instance is still on
+  // the identity that consumed the restored draft. Identity-compared rather
+  // than a consume-once flag so StrictMode's dev double-invoke (which re-runs
+  // the effect on the SAME identity) can't take the reseed branch on its
+  // second pass; a genuine identity change resumes normal reseeding.
+  const draftSeedRef = useRef(restoredDraft ? { id: item.id, isDraft } : null);
+
   // Re-seed local state from the item. App.tsx keys this component by
   // draft-seq/selected-id, so most selections remount it; this effect covers
   // the residual same-instance updates. Either way the cleanup below runs
   // (React runs effect cleanup on unmount and on dep-change alike), so a stream
   // in flight is always stopped when the editor moves off its item.
   useEffect(() => {
+    const seeded = draftSeedRef.current;
+    if (seeded && seeded.id === item.id && seeded.isDraft === isDraft) {
+      aliveRef.current = true;
+      return () => {
+        aliveRef.current = false;
+        stopRef.current?.();
+        stopRef.current = null;
+      };
+    }
+    draftSeedRef.current = null; // identity moved on — normal reseeds from here
     aliveRef.current = true; // (re-)arm; StrictMode's dev remount runs cleanup first
     setTitle(item.title);
     setBody(item.body);
@@ -365,7 +484,12 @@ const Editor = forwardRef<EditorHandle, Props>(function Editor(
           jiraUrl: jiraUrl.trim() || undefined,
         };
         const created = await onCreate(input);
-        if (created) setDirty(false);
+        if (created) {
+          setDirty(false);
+          // The item now owns the content — the backup is redundant, and
+          // keeping it would re-offer stale text on the next boot (§4.3).
+          draftBackup.clearAfterSave();
+        }
         return created;
       }
       const saved = await onSave({
@@ -379,7 +503,10 @@ const Editor = forwardRef<EditorHandle, Props>(function Editor(
         // No projectId: items do not move between projects in v1.
         jiraUrl: jiraUrl.trim(), // "" clears
       });
-      if (saved) setDirty(false); // a rejected save stays dirty → "Save", not "Saved"
+      if (saved) {
+        setDirty(false); // a rejected save stays dirty → "Save", not "Saved"
+        draftBackup.clearAfterSave(); // the saved item owns the content now
+      }
       return saved;
     } finally {
       savingRef.current = false;
@@ -404,6 +531,9 @@ const Editor = forwardRef<EditorHandle, Props>(function Editor(
   });
 
   async function rework(instruction: string, provider: ProviderId) {
+    // Plan.15 D6: snapshot before an AI entry point — a crash mid-stream must
+    // not lose the text the rework was asked about. Fire-and-forget.
+    void draftBackup.flushNow();
     // Selection mode is decided HERE, from the tracked range, never from live
     // DOM in a click handler (D7). Only the selected text is sent (§4 M7).
     const sel = captureSelection(selRef.current, body);
@@ -507,6 +637,7 @@ const Editor = forwardRef<EditorHandle, Props>(function Editor(
       onError("There is no text to generate a title from.", { key: "editor-no-title-src" });
       return;
     }
+    void draftBackup.flushNow(); // plan.15 D6: snapshot before an AI entry point
     stopRef.current?.(); // supersede any in-flight rework/suggest
     const provider = getPreferredProvider();
     setSuggestingTitle(true);
@@ -551,6 +682,9 @@ const Editor = forwardRef<EditorHandle, Props>(function Editor(
     return (value: T) => {
       setter(value);
       setDirty(true);
+      // The single chokepoint every buffered edit passes through — the draft
+      // backup's schedule keys off this timestamp (plan.15 D6).
+      lastEditRef.current = Date.now();
     };
   }
 
@@ -856,6 +990,9 @@ const Editor = forwardRef<EditorHandle, Props>(function Editor(
         onSelect={trackSelection}
         onKeyUp={trackSelection}
         onMouseUp={trackSelection}
+        // Plan.15 D6: leaving the body field is a natural checkpoint — flush
+        // the pending snapshot rather than wait out the idle window.
+        onBlur={() => void draftBackup.flushNow()}
         // F6 (D9): whole-line Ctrl+X/C on a collapsed selection ride the
         // native path via selection expansion; line-paste is the one
         // programmatic insert (edit() + pendingCaretRef, not natively undoable).

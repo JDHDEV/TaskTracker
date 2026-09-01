@@ -7,9 +7,10 @@
 //
 // Tab identity is the caller-supplied `key` string — App builds it with
 // itemKey() from projects.ts, PromptsPage the same way, and a fresh draft gets a
-// synthetic `draft-<seq>` key. The reducer treats the key as opaque, so two
-// distinct entities/projects never collapse as long as the caller keys them
-// distinctly.
+// synthetic `draft-<uuid>` key (plan.15 D8: the bare UUID doubles as the
+// on-disk draft-backup id, stable across restarts). The reducer treats the key
+// as opaque, so two distinct entities/projects never collapse as long as the
+// caller keys them distinctly.
 
 /** One open tab: its stable key, a snapshot of the entity it edits, and whether
  *  the mounted editor currently has unsaved edits (surfaced via onDirtyChange). */
@@ -32,7 +33,7 @@ export function emptyTabs<T>(): OpenTabsState<T> {
 
 // Stable DOM ids derived from a tab key, so the tab (`role="tab"`) and its editor
 // panel (`role="tabpanel"`) can cross-reference via aria-controls/aria-labelledby.
-// Keys are UUID-composite or `draft-<seq>` strings — never user text — so these
+// Keys are UUID-composite or `draft-<uuid>` strings — never user text — so these
 // ids never carry untrusted content. Referenced by exact-string ARIA attributes
 // only (no CSS selector / querySelector), so the `:` in a composite key is fine.
 export function tabDomId(key: string): string {

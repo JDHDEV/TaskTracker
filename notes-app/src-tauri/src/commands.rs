@@ -10,8 +10,8 @@ use crate::ai::{self, keys, ChunkSink, RewriteErrorCode, RewriteEvent};
 use crate::error::{AppError, Result};
 use crate::jira;
 use crate::models::{
-    Item, JiraConfig, ListFilter, NewItem, NewPrompt, ProjectInfo, Prompt, PromptListFilter,
-    PromptVersion, TicketMeta, UpdateItem, UpdatePrompt,
+    Draft, Item, JiraConfig, ListFilter, NewItem, NewPrompt, ProjectInfo, Prompt,
+    PromptListFilter, PromptVersion, TicketMeta, UpdateItem, UpdatePrompt,
 };
 use crate::projects::ProjectManager;
 
@@ -273,6 +273,66 @@ pub async fn set_scratch(
     body: String,
 ) -> Result<()> {
     state.manager.set_scratch(&project_id, &body).await
+}
+
+// --- Draft backups (plan.15) -------------------------------------------------
+// Thin wrappers over the manager's app-level `DraftStore`. Commands take a
+// draft/project UUID, never a path; filenames derive only from `is_uuid`-checked
+// ids inside `store::draftfile`; every failure is a fixed generic message. The
+// drafts dir is app-private and NOT a compatibility surface.
+
+// All four are `async` like every other file-touching command (post-review
+// M4): a sync command runs on the main thread, and `save_draft` fsyncs — one
+// disk flush per dirty tab per tick must never ride the UI thread.
+
+/// Persist one unsaved-buffer snapshot. Refuses a project that isn't loaded
+/// (like `set_scratch`); a project-less draft (`projectId: ""`) is accepted.
+#[tauri::command]
+pub async fn save_draft(state: State<'_, AppState>, draft: Draft) -> Result<()> {
+    state.manager.save_draft(draft)
+}
+
+/// Every draft backup on disk, for boot restore. Corrupt files are skipped
+/// per-file (fail-soft) — a bad draft never blocks the app from starting.
+#[tauri::command]
+pub async fn list_drafts(state: State<'_, AppState>) -> Result<Vec<Draft>> {
+    state.manager.list_drafts()
+}
+
+/// Delete one draft backup (idempotent) — called from every buffer-discarding
+/// path: save, discard, item delete.
+#[tauri::command]
+pub async fn delete_draft(state: State<'_, AppState>, draft_id: String) -> Result<()> {
+    state.manager.delete_draft(&draft_id)
+}
+
+/// Delete every draft of a LOADED project — called before Unload/Reload, whose
+/// confirms promise "unsaved edits are discarded". (Delete files / Forget sweep
+/// server-side on their own.)
+#[tauri::command]
+pub async fn sweep_project_drafts(state: State<'_, AppState>, project_id: String) -> Result<()> {
+    state.manager.sweep_project_drafts(&project_id)
+}
+
+/// Plan.15 Phase 6 (D10): the frontend's "all dirty buffers are flushed" ack —
+/// the `CloseRequested` handler in lib.rs prevented the close, emitted
+/// `flush-drafts`, and is waiting on this (or its ~1.5 s timeout) to destroy
+/// the window. An app command, so no `core:window:allow-close/destroy`
+/// capability grant is needed. Honored ONLY while a close is actually in
+/// flight (post-review, security M2): a spurious ack from renderer code must
+/// not become a "destroy the window without flushing" primitive. destroy()
+/// failures are ignored: the timeout thread may have won the race, which is
+/// fine — the window is gone either way.
+#[tauri::command]
+pub fn ack_close(window: tauri::Window) {
+    use tauri::Manager;
+    let closing = window
+        .state::<crate::CloseState>()
+        .closing
+        .load(Ordering::SeqCst);
+    if closing {
+        let _ = window.destroy();
+    }
 }
 
 /// Show the native folder picker and return the chosen directory path (or `None`
