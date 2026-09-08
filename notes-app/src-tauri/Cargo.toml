@@ -59,6 +59,17 @@ thiserror = "2"
 uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 
+# Plan 16: the native context-menu hook (src/context_menu.rs, the crate's only
+# COM code) drives the WebView2 API directly. Both crates MUST stay exact-pinned
+# to the versions `wry` resolves (`cargo tree -i webview2-com`): tauri does not
+# re-export them, and a different version would make `controller()`'s
+# ICoreWebView2Controller a different type — a compile error, not a silent
+# break. Re-check on every tauri bump. Windows-only; Cargo.lock gains no new
+# crate versions from these, only direct edges.
+[target.'cfg(windows)'.dependencies]
+webview2-com = "=0.38.2"
+windows-core = "=0.61.2"
+
 [dev-dependencies]
 # For the integration tests in tests/ — run with `cargo test` from src-tauri.
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }

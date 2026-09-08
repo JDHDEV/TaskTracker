@@ -1,5 +1,6 @@
 pub mod ai;
 mod commands;
+mod context_menu;
 pub mod db;
 pub mod error;
 pub mod jira;
@@ -88,8 +89,15 @@ pub fn run() {
                 manager: Arc::new(manager),
                 http,
                 cancellations: Mutex::new(HashMap::new()),
+                menu_surface: Mutex::new(context_menu::MenuSurface::None),
             });
             app.manage(CloseState { closing: AtomicBool::new(false) });
+
+            // Plan.16: append the app's items to WebView2's own context menu.
+            // Fail-soft by design — a returned error (no main window yet, no
+            // WebView2 controller) is ignored on purpose: the app then simply
+            // runs with the plain native menu, and startup never aborts.
+            let _ = context_menu::install(app.handle());
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -127,6 +135,7 @@ pub fn run() {
             commands::delete_draft,
             commands::sweep_project_drafts,
             commands::ack_close,
+            commands::set_context_menu_surface,
             commands::ai_rewrite,
             commands::ai_generate_title,
             commands::ai_rewrite_stream,

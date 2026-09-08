@@ -4,6 +4,7 @@ import { getVersion } from "@tauri-apps/api/app";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { ask } from "@tauri-apps/plugin-dialog";
 import { isHttpUrl } from "./jira";
+import { parseContextMenuAction, type ContextMenuAction, type MenuSurface } from "./contextMenu";
 import type {
   Draft,
   GenerateTitleRequest,
@@ -203,6 +204,36 @@ export function onFlushDrafts(handler: () => void | Promise<void>): () => void {
  *  does — this must never hang the close). */
 export function ackClose(): Promise<void> {
   return invoke("ack_close");
+}
+
+/**
+ * Plan.16 D4: tell Rust which kind of field has focus — `"body"` (an item or
+ * prompt body textarea), `"scratch"` (the pad) or `"none"`. The native WebView2
+ * context menu is augmented from Rust (`src-tauri/src/context_menu.rs`), and
+ * WebView2 exposes no element identity to that hook, so the frontend publishes
+ * the surface on focus changes and Rust reads the latest value when a
+ * right-click arrives. The value is derived from the app-rendered
+ * `data-menu-surface` attribute, never from user text; Rust allowlists it.
+ */
+export function setContextMenuSurface(surface: MenuSurface): Promise<void> {
+  return invoke("set_context_menu_surface", { surface });
+}
+
+/**
+ * Plan.16 D6: subscribe to the `context-menu-action` event Rust emits when the
+ * user picks one of the app's items on the native menu. Mirrors `onFlushDrafts`
+ * exactly: the `listen()` promise stays inside and the returned unsubscribe is
+ * synchronous, so an editor effect can return it directly. The payload is
+ * validated against the static action-id allowlist; anything else is dropped.
+ */
+export function onContextMenuAction(handler: (action: ContextMenuAction) => void): () => void {
+  const unlisten = listen<unknown>("context-menu-action", (e) => {
+    const action = parseContextMenuAction(e.payload);
+    if (action !== null) handler(action);
+  });
+  return () => {
+    void unlisten.then((un) => un()).catch(() => {});
+  };
 }
 
 export function listActiveTags(): Promise<string[]> {

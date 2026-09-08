@@ -1131,37 +1131,6 @@ textarea {
   width: 220px;
 }
 
-/* Scratch-pad selection context menu (Plan 13). Reuses the popover surface
-   (hairline, radius, no shadow, no icons) but is viewport-fixed at the pointer;
-   left/top come from the React style prop, clamped on-screen. Above every
-   anchored popover. */
-.context-menu {
-  position: fixed;
-  top: auto;
-  margin: 0;
-  z-index: 30;
-  min-width: 220px;
-  padding: 4px;
-  gap: 0;
-}
-
-.context-menu-item {
-  display: block;
-  width: 100%;
-  padding: 6px 10px;
-  border: 1px solid transparent;
-  border-radius: 6px;
-  background: transparent;
-  color: var(--ink);
-  text-align: left;
-  cursor: pointer;
-}
-
-.context-menu-item:hover,
-.context-menu-item:focus-visible {
-  background: var(--bg);
-}
-
 /* Scratch rail: the where-it-lives note above the project rows. */
 .rail-note {
   margin: 0;

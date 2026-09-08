@@ -5,10 +5,15 @@ import {
   useLayoutEffect,
   useRef,
   useState,
-  type MouseEvent,
 } from "react";
 import type { Draft, ProviderId } from "../types";
-import { aiRewriteStream } from "../lib/api";
+import { aiRewriteStream, onContextMenuAction } from "../lib/api";
+import {
+  sendDestinationOf,
+  type ContextMenuAction,
+  type SendDestination,
+} from "../lib/contextMenu";
+import { formatTimestamp, insertText } from "../lib/timestamp";
 import { buildScratchDraft, contentHash } from "../lib/drafts";
 import { useDraftBackup } from "../hooks/useDraftBackup";
 import { reportAiError } from "../lib/aiErrors";
@@ -22,7 +27,6 @@ import {
   type SelectionRange,
 } from "../lib/selection";
 import AiBar from "./AiBar";
-import SelectionMenu, { type SendDestination } from "./SelectionMenu";
 
 /** One project's scratch pad: the owning project and the pad text as last
  *  read from / saved to its `scratch.md`. */
@@ -68,8 +72,9 @@ interface Props {
 
 /** The title-less pad editor: AiBar (explicit Save, D3), the review card (the
  *  proposal half only — copied from PromptEditor; a pad has no title, so no R1
- *  and no R4), the body textarea with rework-on-selection, and the right-click
- *  `SelectionMenu` for a non-empty selection. */
+ *  and no R4), and the body textarea with rework-on-selection. Right-click is
+ *  the native WebView2 menu, carrying the send-to items and "Insert timestamp"
+ *  injected from Rust (plan.16). */
 const ScratchEditor = forwardRef<ScratchEditorHandle, Props>(function ScratchEditor(
   {
     doc,
@@ -124,12 +129,6 @@ const ScratchEditor = forwardRef<ScratchEditorHandle, Props>(function ScratchEdi
   const [selectionRework, setSelectionRework] = useState<CapturedSelection | null>(null);
   const pendingCaretRef = useRef<SelectionRange | null>(null);
 
-  // Context menu: open at the pointer for a non-empty selection. The selection
-  // it acts on is captured at right-click time (the highlight is lost when
-  // focus moves into the menu; the offsets are not).
-  const [menu, setMenu] = useState<{ x: number; y: number } | null>(null);
-  const menuSelRef = useRef<CapturedSelection | null>(null);
-
   function trackSelection() {
     const ta = bodyRef.current;
     if (!ta) return;
@@ -157,6 +156,38 @@ const ScratchEditor = forwardRef<ScratchEditorHandle, Props>(function ScratchEdi
       bodyRef.current.setSelectionRange(c.start, c.end);
     }
   }, [body]);
+
+  // Plan.16 D6: a native context-menu item was chosen while THIS pad is the
+  // focused textarea (hidden pads stay mounted, so activeElement targets).
+  // "Insert timestamp" rides edit() + pendingCaretRef like a line paste. The
+  // send-to items re-read the LIVE selection at action time (bounds-checked,
+  // whitespace-only rejected — the same gate as a selection rework) and hand
+  // the text up; copy, not cut, and nothing is written until the destination's
+  // own Save (plan.13 D5).
+  function handleContextMenuAction(action: ContextMenuAction) {
+    const ta = bodyRef.current;
+    if (!ta || document.activeElement !== ta) return;
+    if (action === "insert-timestamp") {
+      const r = insertText(
+        ta.value,
+        { start: ta.selectionStart, end: ta.selectionEnd },
+        formatTimestamp(new Date()),
+      );
+      if (!r) return;
+      edit(r.body);
+      clearSelection();
+      pendingCaretRef.current = { start: r.caret, end: r.caret };
+      return;
+    }
+    const dest = sendDestinationOf(action);
+    if (dest === null) return;
+    const sel = captureSelection({ start: ta.selectionStart, end: ta.selectionEnd }, ta.value);
+    if (!sel) return;
+    onSendTo(dest, sel.text);
+  }
+  const contextMenuRef = useRef(handleContextMenuAction);
+  contextMenuRef.current = handleContextMenuAction;
+  useEffect(() => onContextMenuAction((a) => contextMenuRef.current(a)), []);
 
   useImperativeHandle(ref, () => ({
     save: () => save(),
@@ -205,7 +236,6 @@ const ScratchEditor = forwardRef<ScratchEditorHandle, Props>(function ScratchEdi
     selRef.current = null;
     setSelectionLength(0);
     pendingCaretRef.current = null;
-    setMenu(null);
     return () => {
       stopRef.current?.();
       stopRef.current = null;
@@ -309,37 +339,6 @@ const ScratchEditor = forwardRef<ScratchEditorHandle, Props>(function ScratchEdi
     lastEditRef.current = Date.now();
   }
 
-  // Right-click: a non-empty, non-whitespace selection opens the custom menu;
-  // anything else falls through to the native WebView2 menu (the field's only
-  // Cut/Copy/Paste path). Shift+F10 / the ContextMenu key fire the same event.
-  function onContextMenu(e: MouseEvent<HTMLTextAreaElement>) {
-    const ta = bodyRef.current;
-    if (!ta) return;
-    const sel = captureSelection({ start: ta.selectionStart, end: ta.selectionEnd }, body);
-    if (sel === null) return;
-    e.preventDefault();
-    menuSelRef.current = sel;
-    setMenu({ x: e.clientX, y: e.clientY });
-  }
-
-  // Every close path (action, Escape, outside mousedown) restores focus AND the
-  // range — usePopover only refocuses the trigger.
-  function closeMenu() {
-    setMenu(null);
-    const sel = menuSelRef.current;
-    const ta = bodyRef.current;
-    if (ta) {
-      ta.focus();
-      if (sel) ta.setSelectionRange(sel.start, sel.end);
-    }
-  }
-
-  function sendTo(dest: SendDestination) {
-    const sel = menuSelRef.current;
-    closeMenu();
-    if (sel) onSendTo(dest, sel.text);
-  }
-
   const stale = selectionRework !== null && isSelectionStale(body, selectionRework);
 
   return (
@@ -416,6 +415,9 @@ const ScratchEditor = forwardRef<ScratchEditorHandle, Props>(function ScratchEdi
         className="body"
         ref={bodyRef}
         value={body}
+        // Plan.16 D4: the pad surface — "Insert timestamp" plus, on a
+        // non-empty selection, the three send-to items, all on the native menu.
+        data-menu-surface="scratch"
         placeholder="Scratch space for this project. Select text and right-click to send it somewhere."
         onChange={(e) => {
           edit(e.target.value);
@@ -426,9 +428,10 @@ const ScratchEditor = forwardRef<ScratchEditorHandle, Props>(function ScratchEdi
         onMouseUp={trackSelection}
         // Plan.15 D6: leaving the field is a natural checkpoint — flush now.
         onBlur={() => void draftBackup.flushNow()}
-        onContextMenu={onContextMenu}
-        // F6 (D9): whole-line Ctrl+X/C/V on a collapsed selection. The native
-        // right-click menu path is untouched — this is keyboard-only.
+        // F6 (D9): whole-line Ctrl+X/C/V on a collapsed selection — keyboard
+        // only. Right-click is WebView2's own menu, which carries the app's
+        // items ("Insert timestamp", the send-to entries) injected from Rust
+        // (plan.16); the app draws no menu of its own.
         onKeyDown={(e) => {
           if (bodyRef.current) handleLineClipboardKeyDown(e, bodyRef.current);
         }}
@@ -441,15 +444,6 @@ const ScratchEditor = forwardRef<ScratchEditorHandle, Props>(function ScratchEdi
             pendingCaretRef.current = { start: caret, end: caret };
           });
         }}
-      />
-
-      <SelectionMenu
-        open={menu !== null}
-        x={menu?.x ?? 0}
-        y={menu?.y ?? 0}
-        anchor={bodyRef}
-        onClose={closeMenu}
-        onSendTo={sendTo}
       />
     </section>
   );

@@ -16,7 +16,7 @@ import {
 } from "../lib/openTabs";
 import EditorTabs, { type EditorTabDescriptor } from "./EditorTabs";
 import ScratchEditor, { type ScratchDoc, type ScratchEditorHandle } from "./ScratchEditor";
-import type { SendDestination } from "./SelectionMenu";
+import type { SendDestination } from "../lib/contextMenu";
 
 interface Props {
   /** The loaded subset of the project catalog — one pad per loaded project. */

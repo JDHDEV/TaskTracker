@@ -16,7 +16,9 @@ import type {
   Status,
   UpdateItem,
 } from "../types";
-import { aiGenerateTitle, aiRewriteStream } from "../lib/api";
+import { aiGenerateTitle, aiRewriteStream, onContextMenuAction } from "../lib/api";
+import type { ContextMenuAction } from "../lib/contextMenu";
+import { formatTimestamp, insertText } from "../lib/timestamp";
 import { buildItemDraft, bufferEqualsItem, type ItemBuffer } from "../lib/drafts";
 import { useDraftBackup } from "../hooks/useDraftBackup";
 import { reportAiError } from "../lib/aiErrors";
@@ -292,6 +294,32 @@ const Editor = forwardRef<EditorHandle, Props>(function Editor(
       bodyRef.current.setSelectionRange(c.start, c.end);
     }
   }, [body]);
+
+  // Plan.16 D6: a native context-menu item was chosen. Every mounted editor
+  // hears the event (hidden tabs stay mounted), so the activeElement check is
+  // the targeting. The LIVE textarea value/selection are the source of truth
+  // (never the `body` closure), and the insert rides edit() + pendingCaretRef
+  // exactly like a line paste, so the dirty flag and the plan.15 draft backup
+  // behave as for typing. An out-of-range caret makes insertText refuse.
+  function handleContextMenuAction(action: ContextMenuAction) {
+    const ta = bodyRef.current;
+    if (!ta || document.activeElement !== ta) return;
+    if (action !== "insert-timestamp") return;
+    const r = insertText(
+      ta.value,
+      { start: ta.selectionStart, end: ta.selectionEnd },
+      formatTimestamp(new Date()),
+    );
+    if (!r) return;
+    edit(setBody)(r.body);
+    clearSelection();
+    pendingCaretRef.current = { start: r.caret, end: r.caret };
+  }
+  // Subscribed once per mount — never re-created per keystroke — through a
+  // latest-handler ref, so the callback never runs a stale edit() closure.
+  const contextMenuRef = useRef(handleContextMenuAction);
+  contextMenuRef.current = handleContextMenuAction;
+  useEffect(() => onContextMenuAction((a) => contextMenuRef.current(a)), []);
 
   // Expose save() so the close-dirty "Save" branch can persist THIS tab even
   // when it is a background (non-active) tab whose buffer lives only here. No
@@ -979,6 +1007,9 @@ const Editor = forwardRef<EditorHandle, Props>(function Editor(
         className="body"
         ref={bodyRef}
         value={body}
+        // Plan.16 D4: tells Rust this field gets "Insert timestamp" on the
+        // native context menu (published on focus by useContextMenuSurface).
+        data-menu-surface="body"
         placeholder="Write here. Use a rework when it's rough."
         onChange={(e) => {
           edit(setBody)(e.target.value);

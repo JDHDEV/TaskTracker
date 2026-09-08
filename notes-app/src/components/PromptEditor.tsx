@@ -15,7 +15,9 @@ import type {
   ProviderId,
   UpdatePrompt,
 } from "../types";
-import { aiRewriteStream, confirmDialog, copyToClipboard } from "../lib/api";
+import { aiRewriteStream, confirmDialog, copyToClipboard, onContextMenuAction } from "../lib/api";
+import type { ContextMenuAction } from "../lib/contextMenu";
+import { formatTimestamp, insertText } from "../lib/timestamp";
 import { buildPromptDraft } from "../lib/drafts";
 import { useDraftBackup } from "../hooks/useDraftBackup";
 import { reportAiError } from "../lib/aiErrors";
@@ -212,6 +214,27 @@ const PromptEditor = forwardRef<PromptEditorHandle, Props>(function PromptEditor
       bodyRef.current.setSelectionRange(c.start, c.end);
     }
   }, [body]);
+
+  // Plan.16 D6: native context-menu action — same shape as Editor.tsx (act only
+  // when THIS textarea is focused, read the live value/selection, insert via
+  // edit() + pendingCaretRef so dirty flag and draft backup follow).
+  function handleContextMenuAction(action: ContextMenuAction) {
+    const ta = bodyRef.current;
+    if (!ta || document.activeElement !== ta) return;
+    if (action !== "insert-timestamp") return;
+    const r = insertText(
+      ta.value,
+      { start: ta.selectionStart, end: ta.selectionEnd },
+      formatTimestamp(new Date()),
+    );
+    if (!r) return;
+    edit(setBody)(r.body);
+    clearSelection();
+    pendingCaretRef.current = { start: r.caret, end: r.caret };
+  }
+  const contextMenuRef = useRef(handleContextMenuAction);
+  contextMenuRef.current = handleContextMenuAction;
+  useEffect(() => onContextMenuAction((a) => contextMenuRef.current(a)), []);
 
   // Expose save() so the close-dirty "Save" branch can persist THIS prompt tab
   // even when it is a background (non-active) tab whose buffer lives only here.
@@ -624,6 +647,8 @@ const PromptEditor = forwardRef<PromptEditorHandle, Props>(function PromptEditor
         className="body"
         ref={bodyRef}
         value={body}
+        // Plan.16 D4: "Insert timestamp" surface (see Editor.tsx).
+        data-menu-surface="body"
         placeholder="Write the prompt text here."
         onChange={(e) => {
           edit(setBody)(e.target.value);

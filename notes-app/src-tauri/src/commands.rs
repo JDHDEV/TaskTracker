@@ -7,6 +7,7 @@ use tauri::ipc::Channel;
 use tauri::State;
 
 use crate::ai::{self, keys, ChunkSink, RewriteErrorCode, RewriteEvent};
+use crate::context_menu::MenuSurface;
 use crate::error::{AppError, Result};
 use crate::jira;
 use crate::models::{
@@ -25,6 +26,23 @@ pub struct AppState {
     /// `ai_rewrite_cancel` can flip the flag the stream loop polls. Entries
     /// are removed on any terminal event so the map can't grow unbounded.
     pub cancellations: Mutex<HashMap<String, Arc<AtomicBool>>>,
+    /// Plan.16 D4: which kind of field has focus, published by the frontend on
+    /// focus changes so the native context-menu hook (`context_menu.rs`) knows
+    /// which items to append. The ONE copy — `set_context_menu_surface` writes
+    /// it and the hook reads it through the `AppHandle`.
+    pub menu_surface: Mutex<MenuSurface>,
+}
+
+/// Plan.16 D4: record which kind of field has focus. Allowlisted — anything but
+/// `none` | `body` | `scratch` is rejected without touching the stored value
+/// (§4 MUST 3). The value is derived from an attribute the app itself renders,
+/// never from user text.
+#[tauri::command]
+pub fn set_context_menu_surface(state: State<'_, AppState>, surface: String) -> Result<()> {
+    let parsed = MenuSurface::parse(&surface)
+        .ok_or_else(|| AppError::Invalid("unknown context-menu surface".into()))?;
+    *state.menu_surface.lock().unwrap() = parsed;
+    Ok(())
 }
 
 #[tauri::command]

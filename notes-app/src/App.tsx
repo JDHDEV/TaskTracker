@@ -67,6 +67,7 @@ import PromptsPage from "./components/PromptsPage";
 import ScratchPage from "./components/ScratchPage";
 import Toasts from "./components/Toasts";
 import { useToasts } from "./hooks/useToasts";
+import { useContextMenuSurface } from "./hooks/useContextMenuSurface";
 
 type Page = "worknotes" | "prompts" | "scratch";
 // Tablist order — the arrow-key walk (with wrap) follows this.
@@ -282,6 +283,10 @@ export default function App() {
       void api.ackClose().catch(() => {});
     });
   }, []);
+
+  // Plan.16 D4: publish which kind of field has focus (body textarea / scratch
+  // pad / none) so Rust can append the right items to the native context menu.
+  useContextMenuSurface();
 
   // Surface one-time startup warnings (a moved/corrupt/newer project file).
   useEffect(() => {
