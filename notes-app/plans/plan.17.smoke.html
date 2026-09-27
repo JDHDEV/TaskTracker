@@ -1,0 +1,207 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Plan 17 smoke checklist</title>
+<style>
+  :root {
+    --bg: #f4f3ef; --surface: #ffffff; --ink: #23272a; --muted: #6e7378; --line: #dcdad4;
+    --mark: #f6e05e; --mark-soft: #fbf3c9; --mark-ink: #6b5c0e; --ok: #4c8a64; --warn: #b4533a;
+    --note-bg: #eef3f8; --note-ink: #1d4b7a;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #1d1c1a; --surface: #272623; --ink: #eceae4; --muted: #a0a09a; --line: #3a3833;
+      --mark: #f6e05e; --mark-soft: #3a3418; --mark-ink: #f3e08a; --ok: #6fb98a; --warn: #e07a62;
+      --note-bg: #1f2b38; --note-ink: #a9c7e6;
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: var(--bg); color: var(--ink); }
+  body {
+    font-family: "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, sans-serif;
+    font-size: 15px; line-height: 1.5; padding: 24px 16px 80px;
+  }
+  main { max-width: 900px; margin: 0 auto; }
+  h1 { font-size: 22px; margin: 0 0 4px; }
+  h2 { font-size: 17px; margin: 32px 0 8px; padding-top: 12px; border-top: 1px solid var(--line); }
+  h2 small { font-weight: 400; color: var(--muted); font-size: 13px; margin-left: 8px; }
+  p, li { max-width: 78ch; }
+  .lede { color: var(--muted); margin: 0 0 16px; }
+  .sticky {
+    position: sticky; top: 0; z-index: 2; display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+    padding: 10px 12px; margin: 0 -4px 16px; background: var(--surface); border: 1px solid var(--line); border-radius: 8px;
+  }
+  .bar { flex: 1 1 200px; height: 10px; background: var(--line); border-radius: 5px; overflow: hidden; }
+  .bar > div { height: 100%; width: 0; background: var(--ok); transition: width 160ms ease; }
+  .count { font-variant-numeric: tabular-nums; color: var(--muted); font-size: 13px; white-space: nowrap; }
+  button {
+    font: inherit; font-size: 13px; padding: 5px 10px; border: 1px solid var(--line); border-radius: 6px;
+    background: var(--surface); color: var(--ink); cursor: pointer;
+  }
+  button:hover { border-color: var(--muted); }
+  ol.steps { list-style: none; margin: 0; padding: 0; counter-reset: step; }
+  ol.steps > li {
+    counter-increment: step; display: grid; grid-template-columns: 28px 1fr; gap: 10px;
+    padding: 10px 12px; margin: 0 0 8px; background: var(--surface); border: 1px solid var(--line); border-radius: 8px;
+  }
+  ol.steps > li.done { opacity: 0.62; }
+  ol.steps > li > input { width: 18px; height: 18px; margin: 3px 0 0; accent-color: var(--ok); cursor: pointer; }
+  ol.steps > li > label { cursor: pointer; }
+  ol.steps > li > label::before { content: counter(step) ". "; color: var(--muted); font-variant-numeric: tabular-nums; }
+  .pass { display: block; margin-top: 6px; color: var(--ok); }
+  .pass::before { content: "PASS: "; font-weight: 600; }
+  .expected { display: block; margin-top: 6px; padding: 6px 10px; background: var(--note-bg); color: var(--note-ink); border-radius: 6px; }
+  .expected::before { content: "Expected, not a defect: "; font-weight: 600; }
+  .setup { padding: 10px 12px; background: var(--mark-soft); border: 1px solid var(--mark); border-radius: 8px; color: var(--mark-ink); }
+  .setup code, li code, p code { font-family: "Cascadia Mono", Consolas, ui-monospace, monospace; font-size: 0.92em; }
+  kbd { font-family: inherit; font-size: 0.9em; padding: 1px 5px; border: 1px solid var(--line); border-bottom-width: 2px; border-radius: 4px; background: var(--bg); }
+  .fail-note { color: var(--warn); }
+  @media (max-width: 600px) { body { padding: 16px 12px 80px; } }
+</style>
+</head>
+<body>
+<main>
+  <h1>Plan 17 smoke checklist — AI review UX batch</h1>
+  <p class="lede">worknotes · plan 17 (instruction retention &amp; history, auto-grow instruction box, selection confirm + highlight, diff review card, unsaved-change visibility). Progress is kept in this browser's storage; use <em>Reset</em> to start over. Every FAIL is a defect to fix before plan 17 ships — write it down as you go.</p>
+
+  <div class="sticky">
+    <div class="bar"><div id="bar"></div></div>
+    <span class="count" id="count">0 / 0</span>
+    <button type="button" id="reset">Reset</button>
+  </div>
+
+  <div class="setup">
+    <strong>Setup.</strong> Close the installed app (<code>C:\Tools\worknotes</code>) first — the dev app shares <code>catalog.db</code> and the drafts folder with it. Run <code>cd notes-app &amp;&amp; npm run tauri dev</code>. Load a project with at least one note, one task and one prompt, with an AI key saved (a second provider with <em>no</em> key is useful for the error steps). Keep this page on a second monitor.
+  </div>
+
+  <h2>1 · Instruction retention <small>feature 1a · all three editors</small></h2>
+  <ol class="steps" data-section="s1">
+    <li><input type="checkbox" id="s1-1"><label for="s1-1">Open a <strong>note</strong>. Type <code>Tighten this</code> in the <em>Rework instruction</em> box, press <kbd>Enter</kbd>, wait for the card, click <strong>Discard</strong>.<span class="pass">the instruction is still in the box after Discard.</span></label></li>
+    <li><input type="checkbox" id="s1-2"><label for="s1-2">Repeat step 1 on a <strong>task</strong>, a <strong>prompt</strong> (Prompts page) and a <strong>scratch pad</strong> (Scratch page).<span class="pass">the box keeps the instruction in all three.</span></label></li>
+    <li><input type="checkbox" id="s1-3"><label for="s1-3">Start a rework, click <strong>Discard</strong> <em>while it is still streaming</em>.<span class="pass">card closes, instruction stays in the box, the Rework button is enabled again.</span></label></li>
+    <li><input type="checkbox" id="s1-4"><label for="s1-4">Switch the provider select to one with <strong>no key saved</strong>, press <kbd>Enter</kbd> in the box.<span class="pass">the missing-key toast appears, no card, the instruction stays in the box, and the body textarea shows no highlight.</span></label></li>
+  </ol>
+
+  <h2>2 · Prompt instruction history <small>feature 1b · Prompts page</small></h2>
+  <ol class="steps" data-section="s2">
+    <li><input type="checkbox" id="s2-1"><label for="s2-1">On a <strong>saved prompt</strong>, rework with a distinctive instruction (e.g. <code>Make it three bullets</code>), then click <strong>Replace text</strong>.<span class="pass">the box empties (it was unedited), the prompt saves, <code>vN</code> increments.</span></label></li>
+    <li><input type="checkbox" id="s2-2"><label for="s2-2">Click <strong>History</strong>.<span class="pass">the newest row is <em>AI enhanced</em> and shows an <code>INSTRUCTION</code> row with <code>Make it three bullets</code>; the older <em>manual</em> rows show no INSTRUCTION row; a muted line reads “Accepted-rewrite instructions are saved with the prompt's history in the project folder.”; <kbd>Esc</kbd> closes the dialog and focus returns to the <strong>History</strong> button.</span></label></li>
+    <li><input type="checkbox" id="s2-3"><label for="s2-3">Rework again, and while the proposal is pending <strong>retype</strong> a different instruction in the box, then click <strong>Replace text</strong>.<span class="pass">the box keeps your new text (not cleared); History records the instruction that was actually sent, not the retyped one.</span></label></li>
+    <li><input type="checkbox" id="s2-4"><label for="s2-4">Rework with an instruction that yields the <strong>same</strong> text as the body (e.g. select nothing, instruction <code>Return the text exactly unchanged</code>) and click <strong>Replace text</strong>.<span class="pass">saves cleanly.</span><span class="expected">no new version and no INSTRUCTION row — an identical save appends nothing.</span></label></li>
+    <li><input type="checkbox" id="s2-5"><label for="s2-5">Open <code>prompts/&lt;prompt-uuid&gt;/&lt;newest-version-uuid&gt;.md</code> in the project folder in a text editor.<span class="pass">the frontmatter has an <code>instruction: "…"</code> line directly after <code>title:</code>; older version files have none.</span></label></li>
+  </ol>
+
+  <h2>3 · Instruction box <small>feature 2</small></h2>
+  <ol class="steps" data-section="s3">
+    <li><input type="checkbox" id="s3-1"><label for="s3-1">Click into the box and press <kbd>Shift</kbd>+<kbd>Enter</kbd> six times, typing a word on each line.<span class="pass">the box grows line by line to five lines, then scrolls inside; the chips, <strong>Rework</strong> and <strong>Save</strong> stay on the first row and do not jump; no rework was triggered.</span></label></li>
+    <li><input type="checkbox" id="s3-2"><label for="s3-2">Press <kbd>Enter</kbd> (no Shift) with text in the box.<span class="pass">a rework starts; while it runs the box is read-only (typing does nothing, focus stays in it) and the button reads <em>Working…</em>.</span></label></li>
+    <li><input type="checkbox" id="s3-3"><label for="s3-3">Switch to an IME (e.g. Windows Japanese IME), type <code>nihongo</code> and press <kbd>Enter</kbd> to <em>commit the composition</em>.<span class="pass">the composition commits and NO rework starts; a second <kbd>Enter</kbd> then submits.</span></label></li>
+    <li><input type="checkbox" id="s3-4"><label for="s3-4">Click a preset chip.<span class="pass">the chip text fills the box, focus is in the box with the caret at the end, nothing was submitted.</span></label></li>
+    <li><input type="checkbox" id="s3-5"><label for="s3-5">Repeat step 1 in a <strong>dark</strong> palette and with the window narrowed to ~700px wide.<span class="pass">the bar wraps cleanly; the box stays readable and top-aligned with its row.</span></label></li>
+  </ol>
+
+  <h2>4 · Selection confirm <small>feature 3</small></h2>
+  <ol class="steps" data-section="s4">
+    <li><input type="checkbox" id="s4-1"><label for="s4-1">In a note body, <strong>select</strong> a sentence (the bar reads <em>Rework selection with</em>), type an instruction, press <kbd>Enter</kbd>.<span class="pass">a native dialog appears: “Rework only the N selected characters?” with a second line <code>Instruction: "…"</code>, buttons <strong>Rework selection</strong> / <strong>Cancel</strong>; N equals the selected length; the selected text itself is NOT in the dialog; behind the dialog the selection is highlighted in the body.</span></label></li>
+    <li><input type="checkbox" id="s4-2"><label for="s4-2">Click <strong>Cancel</strong>.<span class="pass">no card, no <em>Working…</em>, instruction still in the box, selection still tracked (<em>N characters selected</em> still shown), highlight gone.</span></label></li>
+    <li><input type="checkbox" id="s4-3"><label for="s4-3">Press <kbd>Enter</kbd> again and click <strong>Rework selection</strong>.<span class="pass">the request starts and the card chip reads <em>PROPOSED REWRITE (SELECTION)</em> once done.</span></label></li>
+    <li><input type="checkbox" id="s4-4"><label for="s4-4">Collapse the selection (click in the body or press <strong>Whole text</strong>) and press <kbd>Enter</kbd>.<span class="pass">NO dialog for a whole-text rework.</span></label></li>
+    <li><input type="checkbox" id="s4-5"><label for="s4-5">Select text, press <kbd>Enter</kbd> twice quickly.<span class="pass">exactly one dialog opens.</span><span class="expected">the body cannot be edited while the native dialog is up — it is modal — so the “selection changed” abort can only be provoked by the conflict bar's Restore, not by typing.</span></label></li>
+    <li><input type="checkbox" id="s4-6"><label for="s4-6"><strong>Regression (review finding):</strong> in a body like <code>Alpha Bravo Charlie Delta</code>, select <code>Bravo</code>, rework it and confirm; wait for the card (chip <em>PROPOSED REWRITE (SELECTION)</em>). Without accepting, select <code>Delta</code>, press <kbd>Enter</kbd>, and click <strong>Cancel</strong> in the dialog. Then click <strong>Replace text</strong>.<span class="pass">the card kept its <em>(SELECTION)</em> chip and its highlight on <code>Bravo</code> throughout; Replace text splices only <code>Bravo</code> — <code>Alpha</code>, <code>Charlie</code> and <code>Delta</code> are untouched.</span></label></li>
+  </ol>
+
+  <h2>5 · Selection highlight <small>feature 4</small></h2>
+  <ol class="steps" data-section="s5">
+    <li><input type="checkbox" id="s5-1"><label for="s5-1">Start a selection rework (confirm it) in a body long enough to scroll; while the proposal is pending, <strong>scroll</strong> the textarea.<span class="pass">the mark stays glued to the selected words at every scroll position.</span></label></li>
+    <li><input type="checkbox" id="s5-2"><label for="s5-2">With a selection spanning a long wrapped line, start a rework, then <strong>resize the window</strong> narrower and wider while the proposal is pending.<span class="pass">the mark re-wraps exactly with the text — no drift by a character or a line, with and without a visible scrollbar.</span></label></li>
+    <li><input type="checkbox" id="s5-3"><label for="s5-3">Make the body end with a blank line (trailing newline), select text near the end, start a rework.<span class="pass">mark aligned; scrolling to the very bottom keeps it aligned.</span></label></li>
+    <li><input type="checkbox" id="s5-4"><label for="s5-4">While the selection proposal is pending, click <strong>Replace text</strong> on one try, <strong>Discard</strong> on another, and force an <strong>error</strong> (no-key provider) on a third.<span class="pass">the mark disappears in all three cases; after the error the bar no longer reads <em>Rework selection with</em> unless a selection is still tracked.</span></label></li>
+    <li><input type="checkbox" id="s5-5"><label for="s5-5">While pending, type a character <em>inside</em> the selected range.<span class="pass">the mark vanishes at once and <strong>Replace text</strong> is disabled with the tooltip “The selected text changed — discard and rework again.”</span><span class="expected">the mark does not move to follow the text; it disappears (plan 13 D4).</span></label></li>
+    <li><input type="checkbox" id="s5-6"><label for="s5-6">Repeat step 1 in all five palettes, then with Windows <strong>High contrast</strong> on.<span class="pass">the range is visibly marked (tint + 2px underline) in every palette; in high contrast the system Mark color is used and the mirrored text stays invisible (no doubled glyphs).</span></label></li>
+  </ol>
+
+  <h2>6 · Diff review card <small>features 5 + 6</small></h2>
+  <ol class="steps" data-section="s6">
+    <li><input type="checkbox" id="s6-1"><label for="s6-1">Rework a note whole-text.<span class="pass">while streaming the card shows plain text; once done, changed words are marked — insertions tinted + underlined, deletions struck through — and the unchanged words are plain.</span></label></li>
+    <li><input type="checkbox" id="s6-2"><label for="s6-2">Click <strong>Side by side</strong>.<span class="pass">two columns labelled <code>ORIGINAL</code> and <code>PROPOSED</code>; the left shows deletions only, the right insertions only; one scrollbar for both; the toggle shows pressed.</span></label></li>
+    <li><input type="checkbox" id="s6-3"><label for="s6-3">Quit the app (close the window) and relaunch; rework again.<span class="pass">the card opens in Side by side — the choice persisted. Toggle back to inline.</span></label></li>
+    <li><input type="checkbox" id="s6-4"><label for="s6-4">Do a <strong>selection</strong> rework and switch to Side by side.<span class="pass">the ORIGINAL column shows only the selected text, not the whole body.</span></label></li>
+    <li><input type="checkbox" id="s6-5"><label for="s6-5">Narrow the window until the card is under ~560px wide in Side by side.<span class="pass">the columns stack into one.</span></label></li>
+    <li><input type="checkbox" id="s6-6"><label for="s6-6">Paste a very long body (&gt; 5 000 words, e.g. 300 KB of text), rework it.<span class="pass">the card shows the plain proposal with the note “Too long to compare — showing the proposal only.” and no freeze.</span></label></li>
+    <li><input type="checkbox" id="s6-7"><label for="s6-7">After a whole-text rework finishes, <strong>edit the body</strong> before deciding.<span class="pass">the note “Edited since this rewrite was requested — Replace text overwrites those edits.” appears; <strong>Replace text</strong> still works and replaces the whole body.</span></label></li>
+    <li><input type="checkbox" id="s6-8"><label for="s6-8">Select all text in the inline card and copy it; paste into the body or Notepad.<span class="pass">the pasted text contains no <code>added:</code> / <code>removed:</code> words.</span></label></li>
+    <li><input type="checkbox" id="s6-9"><label for="s6-9">Check the marks in all five palettes and in High contrast.<span class="pass">insertions and deletions are distinguishable in both views everywhere (underline vs strike-through, not colour alone).</span></label></li>
+    <li><input type="checkbox" id="s6-10"><label for="s6-10">On an item rework, wait for the <code>TITLE</code> row.<span class="pass">the title row renders as before, full width, not diffed.</span></label></li>
+  </ol>
+
+  <h2>7 · Unsaved-change visibility <small>feature 7</small></h2>
+  <ol class="steps" data-section="s7">
+    <li><input type="checkbox" id="s7-1"><label for="s7-1">Edit an item on Worknotes, a prompt on Prompts and a pad on Scratch (no saves), then look at the top bar from each page.<span class="pass">every page tab shows a count badge (<code>1</code>) for its dirty tab, including the two hidden pages.</span></label></li>
+    <li><input type="checkbox" id="s7-2"><label for="s7-2">Look at the rails.<span class="pass">the edited item's row, the edited prompt's row and the pad's project row each show the unsaved dot after the title.</span></label></li>
+    <li><input type="checkbox" id="s7-3"><label for="s7-3">Save each of the three.<span class="pass">badge and dot clear for each as it saves; a failed save (e.g. an empty prompt title AND body) keeps them.</span></label></li>
+    <li><input type="checkbox" id="s7-4"><label for="s7-4">Click <strong>New note</strong> (a never-saved draft).<span class="pass">the Worknotes badge counts it.</span><span class="expected">no rail row is marked — a draft has no row.</span></label></li>
+    <li><input type="checkbox" id="s7-5"><label for="s7-5">With a dirty item open, kill the app from Task Manager, relaunch.<span class="pass">the restored tab opens marked (badge + dot) with the recovered edits; a tab restored clean opens unmarked.</span></label></li>
+    <li><input type="checkbox" id="s7-6"><label for="s7-6">Cycle all five palettes with a dirty editor open.<span class="pass">the <strong>Save</strong> label and the page badge digits are clearly readable on the accent fill in every palette.</span></label></li>
+    <li><input type="checkbox" id="s7-7"><label for="s7-7">Start Narrator (<kbd>Win</kbd>+<kbd>Ctrl</kbd>+<kbd>Enter</kbd>), tab through the page tabs, a dirty rail row and a dirty tab-strip tab.<span class="pass">it reads “Prompts, 1 unsaved”, “…, unsaved changes” on the row, and “&lt;title&gt;, unsaved changes” on the tab.</span></label></li>
+  </ol>
+
+  <h2>8 · Upgrade smoke <small>on-disk compatibility</small></h2>
+  <ol class="steps" data-section="s8">
+    <li><input type="checkbox" id="s8-1"><label for="s8-1">Build the installer and install over <code>C:\Tools\worknotes</code>; launch and open an existing project that has prompts with history.<span class="pass">prompts and their full history load; no migration-checksum panic; History shows no INSTRUCTION rows on pre-plan-17 versions.</span></label></li>
+    <li><input type="checkbox" id="s8-2"><label for="s8-2">(Optional) Launch the previous 1.2.1 build against the same project.<span class="pass">it shows “that project was created by a newer version of worknotes” and nothing is lost.</span><span class="expected">that refusal is the documented 0007/0008/0009 behaviour — delete <code>index.db</code> (+ <code>-wal</code>/<code>-shm</code>) to reopen it there.</span></label></li>
+  </ol>
+
+  <p class="fail-note"><strong>Any FAIL:</strong> note the section and step number, the palette, and what you saw; every FAIL is fixed before §12 of plan 17 is closed.</p>
+</main>
+<script>
+(function () {
+  var KEY = "plan17-smoke-v1";
+  var boxes = Array.prototype.slice.call(document.querySelectorAll('ol.steps input[type="checkbox"]'));
+  var bar = document.getElementById("bar");
+  var count = document.getElementById("count");
+
+  function load() {
+    try {
+      var raw = localStorage.getItem(KEY);
+      if (!raw) return {};
+      var parsed = JSON.parse(raw);
+      return parsed && typeof parsed === "object" ? parsed : {};
+    } catch (e) { return {}; }
+  }
+  function save(state) {
+    try { localStorage.setItem(KEY, JSON.stringify(state)); } catch (e) { /* storage unavailable: progress is per-session only */ }
+  }
+  function render() {
+    var done = 0;
+    boxes.forEach(function (b) {
+      b.parentElement.classList.toggle("done", b.checked);
+      if (b.checked) done += 1;
+    });
+    var pct = boxes.length ? Math.round((done / boxes.length) * 100) : 0;
+    bar.style.width = pct + "%";
+    count.textContent = done + " / " + boxes.length + " (" + pct + "%)";
+  }
+
+  var state = load();
+  boxes.forEach(function (b) {
+    b.checked = state[b.id] === true;
+    b.addEventListener("change", function () {
+      state[b.id] = b.checked;
+      save(state);
+      render();
+    });
+  });
+  document.getElementById("reset").addEventListener("click", function () {
+    if (!window.confirm("Clear all progress on this checklist?")) return;
+    state = {};
+    try { localStorage.removeItem(KEY); } catch (e) { /* ignore */ }
+    boxes.forEach(function (b) { b.checked = false; });
+    render();
+  });
+  render();
+})();
+</script>
+</body>
+</html>

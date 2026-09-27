@@ -8,6 +8,8 @@ import {
   activateTab,
   activeTab,
   closeTab,
+  dirtyCount,
+  dirtyKeys,
   emptyTabs,
   openTab,
   setDirty,
@@ -35,6 +37,9 @@ interface Props {
   /** Report the projects with an open pad tab, so App's unload/reload confirms
    *  can warn before closing one (including a dirty background pad). */
   onOpenScratchChange: (projectIds: string[]) => void;
+  /** Plan 17 feature 7: how many open pad tabs carry unsaved edits — the
+   *  Scratch page-tab badge. Fires on count changes only. */
+  onDirtyCountChange: (n: number) => void;
   /** "Send selection to…" destinations. Both open an UNSAVED, pre-filled draft
    *  targeting the pad's own project and issue no write (D5, §4 L3). */
   onSendToItem: (kind: Kind, projectId: string, body: string) => void;
@@ -63,6 +68,7 @@ export default function ScratchPage({
   onNotice,
   onResolve,
   onOpenScratchChange,
+  onDirtyCountChange,
   onSendToItem,
   onSendToPrompt,
   session,
@@ -258,6 +264,14 @@ export default function ScratchPage({
     onOpenScratchChange(openScratchProjectIds);
   }, [openScratchProjectIds, onOpenScratchChange]);
 
+  // Plan 17 feature 7 (D9): dirty pad tabs (keyed `scratch-<projectId>`, the
+  // rail's row key) and their count for the page-tab badge.
+  const scratchDirtyKeys = useMemo(() => dirtyKeys(tabs), [tabs]);
+  const scratchDirtyN = useMemo(() => dirtyCount(tabs), [tabs]);
+  useEffect(() => {
+    onDirtyCountChange(scratchDirtyN);
+  }, [scratchDirtyN, onDirtyCountChange]);
+
   const projectName = (id: string): string =>
     loaded.find((p) => p.id === id)?.name ?? "Scratch";
 
@@ -367,6 +381,12 @@ export default function ScratchPage({
               >
                 <span className="row-top">
                   <span className="row-title">{p.name}</span>
+                  {scratchDirtyKeys.has(scratchTabKey(p.id)) && (
+                    <>
+                      <span className="etab-unsaved" aria-hidden="true" title="Unsaved changes" />
+                      <span className="sr-only">, unsaved changes</span>
+                    </>
+                  )}
                 </span>
               </button>
             </li>

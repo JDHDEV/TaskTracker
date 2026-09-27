@@ -30,6 +30,15 @@
   --done: #4c8a64;
   --scrim: rgba(35, 39, 42, 0.35);
 
+  /* Plan 17 review fills, derived per palette from the tokens above (each
+     palette block re-themes --mark/--mark-soft/--surface, so these follow):
+     --ins-fill is the diff insertion fill on the card (--mark-ink reads at
+     5.3–6.8:1 on it in every palette); --hl-fill is the body-textarea
+     selection highlight (60 % --mark into --surface in the light palettes; the
+     dark palettes override to 25 % below). */
+  --ins-fill: color-mix(in srgb, var(--mark) 25%, var(--mark-soft));
+  --hl-fill: color-mix(in srgb, var(--mark) 60%, var(--surface));
+
   --font-ui: "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif;
   --font-meta: "Cascadia Mono", Consolas, ui-monospace, monospace;
 }
@@ -96,6 +105,7 @@
   --doing: #d9a441;
   --testing: #4f7ec2;
   --done: #4c8a64;
+  --hl-fill: color-mix(in srgb, var(--mark) 25%, var(--surface));
 }
 
 :root[data-palette="neon-noir"] {
@@ -114,6 +124,7 @@
   --doing: #d9a441;
   --testing: #4f7ec2;
   --done: #4c8a64;
+  --hl-fill: color-mix(in srgb, var(--mark) 25%, var(--surface));
 }
 
 :root[data-palette="claude-terminal"] {
@@ -132,6 +143,7 @@
   --doing: #d9a441;
   --testing: #4f7ec2;
   --done: #4c8a64;
+  --hl-fill: color-mix(in srgb, var(--mark) 25%, var(--surface));
 }
 
 /* Per-palette overrides. The dark solid-button hexes and the review-badge text
@@ -298,6 +310,35 @@ textarea {
   color: var(--ink);
   border-bottom-color: var(--ink);
   font-weight: 600;
+}
+
+/* Plan 17 feature 7 (D9): a page tab's unsaved-tab count. --mark fill so it
+   reads as the same unsaved signal as the tab dot / editor frame; the text is
+   --ink in the light palettes (11.3:1 on Original, 8.3:1 on Gray + teal) and
+   the literal dark inks below in the dark ones (never --mark-ink on --mark —
+   1.1–1.7:1 there). */
+.page-tab-badge {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 2px 6px;
+  border-radius: 4px;
+  background: var(--mark);
+  color: var(--ink);
+  font-family: var(--font-meta);
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0;
+  line-height: 1;
+  vertical-align: 1px;
+}
+:root[data-palette="v2-dark"] .page-tab-badge {
+  color: #063a30;
+}
+:root[data-palette="neon-noir"] .page-tab-badge {
+  color: #06210a;
+}
+:root[data-palette="claude-terminal"] .page-tab-badge {
+  color: #3a1c10;
 }
 
 /* Both pages stay mounted (so switching preserves in-progress edits); the
@@ -669,6 +710,12 @@ textarea {
   width: 7px; height: 7px; border-radius: 50%; flex: none;
   background: var(--mark); border: 1px solid var(--mark-ink);
 }
+/* Plan 17 feature 7: the same dot on a rail row (item / prompt / scratch
+   project), right after the title — a different SHAPE from .row-on's --mark
+   left border, so "active" and "unsaved" never read as one thing. */
+.row .etab-unsaved {
+  margin-left: 2px;
+}
 .etab-x {
   display: flex; align-items: center; justify-content: center;
   width: 20px; height: 20px;
@@ -751,13 +798,102 @@ textarea {
   resize: none;
 }
 
+/* Body field wrapper (plan 17 D6): a permanent positioned box that owns the
+   surface + radius, so the selection backdrop can sit behind the textarea
+   without ever remounting it. No overflow:hidden — it would clip the focus
+   ring. `isolation: isolate` makes the wrapper its own stacking context, so
+   the backdrop can sit at z-index -1 — above the wrapper's background, below
+   the in-flow textarea's glyphs — WITHOUT positioning or lifting the textarea
+   itself (a positive z-index on it would paint over every dialog scrim). */
+.body-wrap {
+  position: relative;
+  isolation: isolate;
+  display: flex;
+  flex: 1;
+  min-height: 120px;
+  background: var(--surface);
+  border-radius: 8px;
+}
+
+.body-wrap > .body {
+  flex: 1;
+  min-height: 0;
+}
+
+/* Only while a selection highlight is mounted: let the backdrop show through. */
+.body-transparent {
+  background: transparent;
+}
+
+/* The mirrored backdrop: the textarea's exact box, font and wrapping metrics
+   (box-sizing, 1px border, 14px padding, 15px / 1.6, pre-wrap + break-word),
+   transparent glyphs, no hit-testing, never selectable. Both boxes reserve a
+   scrollbar gutter so their content widths — and therefore line wraps — match
+   whether or not the textarea currently scrolls. */
+.body-hl {
+  position: absolute;
+  inset: 0;
+  z-index: -1;
+  pointer-events: none;
+  user-select: none;
+  overflow: hidden;
+  color: transparent;
+  box-sizing: border-box;
+  padding: 14px;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  font-family: inherit;
+  font-size: 15px;
+  line-height: 1.6;
+  letter-spacing: inherit;
+  white-space: pre-wrap;
+  overflow-wrap: break-word;
+  word-break: normal;
+  tab-size: inherit;
+}
+
+.body,
+.body-hl {
+  scrollbar-gutter: stable;
+}
+
+/* The captured range: a --mark tint plus a 2px underline, because the light
+   fills alone are only 1.2–1.4:1 against the surface (WCAG 1.4.11 / 1.4.1).
+   Light palettes underline in --mark-ink; the dark ones in --mark itself. */
+.body-hl-mark {
+  background: var(--hl-fill);
+  color: transparent;
+  text-decoration: underline;
+  text-decoration-thickness: 2px;
+  text-decoration-color: var(--mark-ink);
+  text-underline-offset: 2px;
+}
+
+:root[data-palette="v2-dark"] .body-hl-mark,
+:root[data-palette="neon-noir"] .body-hl-mark,
+:root[data-palette="claude-terminal"] .body-hl-mark {
+  text-decoration-color: var(--mark);
+}
+
+@media (forced-colors: active) {
+  .body-hl {
+    forced-color-adjust: none;
+    color: transparent;
+  }
+  .body-hl-mark {
+    background: Mark;
+  }
+}
+
 /* The signature: AI proposals arrive as a highlighter-marked annotation,
-   never as a silent overwrite. */
+   never as a silent overwrite. A size container (plan 17 D8) so the
+   side-by-side view can collapse to one column when the card is narrow. */
 .review {
   border: 1px solid var(--mark);
   border-radius: 8px;
   background: var(--mark-soft);
   overflow: hidden;
+  container-type: inline-size;
 }
 
 .review-head {
@@ -791,6 +927,88 @@ textarea {
   line-height: 1.55;
   color: var(--mark-ink);
   white-space: pre-wrap;
+}
+
+/* Diff marks (plan 17 D8). Insertions: a 25 % --mark tint plus an underline;
+   deletions: --mark-ink struck through in --danger (--danger TEXT fails on the
+   card fill in every palette, 2.9–4.4:1, so it only colours the line). Both
+   carry an sr-only "added: " / "removed: " prefix that never enters a copy. */
+.rv-ins {
+  background: var(--ins-fill);
+  text-decoration: underline;
+  text-decoration-color: var(--mark-ink);
+  text-decoration-thickness: 1.5px;
+  text-underline-offset: 2px;
+}
+
+.rv-del {
+  color: var(--mark-ink);
+  text-decoration: line-through;
+  text-decoration-color: var(--danger);
+  text-decoration-thickness: 1.5px;
+}
+
+/* Gray + teal (light)'s --danger line is only 2.9:1 on the card fill; use the
+   palette's mark ink (6.7:1) so the strike itself stays visible there. */
+:root[data-palette="v2-light"] .rv-del {
+  text-decoration-color: var(--mark-ink);
+}
+
+.rv-ins .sr-only,
+.rv-del .sr-only {
+  user-select: none;
+}
+
+/* Side by side: one scroll container, two labelled columns (ORIGINAL =
+   equal + deletions, PROPOSED = equal + insertions), collapsing to a single
+   column under 560px of card width. */
+.review-split {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+  padding: 4px 12px 12px;
+  max-height: min(320px, 40vh);
+  overflow-y: auto;
+}
+
+@container (max-width: 560px) {
+  .review-split {
+    grid-template-columns: 1fr;
+  }
+}
+
+.review-col {
+  min-width: 0;
+}
+
+.review-col-label {
+  display: block;
+  margin-bottom: 4px;
+  font-family: var(--font-meta);
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--mark-ink);
+}
+
+.review-col-text {
+  margin: 0;
+  font-family: var(--font-ui);
+  font-size: 14px;
+  line-height: 1.55;
+  color: var(--mark-ink);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+/* The card's two informational notes ("Too long to compare…", "Edited
+   since…"): quiet mono, never a blocker — Replace stays enabled. */
+.review-note {
+  margin: 0;
+  padding: 0 12px 8px;
+  font-family: var(--font-meta);
+  font-size: 12px;
+  color: var(--mark-ink);
 }
 
 /* Proposed-title row inside the review card. Uses only the constant yellow
@@ -837,10 +1055,12 @@ textarea {
   border: 0;
 }
 
-/* AI bar */
+/* AI bar. Top-aligned (plan 17 D2): the instruction box grows with its
+   content, and the chips/buttons must stay on the first row rather than
+   re-centring against a taller box. */
 .aibar {
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   gap: 8px;
   flex-wrap: wrap;
   padding-top: 2px;
@@ -862,12 +1082,32 @@ textarea {
   color: var(--muted);
 }
 
+/* The rework instruction box (plan 17 feature 2): a one-row textarea that
+   grows with its content via `field-sizing: content` (Chromium ≥ 123) up to
+   five lines, then scrolls (R-18: a huge paste can never break the layout).
+   min-height keeps the single-row height the old <input> had at 14px text. */
 .aibar-custom {
   flex: 1 1 180px;
-  padding: 6px 10px;
+  min-width: 0;
+  padding: 5px 10px;
   border: 1px solid var(--line);
   border-radius: 6px;
   background: var(--surface);
+  font: inherit;
+  line-height: 1.4;
+  field-sizing: content;
+  /* border-box: one line + 10px padding + 2px border ≈ the 31px button row. */
+  min-height: calc(1lh + 12px);
+  max-height: calc(5lh + 12px);
+  overflow-y: auto;
+  resize: none;
+}
+
+/* Without field-sizing the box stays a one-row scrolling field. */
+@supports not (field-sizing: content) {
+  .aibar-custom {
+    height: auto;
+  }
 }
 
 /* Controls */
@@ -920,6 +1160,25 @@ textarea {
   border-color: var(--mark);
   color: var(--mark-ink);
   font-weight: 600;
+}
+
+/* Save label contrast (plan 17, folded-in fix): --mark-ink on --mark is 4.98:1
+   on Original but 4.47:1 on Gray + teal (light) and 1.1–1.7:1 in the three
+   dark palettes, whose --mark-ink is a LIGHT tone. The Save label is the
+   non-colour half of the unsaved signal, so it must reach 4.5:1 everywhere: a
+   deeper teal for v2-light (6.7:1) and the literal dark inks the review badge
+   already uses for the dark palettes (7.5:1 / 12.5:1 / 5.0:1). */
+:root[data-palette="v2-light"] .btn-save {
+  color: #094238;
+}
+:root[data-palette="v2-dark"] .btn-save {
+  color: #063a30;
+}
+:root[data-palette="neon-noir"] .btn-save {
+  color: #06210a;
+}
+:root[data-palette="claude-terminal"] .btn-save {
+  color: #3a1c10;
 }
 
 .select {
@@ -1457,6 +1716,32 @@ textarea {
 .version-title {
   font-weight: 600;
   margin-bottom: 4px;
+}
+
+/* Plan 17 (1b): the instruction behind an accepted rewrite, on aiEnhanced
+   versions that carry one. Label like the review card's TITLE label, muted;
+   the value keeps its line breaks. */
+.version-instruction {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 4px 0;
+}
+
+.version-instruction-label {
+  font-family: var(--font-meta);
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--muted);
+  flex: none;
+}
+
+.version-instruction-text {
+  min-width: 0;
+  font-size: 13px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }
 
 .version-body {

@@ -3,6 +3,8 @@ import {
   activateTab,
   activeTab,
   closeTab,
+  dirtyCount,
+  dirtyKeys,
   emptyTabs,
   hasTab,
   openTab,
@@ -286,6 +288,97 @@ describe("plan.15 draft-restore pins", () => {
       isDirty: false,
     });
     expect(result.activeKey).toBe("a"); // activation still happens
+  });
+});
+
+// plan 17 feature 7: pure derivation of "which open tabs have unsaved edits"
+// for the rail markers and page-tab badges (D9). No React, no persistence
+// (R-16) — these read straight off OpenTabsState.
+describe("dirtyKeys / dirtyCount", () => {
+  it("an empty state has an empty dirty set and a zero count", () => {
+    const state = emptyTabs<string>();
+    expect(dirtyKeys(state)).toEqual(new Set());
+    expect(dirtyCount(state)).toBe(0);
+  });
+
+  it("with mixed clean/dirty tabs, dirtyKeys returns only the dirty ones and dirtyCount matches its size", () => {
+    let state = openTab(emptyTabs<string>(), "a", "Item A"); // clean
+    state = openTab(state, "b", "Item B"); // clean
+    state = openTab(state, "c", "Item C"); // will be made dirty
+    state = setDirty(state, "a", true);
+    state = setDirty(state, "c", true);
+
+    const keys = dirtyKeys(state);
+    expect(keys).toEqual(new Set(["a", "c"]));
+    expect(keys.has("b")).toBe(false);
+    expect(dirtyCount(state)).toBe(2);
+  });
+
+  it("setDirty(key, false) removes the key from dirtyKeys and decrements dirtyCount", () => {
+    let state = openTab(emptyTabs<string>(), "a", "Item A");
+    state = setDirty(state, "a", true);
+    expect(dirtyKeys(state)).toEqual(new Set(["a"]));
+    expect(dirtyCount(state)).toBe(1);
+
+    state = setDirty(state, "a", false);
+    expect(dirtyKeys(state)).toEqual(new Set());
+    expect(dirtyCount(state)).toBe(0);
+  });
+
+  it("closeTab removes a dirty tab's key from dirtyKeys and decrements dirtyCount", () => {
+    let state = openTab(emptyTabs<string>(), "a", "Item A");
+    state = openTab(state, "b", "Item B");
+    state = setDirty(state, "a", true);
+    state = setDirty(state, "b", true);
+    expect(dirtyCount(state)).toBe(2);
+
+    state = closeTab(state, "a");
+    expect(dirtyKeys(state)).toEqual(new Set(["b"]));
+    expect(dirtyCount(state)).toBe(1);
+  });
+
+  it("promoteTab clears the dirty flag on the promoted tab: the OLD key leaves the set and the NEW key is not in it", () => {
+    let state = openTab(emptyTabs<string>(), "draft-1", "New draft", true); // starts dirty
+    expect(dirtyKeys(state)).toEqual(new Set(["draft-1"]));
+
+    state = promoteTab(state, "draft-1", "real:1", "Saved Item");
+
+    // promoteTab hard-codes isDirty: false on the promoted tab (openTabs.ts) —
+    // this is NOT "the dirty flag carries over to the new key": neither the
+    // old nor the new key is dirty afterward.
+    expect(dirtyKeys(state).has("draft-1")).toBe(false);
+    expect(dirtyKeys(state).has("real:1")).toBe(false);
+    expect(dirtyKeys(state)).toEqual(new Set());
+    expect(dirtyCount(state)).toBe(0);
+  });
+
+  it("keeps composite keys from two projects sharing the same item uuid as distinct dirty entries", () => {
+    let state = openTab(emptyTabs<string>(), "projA:1", "Item in project A");
+    state = openTab(state, "projB:1", "Item in project B");
+    state = setDirty(state, "projA:1", true);
+
+    const keys = dirtyKeys(state);
+    expect(keys.has("projA:1")).toBe(true);
+    expect(keys.has("projB:1")).toBe(false);
+    expect(dirtyCount(state)).toBe(1);
+
+    state = setDirty(state, "projB:1", true);
+    expect(dirtyKeys(state)).toEqual(new Set(["projA:1", "projB:1"]));
+    expect(dirtyCount(state)).toBe(2);
+  });
+
+  it("returns a fresh Set each call: mutating the result does not affect subsequent reads of the same state", () => {
+    let state = openTab(emptyTabs<string>(), "a", "Item A");
+    state = setDirty(state, "a", true);
+
+    const keys = dirtyKeys(state);
+    keys.add("intruder");
+    keys.delete("a");
+
+    // A second, independent call proves the mutation above didn't touch the
+    // underlying state.
+    expect(dirtyKeys(state)).toEqual(new Set(["a"]));
+    expect(dirtyKeys(state).has("intruder")).toBe(false);
   });
 });
 

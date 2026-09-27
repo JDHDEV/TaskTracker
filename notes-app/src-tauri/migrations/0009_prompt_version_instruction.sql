@@ -1,0 +1,14 @@
+-- The AI instruction behind an ACCEPTED rewrite (plan.17 feature 1b), carried
+-- on the resulting `aiEnhanced` version so the history dialog can show what was
+-- asked for. Mirrors the optional `instruction:` key in the canonical version
+-- file (`prompts/<prompt-uuid>/<version-uuid>.md`) that this git-ignored index
+-- is rebuilt from on every load — the file is the source of truth, this column
+-- only surfaces it back over IPC through `versions()`.
+--
+-- NULL = absent: a manual version, a version written before this feature, or
+-- an accepted rewrite whose instruction was blank — one form for "nothing to
+-- show". No CHECK: `promptfile::normalize_instruction` is the single gate (it
+-- keeps the value only for an `aiEnhanced` source and only when non-blank), so
+-- the index and the files can never disagree. No index — the value is never a
+-- query predicate.
+ALTER TABLE prompt_versions ADD COLUMN instruction TEXT;

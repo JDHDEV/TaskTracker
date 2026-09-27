@@ -7,7 +7,9 @@
 
 use notes_app_lib::db::{PromptRepository, SqliteRepository};
 use notes_app_lib::error::AppError;
-use notes_app_lib::models::{NewPrompt, PromptListFilter, PromptVersion, UpdatePrompt};
+use notes_app_lib::models::{
+    NewPrompt, PromptListFilter, PromptVersion, UpdatePrompt, MAX_INSTRUCTION_BYTES,
+};
 
 fn new_prompt(title: &str, body: &str) -> NewPrompt {
     NewPrompt {
@@ -17,6 +19,7 @@ fn new_prompt(title: &str, body: &str) -> NewPrompt {
         body: Some(body.into()),
         reusable: None,
         source: None,
+        instruction: None,
     }
 }
 
@@ -269,6 +272,23 @@ async fn prompt_and_version_serialize_to_camelcase_shape() {
     assert!(vjson["promptId"].is_string());
     assert_eq!(vjson["source"], "manual");
     assert!(vjson["createdAt"].is_string());
+    assert!(vjson["instruction"].is_null(), "a manual version's instruction serializes to null");
+
+    // An aiEnhanced update with an instruction serializes it as a string under
+    // the same camelCase key.
+    prompts
+        .update(&p.id, UpdatePrompt {
+            body: Some("b2".into()),
+            source: Some("aiEnhanced".into()),
+            instruction: Some("make it punchier".into()),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let hist = prompts.versions(&p.id).await.unwrap();
+    let enhanced_json = serde_json::to_value(&hist[0]).unwrap();
+    assert_eq!(enhanced_json["source"], "aiEnhanced");
+    assert_eq!(enhanced_json["instruction"], "make it punchier");
 
     // NewPrompt deserializes from camelCase with a REQUIRED projectId.
     let parsed: NewPrompt = serde_json::from_str(r#"{"projectId":"p1","title":"x"}"#).unwrap();
@@ -481,4 +501,315 @@ async fn update_prompt_json_carrying_a_client_schema_version_is_ignored() {
     let updated = prompts.update(&p.id, patch).await.unwrap();
     assert_eq!(updated.title, "after", "the real patch field still applies");
     assert_eq!(updated.schema_version, "1.0.0", "a client-supplied schemaVersion in a patch must be ignored");
+}
+
+// ---------------------------------------------------------------------------
+// Instruction history (plan.17 1b): the AI instruction behind an accepted
+// rewrite, kept only on an aiEnhanced version. Index-level here (no
+// `prompts_dir`); on-disk assertions and the SEC-1 write cap live in
+// `tests/project_manager.rs`.
+// ---------------------------------------------------------------------------
+
+/// An `aiEnhanced` content-changing patch carrying `instruction`.
+fn ai_update(body: &str, instruction: &str) -> UpdatePrompt {
+    UpdatePrompt {
+        body: Some(body.into()),
+        source: Some("aiEnhanced".into()),
+        instruction: Some(instruction.into()),
+        ..Default::default()
+    }
+}
+
+#[tokio::test]
+async fn prompt_ai_enhanced_update_with_instruction_stores_it_and_history_returns_it() {
+    let repo = SqliteRepository::connect_in_memory().await.unwrap();
+    let prompts: &dyn PromptRepository = &repo;
+    let p = prompts.create(new_prompt("t", "original")).await.unwrap();
+
+    prompts.update(&p.id, ai_update("enhanced", "make it punchier")).await.unwrap();
+
+    let hist = prompts.versions(&p.id).await.unwrap();
+    assert_eq!(hist.len(), 2);
+    assert_eq!(hist[0].source, "aiEnhanced");
+    assert_eq!(
+        hist[0].instruction.as_deref(),
+        Some("make it punchier"),
+        "history returns the stored instruction"
+    );
+    assert_eq!(hist[1].instruction, None, "the pre-existing manual version carries none");
+}
+
+#[tokio::test]
+async fn prompt_manual_update_sending_an_instruction_stores_null() {
+    let repo = SqliteRepository::connect_in_memory().await.unwrap();
+    let prompts: &dyn PromptRepository = &repo;
+    let p = prompts.create(new_prompt("t", "b")).await.unwrap();
+
+    // No `source` (defaults to manual) but an instruction is sent anyway — it
+    // must never survive onto a manual version.
+    prompts
+        .update(
+            &p.id,
+            UpdatePrompt { body: Some("c".into()), instruction: Some("ignored".into()), ..Default::default() },
+        )
+        .await
+        .unwrap();
+
+    let hist = prompts.versions(&p.id).await.unwrap();
+    assert_eq!(hist[0].source, "manual");
+    assert_eq!(hist[0].instruction, None, "a manual version never stores an instruction, even if one is sent");
+}
+
+#[tokio::test]
+async fn prompt_unknown_source_with_instruction_normalizes_to_manual_and_null() {
+    let repo = SqliteRepository::connect_in_memory().await.unwrap();
+    let prompts: &dyn PromptRepository = &repo;
+    let p = prompts.create(new_prompt("t", "b")).await.unwrap();
+
+    prompts
+        .update(
+            &p.id,
+            UpdatePrompt {
+                body: Some("c".into()),
+                source: Some("bogus".into()),
+                instruction: Some("x".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let hist = prompts.versions(&p.id).await.unwrap();
+    assert_eq!(hist[0].source, "manual", "a garbage source normalizes to manual");
+    assert_eq!(hist[0].instruction, None, "and the instruction normalizes to null alongside it");
+}
+
+#[tokio::test]
+async fn prompt_create_with_ai_enhanced_source_and_instruction_labels_the_first_version() {
+    let repo = SqliteRepository::connect_in_memory().await.unwrap();
+    let prompts: &dyn PromptRepository = &repo;
+
+    let p = prompts
+        .create(NewPrompt {
+            source: Some("aiEnhanced".into()),
+            instruction: Some("draft it warmly".into()),
+            ..new_prompt("t", "ai body")
+        })
+        .await
+        .unwrap();
+
+    let hist = prompts.versions(&p.id).await.unwrap();
+    assert_eq!(hist.len(), 1);
+    assert_eq!(hist[0].source, "aiEnhanced");
+    assert_eq!(hist[0].instruction.as_deref(), Some("draft it warmly"));
+}
+
+#[tokio::test]
+async fn prompt_manual_create_with_instruction_stores_null() {
+    let repo = SqliteRepository::connect_in_memory().await.unwrap();
+    let prompts: &dyn PromptRepository = &repo;
+
+    // No source (defaults to manual) but an instruction is sent on create too.
+    let p = prompts
+        .create(NewPrompt { instruction: Some("ignored".into()), ..new_prompt("t", "b") })
+        .await
+        .unwrap();
+
+    let hist = prompts.versions(&p.id).await.unwrap();
+    assert_eq!(hist[0].source, "manual");
+    assert_eq!(hist[0].instruction, None, "a manual create never stores an instruction");
+}
+
+#[tokio::test]
+async fn prompt_blank_instruction_on_ai_enhanced_stores_null() {
+    let repo = SqliteRepository::connect_in_memory().await.unwrap();
+    let prompts: &dyn PromptRepository = &repo;
+
+    for blank in ["", "   "] {
+        let p = prompts
+            .create(NewPrompt {
+                source: Some("aiEnhanced".into()),
+                instruction: Some(blank.into()),
+                ..new_prompt("t", "b")
+            })
+            .await
+            .unwrap();
+        let hist = prompts.versions(&p.id).await.unwrap();
+        assert_eq!(hist[0].instruction, None, "blank instruction {blank:?} must store null");
+    }
+}
+
+#[tokio::test]
+async fn prompt_oversized_instruction_is_rejected_and_appends_no_version() {
+    let repo = SqliteRepository::connect_in_memory().await.unwrap();
+    let prompts: &dyn PromptRepository = &repo;
+    let p = prompts.create(new_prompt("t", "original")).await.unwrap();
+
+    let over = "x".repeat(MAX_INSTRUCTION_BYTES + 1);
+    let err = prompts.update(&p.id, ai_update("would-be enhanced", &over)).await.unwrap_err();
+    match err {
+        AppError::Invalid(msg) => assert_eq!(msg, "that instruction is too long"),
+        other => panic!("expected Invalid, got {other:?}"),
+    }
+    let after = prompts.get(&p.id).await.unwrap();
+    assert_eq!(after.version_count, 1, "the rejected update appends no version");
+    assert_eq!(after.body, "original", "body is untouched by the rejected update");
+
+    // Exactly at the cap succeeds.
+    let at_cap = "x".repeat(MAX_INSTRUCTION_BYTES);
+    let ok = prompts.update(&p.id, ai_update("enhanced", &at_cap)).await.unwrap();
+    assert_eq!(ok.version_count, 2, "an at-cap instruction is accepted and appends a version");
+    let hist = prompts.versions(&p.id).await.unwrap();
+    assert_eq!(hist[0].instruction.as_deref(), Some(at_cap.as_str()));
+
+    // An oversized instruction on a MANUAL source is NOT rejected: per
+    // `promptfile::normalize_instruction`, the source gate runs first and a
+    // manual value normalizes to None before `validate_instruction` is ever
+    // called — the cap simply never applies to it.
+    let manual_over = prompts
+        .update(
+            &p.id,
+            UpdatePrompt { body: Some("manual body".into()), instruction: Some(over.clone()), ..Default::default() },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        manual_over.version_count, 3,
+        "a manual update with an oversized instruction still succeeds — the value is dropped, not capped"
+    );
+    let hist = prompts.versions(&p.id).await.unwrap();
+    assert_eq!(hist[0].instruction, None, "manual source drops the instruction before any cap check runs");
+}
+
+#[tokio::test]
+async fn prompt_identical_save_with_instruction_appends_no_version() {
+    let repo = SqliteRepository::connect_in_memory().await.unwrap();
+    let prompts: &dyn PromptRepository = &repo;
+    let p = prompts.create(new_prompt("t", "b")).await.unwrap();
+
+    let after = prompts
+        .update(
+            &p.id,
+            UpdatePrompt {
+                title: Some("t".into()),
+                body: Some("b".into()),
+                source: Some("aiEnhanced".into()),
+                instruction: Some("shouldn't matter".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(after.version_count, 1, "identical content appends no version even with an instruction attached");
+
+    let hist = prompts.versions(&p.id).await.unwrap();
+    assert!(hist.iter().all(|v| v.instruction.is_none()), "no version anywhere carries the discarded instruction");
+}
+
+#[tokio::test]
+async fn prompt_reusable_toggle_with_instruction_appends_no_version_and_keeps_updated_at() {
+    let repo = SqliteRepository::connect_in_memory().await.unwrap();
+    let prompts: &dyn PromptRepository = &repo;
+    let p = prompts.create(new_prompt("t", "b")).await.unwrap();
+    let v = prompts.versions(&p.id).await.unwrap();
+    let old = "2000-01-01T00:00:00.000+00:00";
+    repo.set_prompt_version_timestamp_for_test(&v[0].id, old).await.unwrap();
+
+    let after = prompts
+        .update(
+            &p.id,
+            UpdatePrompt {
+                reusable: Some(true),
+                source: Some("aiEnhanced".into()),
+                instruction: Some("noop".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert!(after.reusable);
+    assert_eq!(after.version_count, 1, "a reusable-only toggle appends no version even with an instruction attached");
+    assert_eq!(after.updated_at, old, "no content change means updatedAt does not move");
+
+    let hist = prompts.versions(&p.id).await.unwrap();
+    assert_eq!(hist[0].instruction, None, "the toggle never wrote the instruction anywhere");
+}
+
+#[tokio::test]
+async fn prompt_older_versions_keep_their_instruction_after_a_newer_ai_enhanced_save() {
+    let repo = SqliteRepository::connect_in_memory().await.unwrap();
+    let prompts: &dyn PromptRepository = &repo;
+    let p = prompts.create(new_prompt("t", "v1")).await.unwrap();
+    prompts.update(&p.id, ai_update("v2", "first instruction")).await.unwrap();
+    prompts.update(&p.id, ai_update("v3", "second instruction")).await.unwrap();
+
+    let hist = prompts.versions(&p.id).await.unwrap();
+    assert_eq!(hist.len(), 3);
+    assert_eq!(hist[0].body, "v3");
+    assert_eq!(hist[0].instruction.as_deref(), Some("second instruction"));
+    assert_eq!(hist[1].body, "v2");
+    assert_eq!(
+        hist[1].instruction.as_deref(),
+        Some("first instruction"),
+        "the older aiEnhanced version keeps its own instruction after a newer save"
+    );
+    assert_eq!(hist[2].body, "v1");
+    assert_eq!(hist[2].instruction, None);
+}
+
+#[tokio::test]
+async fn new_prompt_and_update_prompt_json_without_instruction_deserialize() {
+    let absent: NewPrompt = serde_json::from_str(r#"{"projectId":"p1","title":"x"}"#).unwrap();
+    assert_eq!(absent.instruction, None, "an absent instruction key deserializes to None");
+    let present: NewPrompt =
+        serde_json::from_str(r#"{"projectId":"p1","title":"x","instruction":"do it"}"#).unwrap();
+    assert_eq!(present.instruction.as_deref(), Some("do it"));
+
+    let patch_absent: UpdatePrompt = serde_json::from_str(r#"{"body":"b"}"#).unwrap();
+    assert_eq!(patch_absent.instruction, None);
+    let patch_present: UpdatePrompt =
+        serde_json::from_str(r#"{"body":"b","instruction":"x"}"#).unwrap();
+    assert_eq!(patch_present.instruction.as_deref(), Some("x"));
+}
+
+#[tokio::test]
+async fn import_prompt_preserves_instruction() {
+    let repo = SqliteRepository::connect_in_memory().await.unwrap();
+    let prompts: &dyn PromptRepository = &repo;
+    let src = prompts.create(new_prompt("t1", "b1")).await.unwrap();
+    prompts.update(&src.id, ai_update("b2", "an instruction")).await.unwrap();
+    let source_versions: Vec<PromptVersion> = prompts.versions(&src.id).await.unwrap();
+    let head = prompts.get(&src.id).await.unwrap();
+
+    let repo2 = SqliteRepository::connect_in_memory().await.unwrap();
+    let prompts2: &dyn PromptRepository = &repo2;
+    prompts2
+        .import_prompt(&src.id, head.reusable, &head.created_at, &head.schema_version, &source_versions)
+        .await
+        .unwrap();
+
+    let imported_versions = prompts2.versions(&src.id).await.unwrap();
+    assert_eq!(imported_versions.len(), source_versions.len());
+    for (a, b) in source_versions.iter().zip(imported_versions.iter()) {
+        assert_eq!(a.id, b.id);
+        assert_eq!(a.instruction, b.instruction, "instruction is preserved verbatim per version id");
+    }
+    // Sanity: the aiEnhanced version really carried one, so the equality
+    // above actually constrains something.
+    assert!(source_versions.iter().any(|v| v.instruction.is_some()));
+}
+
+#[tokio::test]
+async fn over_cap_body_is_not_capped_by_the_index_only_store() {
+    // Placement decision (plan.17 SEC-1): the write-side size cap lives in the
+    // file writers (`promptfile::write_version`/`write_prompt`), which this
+    // in-memory repo never calls (no `prompts_dir` — see the module docs at
+    // the top of this file). An index-only store therefore has no way to
+    // enforce it; the cap is exercised against real files in
+    // `tests/project_manager.rs` instead.
+    let repo = SqliteRepository::connect_in_memory().await.unwrap();
+    let prompts: &dyn PromptRepository = &repo;
+    let big = "x".repeat(5 * 1024 * 1024); // > MAX_ITEM_FILE_BYTES, no files dir to enforce it
+    let p = prompts.create(new_prompt("t", &big)).await.unwrap();
+    assert_eq!(p.body.len(), big.len(), "the index-only store has no size cap to enforce");
 }

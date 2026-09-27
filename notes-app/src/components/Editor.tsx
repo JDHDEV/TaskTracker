@@ -16,7 +16,7 @@ import type {
   Status,
   UpdateItem,
 } from "../types";
-import { aiGenerateTitle, aiRewriteStream, onContextMenuAction } from "../lib/api";
+import { aiGenerateTitle, aiRewriteStream, confirmDialog, onContextMenuAction } from "../lib/api";
 import type { ContextMenuAction } from "../lib/contextMenu";
 import { formatTimestamp, insertText } from "../lib/timestamp";
 import { buildItemDraft, bufferEqualsItem, type ItemBuffer } from "../lib/drafts";
@@ -27,6 +27,7 @@ import { fromDateInputValue, toDateInputValue } from "../lib/dueDate";
 import { resolveTitleForSave } from "../lib/titleForSave";
 import { isRedundantTitle } from "../lib/titleProposal";
 import { handleLineClipboardKeyDown, handleLinePaste } from "../lib/lineEdit";
+import { selectionConfirmMessage, shouldClearInstruction } from "../lib/rework";
 import { tabDomId, tabPanelDomId } from "../lib/openTabs";
 import {
   captureSelection,
@@ -38,6 +39,8 @@ import {
 import AiBar from "./AiBar";
 import EditorTags from "./EditorTags";
 import JiraRow from "./JiraRow";
+import ReviewCard from "./ReviewCard";
+import SelectionBackdrop from "./SelectionBackdrop";
 
 /** Imperative handle: lets the parent persist a background (mounted-hidden,
  *  non-active) tab from the close-dirty "Save" branch — its buffer lives only in
@@ -261,6 +264,30 @@ const Editor = forwardRef<EditorHandle, Props>(function Editor(
   const [selectionRework, setSelectionRework] = useState<CapturedSelection | null>(null);
   const pendingCaretRef = useRef<SelectionRange | null>(null);
 
+  // Plan 17 (D2–D5). The AI bar's instruction is controlled HERE so it survives
+  // a discard and resets on reseed; the ref mirror lets the accept path read
+  // the live box after its await. `reworkRequest` snapshots what a rework was
+  // asked about — the diff's original and the instruction 1b persists — never
+  // the live box (R-8). `confirmingSel` is the range a selection-rework confirm
+  // is asking about while the native dialog is up: it drives the body
+  // highlight and is deliberately SEPARATE from `selectionRework`, so an
+  // already-open card is never touched until a confirmed rework supersedes
+  // proposal + range + request together (§12). Its ref twin is the synchronous
+  // guard so a queued second Enter never opens two dialogs.
+  const [instruction, setInstruction] = useState("");
+  const instructionRef = useRef(instruction);
+  useEffect(() => {
+    instructionRef.current = instruction;
+  }, [instruction]);
+  const [reworkRequest, setReworkRequest] = useState<{
+    original: string;
+    instruction: string;
+  } | null>(null);
+  const [confirmingSel, setConfirmingSel] = useState<CapturedSelection | null>(null);
+  const confirmingRef = useRef(false);
+  // The selection-highlight mirror (Phase 4), scroll-synced from the textarea.
+  const hlRef = useRef<HTMLDivElement>(null);
+
   function trackSelection() {
     const ta = bodyRef.current;
     if (!ta) return;
@@ -268,6 +295,10 @@ const Editor = forwardRef<EditorHandle, Props>(function Editor(
     selRef.current = start === end ? null : { start, end };
     const len = captureSelection(selRef.current, body)?.text.length ?? 0;
     if (len !== selectionLength) setSelectionLength(len);
+  }
+
+  function syncHighlightScroll() {
+    if (hlRef.current && bodyRef.current) hlRef.current.scrollTop = bodyRef.current.scrollTop;
   }
 
   // Leave selection mode: forget the range and collapse the visible highlight to
@@ -424,6 +455,10 @@ const Editor = forwardRef<EditorHandle, Props>(function Editor(
     selRef.current = null;
     setSelectionLength(0);
     pendingCaretRef.current = null;
+    setInstruction("");
+    setReworkRequest(null);
+    setConfirmingSel(null);
+    confirmingRef.current = false;
     // Navigating away mid-stream must kill the backend stream, not just the
     // card — the cleanup marks the in-flight request cancelled (body OR the
     // R1 title phase) and cancels it, and flags a pending R4 save() as stale so
@@ -559,9 +594,6 @@ const Editor = forwardRef<EditorHandle, Props>(function Editor(
   });
 
   async function rework(instruction: string, provider: ProviderId) {
-    // Plan.15 D6: snapshot before an AI entry point — a crash mid-stream must
-    // not lose the text the rework was asked about. Fire-and-forget.
-    void draftBackup.flushNow();
     // Selection mode is decided HERE, from the tracked range, never from live
     // DOM in a click handler (D7). Only the selected text is sent (§4 M7).
     const sel = captureSelection(selRef.current, body);
@@ -570,6 +602,42 @@ const Editor = forwardRef<EditorHandle, Props>(function Editor(
       onError("There is no text to rework yet.", { key: "editor-no-text" });
       return;
     }
+    // Plan 17 D5: a SELECTION rework is confirmed first — before the draft
+    // flush and before any IPC, so Cancel changes nothing (box, body, tracked
+    // range, and any card already open all untouched). The captured range is
+    // highlighted behind the native dialog through `confirmingSel` — never
+    // through `selectionRework`, which stays bound to the open card until the
+    // supersede below; after OK it is re-checked against the live body. The
+    // guard is reset on EVERY exit path. Whole-text reworks never see this.
+    if (sel) {
+      if (confirmingRef.current) return; // a queued second Enter → one dialog
+      confirmingRef.current = true;
+      setConfirmingSel(sel);
+      try {
+        const msg = selectionConfirmMessage(sel.text.length, instruction);
+        const ok = await confirmDialog(msg.message, {
+          okLabel: msg.okLabel,
+          cancelLabel: msg.cancelLabel,
+          kind: "info",
+        });
+        if (!ok) return;
+        if (isSelectionStale(bodyRef.current?.value ?? body, sel)) {
+          onError("The selected text changed — select it again.", {
+            key: "editor-selection-changed",
+          });
+          return;
+        }
+      } catch (err) {
+        onError(String(err));
+        return;
+      } finally {
+        confirmingRef.current = false;
+        setConfirmingSel(null);
+      }
+    }
+    // Plan.15 D6: snapshot before an AI entry point — a crash mid-stream must
+    // not lose the text the rework was asked about. Fire-and-forget.
+    void draftBackup.flushNow();
     stopRef.current?.(); // defensive: the AiBar disables Rework while busy, so
     // this can't re-enter mid-stream today — but a future caller might.
     setAiBusy(true);
@@ -578,6 +646,9 @@ const Editor = forwardRef<EditorHandle, Props>(function Editor(
     setProposedTitle(null); // a fresh rework supersedes any prior title proposal
     setTitlePending(false);
     setSelectionRework(sel);
+    // Plan 17 D4: what this rework was asked about — the diff's request-time
+    // original and the instruction that 1b persists on accept.
+    setReworkRequest({ original: text, instruction });
 
     // Per-request cancel flag lives in this closure, so a late chunk or the
     // settled promise from THIS request can't touch a newer request's card.
@@ -608,6 +679,10 @@ const Editor = forwardRef<EditorHandle, Props>(function Editor(
       setProposal(null);
       setStreaming(false);
       setAiBusy(false);
+      // Plan 17 step 6: a failed stream leaves no selection mode behind
+      // (the confirmed leak — anything keyed on `selectionRework` would stick).
+      setSelectionRework(null);
+      setReworkRequest(null);
       if (stopRef.current === stop) stopRef.current = null;
       await reportAiError(provider, err, onError);
       return;
@@ -701,6 +776,7 @@ const Editor = forwardRef<EditorHandle, Props>(function Editor(
     setProposal(null);
     setProposedTitle(null);
     setSelectionRework(null);
+    setReworkRequest(null); // the instruction stays in the box (D3)
     setStreaming(false);
     setTitlePending(false);
     setAiBusy(false);
@@ -742,6 +818,15 @@ const Editor = forwardRef<EditorHandle, Props>(function Editor(
   // The body moved under a pending selection proposal → the splice would land in
   // the wrong place. Disabled eagerly here and re-validated on click (D4).
   const stale = selectionRework !== null && isSelectionStale(body, selectionRework);
+  // Plan 17 D6 / R-6: mirror the captured range behind the textarea only while
+  // it is still valid and a selection rework is confirming (its own range) or
+  // pending (the open card's range). When the range goes stale the mirror
+  // vanishes (it never relocates); the mount syncs its scroll position.
+  const highlightSel = confirmingSel ?? (proposal !== null ? selectionRework : null);
+  const showHighlight = highlightSel !== null && !isSelectionStale(body, highlightSel);
+  useLayoutEffect(() => {
+    if (showHighlight) syncHighlightScroll();
+  }, [showHighlight]);
 
   return (
     <section
@@ -911,6 +996,8 @@ const Editor = forwardRef<EditorHandle, Props>(function Editor(
         dirty={dirty}
         generatingTitle={generatingTitle}
         saveBlocked={isDraft && !projectId}
+        instruction={instruction}
+        onInstructionChange={setInstruction}
         onRework={(i, p) => void rework(i, p)}
         onSave={() => void save()}
         selectionLength={selectionLength}
@@ -918,57 +1005,71 @@ const Editor = forwardRef<EditorHandle, Props>(function Editor(
       />
 
       {cardOpen && (
-        <div
-          className="review"
-          role="region"
-          aria-label={
+        <ReviewCard
+          ariaLabel={
             proposal !== null
               ? selectionRework
                 ? "AI selection rewrite proposal"
                 : "AI rewrite proposal"
               : "AI title proposal"
           }
+          chipLabel={
+            streaming
+              ? "Streaming…"
+              : proposal !== null
+                ? selectionRework
+                  ? "Proposed rewrite (selection)"
+                  : "Proposed rewrite"
+                : "Proposed title"
+          }
+          proposal={proposal}
+          streaming={streaming}
+          original={reworkRequest?.original ?? null}
+          editedSinceRequest={
+            selectionRework === null && reworkRequest !== null && body !== reworkRequest.original
+          }
+          replaceDisabled={streaming || saving || stale}
+          replaceTitle={stale ? "The selected text changed — discard and rework again." : undefined}
+          onReplaceText={async () => {
+            if (proposal === null) return;
+            // The ONLY splice site (§4 H4): a selection proposal lands in
+            // its captured range or not at all — never whole-body, never
+            // re-found. A whole-text proposal replaces the body as before.
+            const next = selectionRework
+              ? spliceProposal(body, selectionRework, proposal)
+              : { ok: true as const, body: proposal, caret: null };
+            if (!next.ok) return;
+            edit(setBody)(next.body);
+            pendingCaretRef.current = next.caret;
+            const ok = await save({ body: next.body });
+            if (ok) {
+              setProposal(null); // clear only the body half on success
+              setSelectionRework(null);
+              // D3: empty the box only while it still holds the instruction
+              // that produced this proposal (read live — the closure's value
+              // predates the save).
+              if (
+                reworkRequest &&
+                shouldClearInstruction(instructionRef.current, reworkRequest.instruction)
+              ) {
+                setInstruction("");
+              }
+              setReworkRequest(null);
+            }
+          }}
+          onDiscard={discardProposal}
+          statusMessage={
+            streaming
+              ? "Streaming rewrite"
+              : titlePending
+                ? "Generating title"
+                : proposedTitle !== null
+                  ? "Title proposed"
+                  : selectionRework
+                    ? "Selection rewrite ready"
+                    : "Rewrite ready"
+          }
         >
-          <div className="review-head">
-            <span className="review-mark">
-              {streaming
-                ? "Streaming…"
-                : proposal !== null
-                  ? selectionRework
-                    ? "Proposed rewrite (selection)"
-                    : "Proposed rewrite"
-                  : "Proposed title"}
-            </span>
-            {proposal !== null && (
-              <button
-                className="btn"
-                disabled={streaming || saving || stale}
-                title={stale ? "The selected text changed — discard and rework again." : undefined}
-                onClick={async () => {
-                  // The ONLY splice site (§4 H4): a selection proposal lands in
-                  // its captured range or not at all — never whole-body, never
-                  // re-found. A whole-text proposal replaces the body as before.
-                  const next = selectionRework
-                    ? spliceProposal(body, selectionRework, proposal)
-                    : { ok: true as const, body: proposal, caret: null };
-                  if (!next.ok) return;
-                  edit(setBody)(next.body);
-                  pendingCaretRef.current = next.caret;
-                  const ok = await save({ body: next.body });
-                  if (ok) {
-                    setProposal(null); // clear only the body half on success
-                    setSelectionRework(null);
-                  }
-                }}
-              >
-                Replace text
-              </button>
-            )}
-            <button className="btn btn-quiet" onClick={discardProposal}>
-              Discard
-            </button>
-          </div>
-          {proposal !== null && <pre className="review-body">{proposal}</pre>}
           {(proposedTitle !== null || titlePending) && (
             <div className="review-title">
               <span className="review-title-label">TITLE</span>
@@ -989,57 +1090,55 @@ const Editor = forwardRef<EditorHandle, Props>(function Editor(
               </button>
             </div>
           )}
-          <span className="sr-only" role="status" aria-live="polite">
-            {streaming
-              ? "Streaming rewrite"
-              : titlePending
-                ? "Generating title"
-                : proposedTitle !== null
-                  ? "Title proposed"
-                  : selectionRework
-                    ? "Selection rewrite ready"
-                    : "Rewrite ready"}
-          </span>
-        </div>
+        </ReviewCard>
       )}
 
-      <textarea
-        className="body"
-        ref={bodyRef}
-        value={body}
-        // Plan.16 D4: tells Rust this field gets "Insert timestamp" on the
-        // native context menu (published on focus by useContextMenuSurface).
-        data-menu-surface="body"
-        placeholder="Write here. Use a rework when it's rough."
-        onChange={(e) => {
-          edit(setBody)(e.target.value);
-          // A manual edit invalidates the tracked offsets. (React's onChange
-          // does not fire for a programmatic setBody, so a splice never clears
-          // its own re-selection.)
-          clearSelection();
-        }}
-        onSelect={trackSelection}
-        onKeyUp={trackSelection}
-        onMouseUp={trackSelection}
-        // Plan.15 D6: leaving the body field is a natural checkpoint — flush
-        // the pending snapshot rather than wait out the idle window.
-        onBlur={() => void draftBackup.flushNow()}
-        // F6 (D9): whole-line Ctrl+X/C on a collapsed selection ride the
-        // native path via selection expansion; line-paste is the one
-        // programmatic insert (edit() + pendingCaretRef, not natively undoable).
-        onKeyDown={(e) => {
-          if (bodyRef.current) handleLineClipboardKeyDown(e, bodyRef.current);
-        }}
-        onPaste={(e) => {
-          const ta = bodyRef.current;
-          if (!ta) return;
-          handleLinePaste(e, ta, (nextBody, caret) => {
-            edit(setBody)(nextBody);
+      {/* Permanent wrapper (plan 17 D6): the backdrop is a conditional SIBLING
+          before the textarea, never a conditional wrapper — wrapping would
+          remount the textarea and lose focus, undo, scroll and selection. */}
+      <div className="body-wrap">
+        {showHighlight && (
+          <SelectionBackdrop body={body} sel={highlightSel} hlRef={hlRef} />
+        )}
+        <textarea
+          className={showHighlight ? "body body-transparent" : "body"}
+          ref={bodyRef}
+          value={body}
+          // Plan.16 D4: tells Rust this field gets "Insert timestamp" on the
+          // native context menu (published on focus by useContextMenuSurface).
+          data-menu-surface="body"
+          placeholder="Write here. Use a rework when it's rough."
+          onChange={(e) => {
+            edit(setBody)(e.target.value);
+            // A manual edit invalidates the tracked offsets. (React's onChange
+            // does not fire for a programmatic setBody, so a splice never clears
+            // its own re-selection.)
             clearSelection();
-            pendingCaretRef.current = { start: caret, end: caret };
-          });
-        }}
-      />
+          }}
+          onSelect={trackSelection}
+          onKeyUp={trackSelection}
+          onMouseUp={trackSelection}
+          onScroll={syncHighlightScroll}
+          // Plan.15 D6: leaving the body field is a natural checkpoint — flush
+          // the pending snapshot rather than wait out the idle window.
+          onBlur={() => void draftBackup.flushNow()}
+          // F6 (D9): whole-line Ctrl+X/C on a collapsed selection ride the
+          // native path via selection expansion; line-paste is the one
+          // programmatic insert (edit() + pendingCaretRef, not natively undoable).
+          onKeyDown={(e) => {
+            if (bodyRef.current) handleLineClipboardKeyDown(e, bodyRef.current);
+          }}
+          onPaste={(e) => {
+            const ta = bodyRef.current;
+            if (!ta) return;
+            handleLinePaste(e, ta, (nextBody, caret) => {
+              edit(setBody)(nextBody);
+              clearSelection();
+              pendingCaretRef.current = { start: caret, end: caret };
+            });
+          }}
+        />
+      </div>
     </section>
   );
 });

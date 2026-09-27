@@ -48,6 +48,24 @@ export function hasTab<T>(state: OpenTabsState<T>, key: string): boolean {
   return state.tabs.some((t) => t.key === key);
 }
 
+/** The keys of every tab with unsaved edits (plan 17 feature 7): the rails
+ *  mark their rows from this set. Derived from in-memory tab state only, never
+ *  persisted (R-16); a key leaves the set only when its editor reports clean
+ *  after a save that returned ok. */
+export function dirtyKeys<T>(state: OpenTabsState<T>): Set<string> {
+  const keys = new Set<string>();
+  for (const t of state.tabs) if (t.isDirty) keys.add(t.key);
+  return keys;
+}
+
+/** How many open tabs have unsaved edits — the page-tab badge count. Drafts
+ *  (which have no rail row) count here even though they mark no row. */
+export function dirtyCount<T>(state: OpenTabsState<T>): number {
+  let n = 0;
+  for (const t of state.tabs) if (t.isDirty) n += 1;
+  return n;
+}
+
 /** The active tab, or null when the set is empty. */
 export function activeTab<T>(state: OpenTabsState<T>): Tab<T> | null {
   return state.tabs.find((t) => t.key === state.activeKey) ?? null;

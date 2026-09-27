@@ -48,6 +48,7 @@ import {
   activateTab,
   activeTab,
   closeTab,
+  dirtyKeys,
   emptyTabs,
   hasTab,
   openTab,
@@ -77,6 +78,22 @@ const PAGES: Page[] = ["worknotes", "prompts", "scratch"];
  *  item/draft is still untitled. */
 function itemTabTitle(item: Item): string {
   return item.title || (item.kind === "task" ? "Untitled task" : "Untitled note");
+}
+
+/** Plan 17 feature 7 (D9): a page tab's unsaved count. Unsaved work on a
+ *  hidden page was invisible before this — the badge is the one place it
+ *  shows. Rendered only when `n > 0`; the number is decorative and the sr-only
+ *  text carries it into the tab's accessible name. */
+function PageTabBadge({ n }: { n: number }) {
+  if (n <= 0) return null;
+  return (
+    <>
+      <span className="page-tab-badge" aria-hidden="true">
+        {n}
+      </span>
+      <span className="sr-only">, {n} unsaved</span>
+    </>
+  );
 }
 
 export default function App() {
@@ -182,6 +199,13 @@ export default function App() {
   const [openPromptProjectIds, setOpenPromptProjectIds] = useState<string[]>([]);
   // Likewise for open scratch-pad tabs on the Scratch page (Plan 13).
   const [openScratchProjectIds, setOpenScratchProjectIds] = useState<string[]>([]);
+
+  // Plan 17 feature 7 (D9): how many tabs on each page carry unsaved edits.
+  // Item tabs are derived from `tabs` below (dirty flips are transition-only,
+  // so keystrokes never reach this); the two child pages report their own
+  // counts up through `onDirtyCountChange` (the `onOpenPromptsChange` pattern).
+  const [promptDirtyN, setPromptDirtyN] = useState(0);
+  const [scratchDirtyN, setScratchDirtyN] = useState(0);
 
   // Bumped when a project is reloaded so PromptsPage closes its own open prompt
   // tabs of that project — reload keeps the project `loaded`, so PromptsPage's
@@ -528,6 +552,11 @@ export default function App() {
   const active = activeTab(tabs);
   // Rail highlight: the active tab's saved item id (a draft has "" → no row).
   const selectedId = active && active.item.id !== "" ? active.item.id : null;
+  // Plan 17 feature 7: the dirty item tabs, keyed like rail rows (itemKey), for
+  // the row markers; its size is the Worknotes page badge. Memoised on `tabs`
+  // so the rail's marker set only changes on a dirty transition.
+  const dirtyItemKeys = useMemo(() => dirtyKeys(tabs), [tabs]);
+  const itemDirtyN = dirtyItemKeys.size;
 
   // EditorTabs descriptors — primitives only, so a keystroke in one editor (which
   // re-renders only that editor, not App) never rebuilds this list.
@@ -911,6 +940,7 @@ export default function App() {
             onKeyDown={onPageTabKeyDown}
           >
             Worknotes
+            <PageTabBadge n={itemDirtyN} />
           </button>
           <button
             id="tab-prompts"
@@ -923,6 +953,7 @@ export default function App() {
             onKeyDown={onPageTabKeyDown}
           >
             Prompts
+            <PageTabBadge n={promptDirtyN} />
           </button>
           <button
             id="tab-scratch"
@@ -935,6 +966,7 @@ export default function App() {
             onKeyDown={onPageTabKeyDown}
           >
             Scratch
+            <PageTabBadge n={scratchDirtyN} />
           </button>
         </div>
         <span className="meta-spring" />
@@ -979,6 +1011,7 @@ export default function App() {
         <ItemList
           items={items}
           selectedId={selectedId}
+          dirtyKeys={dirtyItemKeys}
           kind={kind}
           search={search}
           tagFilter={tagFilter}
@@ -1098,6 +1131,7 @@ export default function App() {
           onNotice={showNotice}
           onResolve={dismissKey}
           onOpenPromptsChange={setOpenPromptProjectIds}
+          onDirtyCountChange={setPromptDirtyN}
           seed={promptSeed}
           session={initialSession?.prompts ?? null}
           sessionReady={metaLoaded}
@@ -1119,6 +1153,7 @@ export default function App() {
           onNotice={showNotice}
           onResolve={dismissKey}
           onOpenScratchChange={setOpenScratchProjectIds}
+          onDirtyCountChange={setScratchDirtyN}
           onSendToItem={sendSelectionToItem}
           onSendToPrompt={sendSelectionToPrompt}
           session={initialSession?.scratch ?? null}

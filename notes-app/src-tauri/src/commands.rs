@@ -381,6 +381,7 @@ pub struct RewriteRequest {
 /// case keeps its actionable copy.
 #[tauri::command]
 pub async fn ai_rewrite(state: State<'_, AppState>, req: RewriteRequest) -> Result<String> {
+    ai::validate_instruction(&req.instruction)?; // cap first: nothing else has run yet
     if req.text.trim().is_empty() {
         return Err(AppError::Invalid("there is no text to rework".into()));
     }
@@ -462,6 +463,7 @@ pub async fn ai_rewrite_stream(
     on_event: Channel<RewriteEvent>,
 ) -> Result<()> {
     // --- Preflight (rejects the promise; nothing has streamed yet) ---
+    ai::validate_instruction(&req.instruction)?; // cap first: before the key lookup and the provider
     if req.text.trim().is_empty() {
         return Err(AppError::Invalid("there is no text to rework".into()));
     }

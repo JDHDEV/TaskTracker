@@ -110,8 +110,10 @@ function EditorTabs({
             id={tabDomId(t.key)}
             // Explicit accessible name = the title, so the tab isn't announced
             // from its subtree (which would fold in the close button's "Close …"
-            // label and the pin/dot/unsaved title= attributes).
-            aria-label={t.title}
+            // label and the pin/dot/unsaved title= attributes). Because this
+            // overrides the subtree, the unsaved state must be spelled into it
+            // (plan 17): the dot alone was never heard.
+            aria-label={t.dirty ? `${t.title}, unsaved changes` : t.title}
             aria-selected={on}
             aria-controls={tabPanelDomId(t.key)}
             tabIndex={on ? 0 : -1}

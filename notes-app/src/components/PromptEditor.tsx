@@ -22,6 +22,7 @@ import { buildPromptDraft } from "../lib/drafts";
 import { useDraftBackup } from "../hooks/useDraftBackup";
 import { reportAiError } from "../lib/aiErrors";
 import { handleLineClipboardKeyDown, handleLinePaste } from "../lib/lineEdit";
+import { selectionConfirmMessage, shouldClearInstruction } from "../lib/rework";
 import { tabDomId, tabPanelDomId } from "../lib/openTabs";
 import {
   captureSelection,
@@ -33,6 +34,8 @@ import {
 import { usePopover } from "../hooks/usePopover";
 import AiBar from "./AiBar";
 import PromptHistoryDialog from "./PromptHistoryDialog";
+import ReviewCard from "./ReviewCard";
+import SelectionBackdrop from "./SelectionBackdrop";
 
 /** Imperative handle: lets the parent persist a background (non-active) prompt
  *  tab from the close-dirty "Save" branch (its buffer lives only here).
@@ -131,6 +134,8 @@ const PromptEditor = forwardRef<PromptEditorHandle, Props>(function PromptEditor
   const [aiBusy, setAiBusy] = useState(false);
   const [saving, setSaving] = useState(false);
   const [showHistory, setShowHistory] = useState(false);
+  // Focus returns here when the History dialog closes (plan 17 D13).
+  const historyBtnRef = useRef<HTMLButtonElement>(null);
   // Inline "Copied" feedback (plan.8), self-reverting; the timer is cleared on
   // unmount / prompt change so a stale revert never fires on a newer prompt.
   const [copied, setCopied] = useState(false);
@@ -186,6 +191,25 @@ const PromptEditor = forwardRef<PromptEditorHandle, Props>(function PromptEditor
   const [selectionRework, setSelectionRework] = useState<CapturedSelection | null>(null);
   const pendingCaretRef = useRef<SelectionRange | null>(null);
 
+  // Plan 17 (D2–D5) — the Editor.tsx wiring: controlled instruction (+ live
+  // ref mirror), the request-time capture `reworkRequest` (its instruction is
+  // what an accepted rewrite persists — never the live box, R-8), and the
+  // selection-confirm range + guard (kept apart from `selectionRework` so an
+  // open card is never disturbed by a cancelled confirm — see Editor.tsx).
+  const [instruction, setInstruction] = useState("");
+  const instructionRef = useRef(instruction);
+  useEffect(() => {
+    instructionRef.current = instruction;
+  }, [instruction]);
+  const [reworkRequest, setReworkRequest] = useState<{
+    original: string;
+    instruction: string;
+  } | null>(null);
+  const [confirmingSel, setConfirmingSel] = useState<CapturedSelection | null>(null);
+  const confirmingRef = useRef(false);
+  // The selection-highlight mirror (Phase 4), scroll-synced from the textarea.
+  const hlRef = useRef<HTMLDivElement>(null);
+
   function trackSelection() {
     const ta = bodyRef.current;
     if (!ta) return;
@@ -193,6 +217,10 @@ const PromptEditor = forwardRef<PromptEditorHandle, Props>(function PromptEditor
     selRef.current = start === end ? null : { start, end };
     const len = captureSelection(selRef.current, body)?.text.length ?? 0;
     if (len !== selectionLength) setSelectionLength(len);
+  }
+
+  function syncHighlightScroll() {
+    if (hlRef.current && bodyRef.current) hlRef.current.scrollTop = bodyRef.current.scrollTop;
   }
 
   // Leave selection mode (does not touch an in-flight `selectionRework`).
@@ -296,6 +324,10 @@ const PromptEditor = forwardRef<PromptEditorHandle, Props>(function PromptEditor
     selRef.current = null;
     setSelectionLength(0);
     pendingCaretRef.current = null;
+    setInstruction("");
+    setReworkRequest(null);
+    setConfirmingSel(null);
+    confirmingRef.current = false;
     return () => {
       stopRef.current?.();
       stopRef.current = null;
@@ -333,6 +365,9 @@ const PromptEditor = forwardRef<PromptEditorHandle, Props>(function PromptEditor
   async function save(overrides?: {
     body?: string;
     source?: PromptSource;
+    /** Plan 17 (1b): the request-time instruction behind an accepted
+     *  proposal — forwarded with `source: "aiEnhanced"` only. */
+    instruction?: string;
   }): Promise<boolean> {
     if (savingRef.current) return false; // re-entry guard
     savingRef.current = true;
@@ -358,6 +393,7 @@ const PromptEditor = forwardRef<PromptEditorHandle, Props>(function PromptEditor
           // Provenance for the first version (§12): "aiEnhanced" when this save
           // is accepting an AI proposal on a not-yet-created draft, else manual.
           source: overrides?.source,
+          instruction: overrides?.instruction,
         };
         const created = await onCreate(input);
         if (created) {
@@ -370,6 +406,7 @@ const PromptEditor = forwardRef<PromptEditorHandle, Props>(function PromptEditor
         title,
         body: effectiveBody,
         source: overrides?.source,
+        instruction: overrides?.instruction,
       });
       if (saved) {
         setDirty(false); // a rejected save stays dirty → "Save", not "Saved"
@@ -398,8 +435,6 @@ const PromptEditor = forwardRef<PromptEditorHandle, Props>(function PromptEditor
   });
 
   async function rework(instruction: string, provider: ProviderId) {
-    // Plan.15 D6: snapshot before an AI entry point. Fire-and-forget.
-    void draftBackup.flushNow();
     // Selection mode is decided here from the tracked range (D7); only the
     // selected text is sent (§4 M7).
     const sel = captureSelection(selRef.current, body);
@@ -408,11 +443,44 @@ const PromptEditor = forwardRef<PromptEditorHandle, Props>(function PromptEditor
       onError("There is no text to rework yet.", { key: "prompt-no-text" });
       return;
     }
+    // Plan 17 D5: confirm a SELECTION rework before the draft flush and any
+    // IPC (Cancel changes nothing); highlight behind the dialog; re-check the
+    // range after OK; reset the guard on every exit path (see Editor.tsx).
+    if (sel) {
+      if (confirmingRef.current) return;
+      confirmingRef.current = true;
+      setConfirmingSel(sel);
+      try {
+        const msg = selectionConfirmMessage(sel.text.length, instruction);
+        const ok = await confirmDialog(msg.message, {
+          okLabel: msg.okLabel,
+          cancelLabel: msg.cancelLabel,
+          kind: "info",
+        });
+        if (!ok) return;
+        if (isSelectionStale(bodyRef.current?.value ?? body, sel)) {
+          onError("The selected text changed — select it again.", {
+            key: "prompt-selection-changed",
+          });
+          return;
+        }
+      } catch (err) {
+        onError(String(err));
+        return;
+      } finally {
+        confirmingRef.current = false;
+        setConfirmingSel(null);
+      }
+    }
+    // Plan.15 D6: snapshot before an AI entry point. Fire-and-forget.
+    void draftBackup.flushNow();
     stopRef.current?.(); // defensive: AiBar disables Rework while busy
     setAiBusy(true);
     setStreaming(true);
     setProposal(""); // instant empty card; tokens accumulate into it
     setSelectionRework(sel);
+    // Plan 17 D4: the request-time original + the instruction 1b persists.
+    setReworkRequest({ original: text, instruction });
 
     // Per-request cancel flag lives in this closure, so a late chunk or the
     // settled promise from THIS request can't touch a newer request's card.
@@ -438,6 +506,9 @@ const PromptEditor = forwardRef<PromptEditorHandle, Props>(function PromptEditor
     } catch (err) {
       if (cancelled) return;
       setProposal(null);
+      // Plan 17 step 6: a failed stream leaves no selection mode behind.
+      setSelectionRework(null);
+      setReworkRequest(null);
       await reportAiError(provider, err, onError); // keyed when no key stored (F5)
     } finally {
       if (!cancelled) {
@@ -455,6 +526,7 @@ const PromptEditor = forwardRef<PromptEditorHandle, Props>(function PromptEditor
     stopRef.current = null;
     setProposal(null);
     setSelectionRework(null);
+    setReworkRequest(null); // the instruction stays in the box (D3)
     setStreaming(false);
     setAiBusy(false);
   }
@@ -487,6 +559,13 @@ const PromptEditor = forwardRef<PromptEditorHandle, Props>(function PromptEditor
   // The body moved under a pending selection proposal (D4): disabled eagerly,
   // re-validated on click.
   const stale = selectionRework !== null && isSelectionStale(body, selectionRework);
+  // Plan 17 D6 / R-6: the highlight mirror shows only while the range is valid
+  // and a selection rework is confirming or pending (see Editor.tsx).
+  const highlightSel = confirmingSel ?? (proposal !== null ? selectionRework : null);
+  const showHighlight = highlightSel !== null && !isSelectionStale(body, highlightSel);
+  useLayoutEffect(() => {
+    if (showHighlight) syncHighlightScroll();
+  }, [showHighlight]);
 
   return (
     <section
@@ -569,7 +648,11 @@ const PromptEditor = forwardRef<PromptEditorHandle, Props>(function PromptEditor
                 </div>
               )}
             </span>
-            <button className="btn btn-quiet" onClick={() => setShowHistory(true)}>
+            <button
+              className="btn btn-quiet"
+              ref={historyBtnRef}
+              onClick={() => setShowHistory(true)}
+            >
               History
             </button>
             <button className="btn btn-danger" onClick={onDelete}>
@@ -585,6 +668,8 @@ const PromptEditor = forwardRef<PromptEditorHandle, Props>(function PromptEditor
         dirty={dirty}
         generatingTitle={false}
         saveBlocked={false}
+        instruction={instruction}
+        onInstructionChange={setInstruction}
         onRework={(i, p) => void rework(i, p)}
         onSave={() => void save()}
         onDiscard={isDraft ? undefined : discardEdits}
@@ -593,91 +678,109 @@ const PromptEditor = forwardRef<PromptEditorHandle, Props>(function PromptEditor
       />
 
       {proposal !== null && (
-        <div
-          className="review"
-          role="region"
-          aria-label={selectionRework ? "AI selection rewrite proposal" : "AI rewrite proposal"}
-        >
-          <div className="review-head">
-            <span className="review-mark">
-              {streaming
-                ? "Streaming…"
-                : selectionRework
-                  ? "Proposed rewrite (selection)"
-                  : "Proposed rewrite"}
-            </span>
-            <button
-              className="btn"
-              disabled={streaming || saving || stale}
-              title={stale ? "The selected text changed — discard and rework again." : undefined}
-              onClick={async () => {
-                // The ONLY splice site (§4 H4): into the captured range or not
-                // at all. A partially-AI body is still `aiEnhanced`.
-                const next = selectionRework
-                  ? spliceProposal(body, selectionRework, proposal)
-                  : { ok: true as const, body: proposal, caret: null };
-                if (!next.ok) return;
-                edit(setBody)(next.body);
-                pendingCaretRef.current = next.caret;
-                const ok = await save({ body: next.body, source: "aiEnhanced" });
-                if (ok) {
-                  setProposal(null);
-                  setSelectionRework(null);
-                }
-              }}
-            >
-              Replace text
-            </button>
-            <button className="btn btn-quiet" onClick={discardProposal}>
-              Discard
-            </button>
-          </div>
-          <pre className="review-body">{proposal}</pre>
-          <span className="sr-only" role="status" aria-live="polite">
-            {streaming
+        <ReviewCard
+          ariaLabel={selectionRework ? "AI selection rewrite proposal" : "AI rewrite proposal"}
+          chipLabel={
+            streaming
+              ? "Streaming…"
+              : selectionRework
+                ? "Proposed rewrite (selection)"
+                : "Proposed rewrite"
+          }
+          proposal={proposal}
+          streaming={streaming}
+          original={reworkRequest?.original ?? null}
+          editedSinceRequest={
+            selectionRework === null && reworkRequest !== null && body !== reworkRequest.original
+          }
+          replaceDisabled={streaming || saving || stale}
+          replaceTitle={stale ? "The selected text changed — discard and rework again." : undefined}
+          onReplaceText={async () => {
+            // The ONLY splice site (§4 H4): into the captured range or not
+            // at all. A partially-AI body is still `aiEnhanced`.
+            const next = selectionRework
+              ? spliceProposal(body, selectionRework, proposal)
+              : { ok: true as const, body: proposal, caret: null };
+            if (!next.ok) return;
+            edit(setBody)(next.body);
+            pendingCaretRef.current = next.caret;
+            // The persisted instruction is the request-time capture (R-8),
+            // never the live box — the user may have retyped it meanwhile.
+            const ok = await save({
+              body: next.body,
+              source: "aiEnhanced",
+              instruction: reworkRequest?.instruction,
+            });
+            if (ok) {
+              setProposal(null);
+              setSelectionRework(null);
+              // D3: empty the box only while it still holds the sent
+              // instruction (read live — the closure predates the save).
+              if (
+                reworkRequest &&
+                shouldClearInstruction(instructionRef.current, reworkRequest.instruction)
+              ) {
+                setInstruction("");
+              }
+              setReworkRequest(null);
+            }
+          }}
+          onDiscard={discardProposal}
+          statusMessage={
+            streaming
               ? "Streaming rewrite"
               : selectionRework
                 ? "Selection rewrite ready"
-                : "Rewrite ready"}
-          </span>
-        </div>
+                : "Rewrite ready"
+          }
+        />
       )}
 
-      <textarea
-        className="body"
-        ref={bodyRef}
-        value={body}
-        // Plan.16 D4: "Insert timestamp" surface (see Editor.tsx).
-        data-menu-surface="body"
-        placeholder="Write the prompt text here."
-        onChange={(e) => {
-          edit(setBody)(e.target.value);
-          clearSelection(); // a manual edit invalidates the tracked offsets
-        }}
-        onSelect={trackSelection}
-        onKeyUp={trackSelection}
-        onMouseUp={trackSelection}
-        // Plan.15 D6: leaving the field is a natural checkpoint — flush now.
-        onBlur={() => void draftBackup.flushNow()}
-        // F6 (D9): whole-line Ctrl+X/C/V on a collapsed selection.
-        onKeyDown={(e) => {
-          if (bodyRef.current) handleLineClipboardKeyDown(e, bodyRef.current);
-        }}
-        onPaste={(e) => {
-          const ta = bodyRef.current;
-          if (!ta) return;
-          handleLinePaste(e, ta, (nextBody, caret) => {
-            edit(setBody)(nextBody);
-            clearSelection();
-            pendingCaretRef.current = { start: caret, end: caret };
-          });
-        }}
-      />
+      {/* Permanent wrapper (plan 17 D6) — see Editor.tsx. */}
+      <div className="body-wrap">
+        {showHighlight && (
+          <SelectionBackdrop body={body} sel={highlightSel} hlRef={hlRef} />
+        )}
+        <textarea
+          className={showHighlight ? "body body-transparent" : "body"}
+          ref={bodyRef}
+          value={body}
+          // Plan.16 D4: "Insert timestamp" surface (see Editor.tsx).
+          data-menu-surface="body"
+          placeholder="Write the prompt text here."
+          onChange={(e) => {
+            edit(setBody)(e.target.value);
+            clearSelection(); // a manual edit invalidates the tracked offsets
+          }}
+          onSelect={trackSelection}
+          onKeyUp={trackSelection}
+          onMouseUp={trackSelection}
+          onScroll={syncHighlightScroll}
+          // Plan.15 D6: leaving the field is a natural checkpoint — flush now.
+          onBlur={() => void draftBackup.flushNow()}
+          // F6 (D9): whole-line Ctrl+X/C/V on a collapsed selection.
+          onKeyDown={(e) => {
+            if (bodyRef.current) handleLineClipboardKeyDown(e, bodyRef.current);
+          }}
+          onPaste={(e) => {
+            const ta = bodyRef.current;
+            if (!ta) return;
+            handleLinePaste(e, ta, (nextBody, caret) => {
+              edit(setBody)(nextBody);
+              clearSelection();
+              pendingCaretRef.current = { start: caret, end: caret };
+            });
+          }}
+        />
+      </div>
 
       {showHistory && (
         <PromptHistoryDialog
           promptId={prompt.id}
-          onClose={() => setShowHistory(false)}
+          onClose={() => {
+            setShowHistory(false);
+            historyBtnRef.current?.focus(); // never drop focus to <body>
+          }}
           onError={onError}
         />
       )}

@@ -430,7 +430,24 @@ export async function copyToClipboard(text: string): Promise<void> {
  * (delete, unload, reload, delete-files) routes through the dialog plugin's
  * async `ask` instead. Resolves `true` when the user accepts. Routed through
  * api.ts like `openExternal`, so plugin IPC stays out of components.
+ *
+ * `opts` (plan 17 D5) names the buttons and the icon kind for the one
+ * non-destructive use — the selection-rework confirm; every other call site
+ * passes only the message and keeps the `worknotes` title + warning kind.
  */
-export function confirmDialog(message: string, title = "worknotes"): Promise<boolean> {
-  return ask(message, { title, kind: "warning" });
+export function confirmDialog(
+  message: string,
+  opts: {
+    title?: string;
+    okLabel?: string;
+    cancelLabel?: string;
+    kind?: "info" | "warning" | "error";
+  } = {},
+): Promise<boolean> {
+  return ask(message, {
+    title: opts.title ?? "worknotes",
+    kind: opts.kind ?? "warning",
+    okLabel: opts.okLabel,
+    cancelLabel: opts.cancelLabel,
+  });
 }

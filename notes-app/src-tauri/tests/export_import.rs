@@ -186,6 +186,7 @@ fn prompt_version(id: &str, title: &str, body: &str) -> promptfile::PromptVersio
         body: body.into(),
         source: "manual".into(),
         created_at: TS.into(),
+        instruction: None,
     }
 }
 
@@ -203,6 +204,16 @@ fn prompt_idempotent_export_is_byte_stable() {
     let once = promptfile::serialize_version(&version);
     let twice = promptfile::serialize_version(&promptfile::parse_version(&once, PROMPT_ID).unwrap());
     assert_eq!(once, twice, "re-exporting a parsed version must be byte-identical");
+
+    // plan.17 1b: an instruction-bearing aiEnhanced version must be just as
+    // byte-stable across a round trip.
+    let mut enhanced = prompt_version(VERSION_ID, "Draft the release email", "Hi team\n");
+    enhanced.source = "aiEnhanced".into();
+    enhanced.instruction = Some("Make it warmer.\nKeep it under 100 words.".into());
+    let once = promptfile::serialize_version(&enhanced);
+    let twice = promptfile::serialize_version(&promptfile::parse_version(&once, PROMPT_ID).unwrap());
+    assert_eq!(once, twice, "re-exporting a parsed instruction-bearing version must be byte-identical");
+    assert!(once.contains("instruction: \""), "sanity: the instruction line must genuinely be present");
 }
 
 #[test]
@@ -218,7 +229,12 @@ fn two_branches_each_adding_a_version_merge_into_one_prompt_with_both_preserved(
     let version_a = "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee";
     let version_b = "ffffffff-ffff-ffff-ffff-ffffffffffff";
     promptfile::write_version(dir.path(), &prompt_version(version_a, "from branch a", "a body")).unwrap();
-    promptfile::write_version(dir.path(), &prompt_version(version_b, "from branch b", "b body")).unwrap();
+    // Branch b's version carries an instruction (plan.17 1b), so the merge
+    // assertion below is non-vacuous for the new field too.
+    let mut version_b_record = prompt_version(version_b, "from branch b", "b body");
+    version_b_record.source = "aiEnhanced".into();
+    version_b_record.instruction = Some("make it snappier".into());
+    promptfile::write_version(dir.path(), &version_b_record).unwrap();
 
     let out = promptfile::scan(dir.path());
     assert!(out.errors.is_empty(), "clean disjoint version files scan without errors: {:?}", out.errors);
@@ -228,6 +244,15 @@ fn two_branches_each_adding_a_version_merge_into_one_prompt_with_both_preserved(
     let mut expected = vec![version_a, version_b];
     expected.sort();
     assert_eq!(ids, expected, "both branches' versions are preserved, neither overwriting the other");
+
+    let merged_b = out.prompts[0].versions.iter().find(|v| v.id == version_b).unwrap();
+    assert_eq!(
+        merged_b.instruction.as_deref(),
+        Some("make it snappier"),
+        "branch b's instruction survives the merge alongside its content"
+    );
+    let merged_a = out.prompts[0].versions.iter().find(|v| v.id == version_a).unwrap();
+    assert_eq!(merged_a.instruction, None, "branch a's manual version still carries none");
 }
 
 #[test]
@@ -298,6 +323,9 @@ fn relocating_a_prompt_dir_preserves_every_version_and_clears_the_source() {
     let mut version_two = prompt_version(v2, "second", "second body");
     version_two.source = "aiEnhanced".into();
     version_two.created_at = "2026-07-15T00:00:00.000+00:00".into();
+    // plan.17 1b: carries an instruction so the structural-equality assertion
+    // below is non-vacuous for the new field too.
+    version_two.instruction = Some("shorten this".into());
     promptfile::write_version(source.path(), &prompt_version(v1, "first", "first body")).unwrap();
     promptfile::write_version(source.path(), &version_two).unwrap();
 
@@ -321,7 +349,13 @@ fn relocating_a_prompt_dir_preserves_every_version_and_clears_the_source() {
     let mut tgt_versions = tgt_prompt.versions.clone();
     src_versions.sort_by(|a, b| a.id.cmp(&b.id));
     tgt_versions.sort_by(|a, b| a.id.cmp(&b.id));
-    assert_eq!(src_versions, tgt_versions, "every version's id/source/created_at/title/body is preserved");
+    assert_eq!(src_versions, tgt_versions, "every version's id/source/created_at/title/body/instruction is preserved");
+    let tgt_v2 = tgt_versions.iter().find(|v| v.id == v2).unwrap();
+    assert_eq!(
+        tgt_v2.instruction.as_deref(),
+        Some("shorten this"),
+        "sanity: the instruction really did travel, so the equality above is non-vacuous"
+    );
 
     // Delete-source-last: remove_prompt clears the source dir entirely.
     promptfile::remove_prompt(source.path(), PROMPT_ID).unwrap();

@@ -1,0 +1,145 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Plan 17 changes</title>
+<style>
+:root{--bg:#ffffff;--surface:#f5f5f7;--border:#6b7280;--text:#1a1a1a;--muted:#4b5563;--accent:#1d4ed8;--create:#15803d;--modify:#b45309}
+@media (prefers-color-scheme: dark){:root{--bg:#121212;--surface:#1e1e22;--border:#9ca3af;--text:#f5f5f5;--muted:#b3b3b8;--accent:#60a5fa;--create:#4ade80;--modify:#fbbf24}}
+@media print{:root{--bg:#ffffff;--surface:#f5f5f7;--text:#1a1a1a;--accent:#1d4ed8}}
+body{background:var(--bg);color:var(--text);margin:0;padding:16px;font-family:system-ui,sans-serif}
+h1{font-size:18px;margin:0 0 8px}p{margin:0 0 12px;color:var(--muted);font-size:14px}
+figure{margin:0}svg{width:100%;height:auto;display:block}
+table{border-collapse:collapse;margin-top:16px;width:100%;table-layout:fixed}th,td{border:1px solid var(--border);padding:4px 8px;text-align:left;overflow-wrap:anywhere;font-size:13px}
+.legend{font-size:13px;color:var(--muted);margin-top:8px}
+</style></head><body>
+<h1>Plan 17 changes</h1>
+<p>AI review UX batch: instruction retention and history, auto-grow instruction box, confirm and highlight selection reworks, diff review card, unsaved-change visibility. Paths are relative to <code>notes-app/</code>. The plan file <code>plans/plan.17.md</code> is authoritative; this map is illustrative.</p>
+<figure>
+<svg viewBox="0 0 1140 1540" role="img" aria-labelledby="dt dd">
+<title id="dt">Plan 17: planned changes</title>
+<desc id="dd">One lane per directory; dashed boxes are files to create, solid boxes files to modify; arrows point from a file to the file it depends on (solid = new dependency, dashed = existing); numbered badges give the first implementation step touching the file. Columns left to right: Phases 0-1, Phase 2, Phases 3-4, Phase 5, Phases 6-7.</desc>
+<defs><marker id="a" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="var(--border)"/></marker></defs>
+<text x="20" y="32" fill="var(--muted)" font-size="12">src/components/</text>
+<line x1="20" y1="36" x2="1120" y2="36" stroke="var(--border)" stroke-width="0.5" stroke-dasharray="2 4"/>
+<text x="20" y="532" fill="var(--muted)" font-size="12">src/lib/</text>
+<line x1="20" y1="536" x2="1120" y2="536" stroke="var(--border)" stroke-width="0.5" stroke-dasharray="2 4"/>
+<text x="20" y="832" fill="var(--muted)" font-size="12">src/</text>
+<line x1="20" y1="836" x2="1120" y2="836" stroke="var(--border)" stroke-width="0.5" stroke-dasharray="2 4"/>
+<text x="20" y="932" fill="var(--muted)" font-size="12">src-tauri/migrations/</text>
+<line x1="20" y1="936" x2="1120" y2="936" stroke="var(--border)" stroke-width="0.5" stroke-dasharray="2 4"/>
+<text x="20" y="1032" fill="var(--muted)" font-size="12">src-tauri/src/</text>
+<line x1="20" y1="1036" x2="1120" y2="1036" stroke="var(--border)" stroke-width="0.5" stroke-dasharray="2 4"/>
+<text x="20" y="1132" fill="var(--muted)" font-size="12">src-tauri/tests/</text>
+<line x1="20" y1="1136" x2="1120" y2="1136" stroke="var(--border)" stroke-width="0.5" stroke-dasharray="2 4"/>
+<text x="20" y="1232" fill="var(--muted)" font-size="12">docs/</text>
+<line x1="20" y1="1236" x2="1120" y2="1236" stroke="var(--border)" stroke-width="0.5" stroke-dasharray="2 4"/>
+<text x="20" y="1332" fill="var(--muted)" font-size="12">notes-app/ (root)</text>
+<line x1="20" y1="1336" x2="1120" y2="1336" stroke="var(--border)" stroke-width="0.5" stroke-dasharray="2 4"/>
+<text x="20" y="1432" fill="var(--muted)" font-size="12">plans/</text>
+<line x1="20" y1="1436" x2="1120" y2="1436" stroke="var(--border)" stroke-width="0.5" stroke-dasharray="2 4"/>
+<g><title>src/components/ReviewCard.tsx (create, step 1)</title><rect x="20" y="42" width="180" height="60" rx="8" fill="var(--surface)" stroke="var(--create)" stroke-width="2" stroke-dasharray="4 2"/><text x="110" y="76" text-anchor="middle" fill="var(--text)" font-size="13">ReviewCard.tsx</text><circle cx="20" cy="42" r="10" fill="var(--accent)"/><text x="20" y="46" text-anchor="middle" fill="var(--bg)" font-size="11">1</text></g>
+<g><title>src/components/Editor.tsx (modify, step 2)</title><rect x="20" y="142" width="180" height="60" rx="8" fill="var(--surface)" stroke="var(--modify)" stroke-width="2"/><text x="110" y="176" text-anchor="middle" fill="var(--text)" font-size="13">Editor.tsx</text><circle cx="20" cy="142" r="10" fill="var(--accent)"/><text x="20" y="146" text-anchor="middle" fill="var(--bg)" font-size="11">2</text></g>
+<g><title>src/components/PromptEditor.tsx (modify, step 2)</title><rect x="20" y="242" width="180" height="60" rx="8" fill="var(--surface)" stroke="var(--modify)" stroke-width="2"/><text x="110" y="276" text-anchor="middle" fill="var(--text)" font-size="13">PromptEditor.tsx</text><circle cx="20" cy="242" r="10" fill="var(--accent)"/><text x="20" y="246" text-anchor="middle" fill="var(--bg)" font-size="11">2</text></g>
+<g><title>src/components/ScratchEditor.tsx (modify, step 2)</title><rect x="20" y="342" width="180" height="60" rx="8" fill="var(--surface)" stroke="var(--modify)" stroke-width="2"/><text x="110" y="376" text-anchor="middle" fill="var(--text)" font-size="13">ScratchEditor.tsx</text><circle cx="20" cy="342" r="10" fill="var(--accent)"/><text x="20" y="346" text-anchor="middle" fill="var(--bg)" font-size="11">2</text></g>
+<g><title>src/components/AiBar.tsx (modify, step 4)</title><rect x="20" y="442" width="180" height="60" rx="8" fill="var(--surface)" stroke="var(--modify)" stroke-width="2"/><text x="110" y="476" text-anchor="middle" fill="var(--text)" font-size="13">AiBar.tsx</text><circle cx="20" cy="442" r="10" fill="var(--accent)"/><text x="20" y="446" text-anchor="middle" fill="var(--bg)" font-size="11">4</text></g>
+<g><title>src/components/PromptsPage.tsx (modify, step 10)</title><rect x="240" y="42" width="180" height="60" rx="8" fill="var(--surface)" stroke="var(--modify)" stroke-width="2"/><text x="330" y="76" text-anchor="middle" fill="var(--text)" font-size="13">PromptsPage.tsx</text><circle cx="240" cy="42" r="10" fill="var(--accent)"/><text x="240" y="46" text-anchor="middle" fill="var(--bg)" font-size="11">10</text></g>
+<g><title>src/components/ScratchPage.tsx (modify, step 10)</title><rect x="240" y="142" width="180" height="60" rx="8" fill="var(--surface)" stroke="var(--modify)" stroke-width="2"/><text x="330" y="176" text-anchor="middle" fill="var(--text)" font-size="13">ScratchPage.tsx</text><circle cx="240" cy="142" r="10" fill="var(--accent)"/><text x="240" y="146" text-anchor="middle" fill="var(--bg)" font-size="11">10</text></g>
+<g><title>src/components/ItemList.tsx (modify, step 11)</title><rect x="240" y="242" width="180" height="60" rx="8" fill="var(--surface)" stroke="var(--modify)" stroke-width="2"/><text x="330" y="276" text-anchor="middle" fill="var(--text)" font-size="13">ItemList.tsx</text><circle cx="240" cy="242" r="10" fill="var(--accent)"/><text x="240" y="246" text-anchor="middle" fill="var(--bg)" font-size="11">11</text></g>
+<g><title>src/components/PromptList.tsx (modify, step 11)</title><rect x="240" y="342" width="180" height="60" rx="8" fill="var(--surface)" stroke="var(--modify)" stroke-width="2"/><text x="330" y="376" text-anchor="middle" fill="var(--text)" font-size="13">PromptList.tsx</text><circle cx="240" cy="342" r="10" fill="var(--accent)"/><text x="240" y="346" text-anchor="middle" fill="var(--bg)" font-size="11">11</text></g>
+<g><title>src/components/EditorTabs.tsx (modify, step 12)</title><rect x="240" y="442" width="180" height="60" rx="8" fill="var(--surface)" stroke="var(--modify)" stroke-width="2"/><text x="330" y="476" text-anchor="middle" fill="var(--text)" font-size="13">EditorTabs.tsx</text><circle cx="240" cy="442" r="10" fill="var(--accent)"/><text x="240" y="446" text-anchor="middle" fill="var(--bg)" font-size="11">12</text></g>
+<g><title>src/components/SelectionBackdrop.tsx (create, step 19)</title><rect x="460" y="42" width="180" height="60" rx="8" fill="var(--surface)" stroke="var(--create)" stroke-width="2" stroke-dasharray="4 2"/><text x="550" y="76" text-anchor="middle" fill="var(--text)" font-size="13">SelectionBackdrop.tsx</text><circle cx="460" cy="42" r="10" fill="var(--accent)"/><text x="460" y="46" text-anchor="middle" fill="var(--bg)" font-size="11">19</text></g>
+<g><title>src/components/PromptHistoryDialog.tsx (modify, step 32)</title><rect x="900" y="42" width="180" height="60" rx="8" fill="var(--surface)" stroke="var(--modify)" stroke-width="2"/><text x="990" y="76" text-anchor="middle" fill="var(--text)" font-size="13">PromptHistoryDialog.tsx</text><circle cx="900" cy="42" r="10" fill="var(--accent)"/><text x="900" y="46" text-anchor="middle" fill="var(--bg)" font-size="11">32</text></g>
+<g><title>src/lib/rework.ts, src/lib/rework.test.ts (create, step 3)</title><rect x="20" y="542" width="180" height="60" rx="8" fill="var(--surface)" stroke="var(--create)" stroke-width="2" stroke-dasharray="4 2"/><text x="110" y="576" text-anchor="middle" fill="var(--text)" font-size="13">rework.ts (+test)</text><circle cx="20" cy="542" r="10" fill="var(--accent)"/><text x="20" y="546" text-anchor="middle" fill="var(--bg)" font-size="11">3</text></g>
+<g><title>src/lib/api.ts (modify, step 7)</title><rect x="20" y="642" width="180" height="60" rx="8" fill="var(--surface)" stroke="var(--modify)" stroke-width="2"/><text x="110" y="676" text-anchor="middle" fill="var(--text)" font-size="13">api.ts</text><circle cx="20" cy="642" r="10" fill="var(--accent)"/><text x="20" y="646" text-anchor="middle" fill="var(--bg)" font-size="11">7</text></g>
+<g><title>src/lib/openTabs.ts, src/lib/openTabs.test.ts (modify, step 8)</title><rect x="240" y="542" width="180" height="60" rx="8" fill="var(--surface)" stroke="var(--modify)" stroke-width="2"/><text x="330" y="576" text-anchor="middle" fill="var(--text)" font-size="13">openTabs.ts (+test)</text><circle cx="240" cy="542" r="10" fill="var(--accent)"/><text x="240" y="546" text-anchor="middle" fill="var(--bg)" font-size="11">8</text></g>
+<g><title>src/lib/diff.ts, src/lib/diff.test.ts (create, step 14)</title><rect x="460" y="542" width="180" height="60" rx="8" fill="var(--surface)" stroke="var(--create)" stroke-width="2" stroke-dasharray="4 2"/><text x="550" y="576" text-anchor="middle" fill="var(--text)" font-size="13">diff.ts (+test)</text><circle cx="460" cy="542" r="10" fill="var(--accent)"/><text x="460" y="546" text-anchor="middle" fill="var(--bg)" font-size="11">14</text></g>
+<g><title>src/lib/reviewLayout.ts, src/lib/reviewLayout.test.ts (create, step 15)</title><rect x="460" y="642" width="180" height="60" rx="8" fill="var(--surface)" stroke="var(--create)" stroke-width="2" stroke-dasharray="4 2"/><text x="550" y="669" text-anchor="middle" fill="var(--text)" font-size="13"><tspan x="550" dy="0">reviewLayout.ts</tspan><tspan x="550" dy="15">(+test)</tspan></text><circle cx="460" cy="642" r="10" fill="var(--accent)"/><text x="460" y="646" text-anchor="middle" fill="var(--bg)" font-size="11">15</text></g>
+<g><title>src/lib/selection.ts, src/lib/selection.test.ts (modify, step 19)</title><rect x="460" y="742" width="180" height="60" rx="8" fill="var(--surface)" stroke="var(--modify)" stroke-width="2"/><text x="550" y="776" text-anchor="middle" fill="var(--text)" font-size="13">selection.ts (+test)</text><circle cx="460" cy="742" r="10" fill="var(--accent)"/><text x="460" y="746" text-anchor="middle" fill="var(--bg)" font-size="11">19</text></g>
+<g><title>src/styles.css (modify, step 5)</title><rect x="20" y="842" width="180" height="60" rx="8" fill="var(--surface)" stroke="var(--modify)" stroke-width="2"/><text x="110" y="876" text-anchor="middle" fill="var(--text)" font-size="13">styles.css</text><circle cx="20" cy="842" r="10" fill="var(--accent)"/><text x="20" y="846" text-anchor="middle" fill="var(--bg)" font-size="11">5</text></g>
+<g><title>src/App.tsx (modify, step 9)</title><rect x="240" y="842" width="180" height="60" rx="8" fill="var(--surface)" stroke="var(--modify)" stroke-width="2"/><text x="330" y="876" text-anchor="middle" fill="var(--text)" font-size="13">App.tsx</text><circle cx="240" cy="842" r="10" fill="var(--accent)"/><text x="240" y="846" text-anchor="middle" fill="var(--bg)" font-size="11">9</text></g>
+<g><title>src/types.ts (modify, step 30)</title><rect x="900" y="842" width="180" height="60" rx="8" fill="var(--surface)" stroke="var(--modify)" stroke-width="2"/><text x="990" y="876" text-anchor="middle" fill="var(--text)" font-size="13">types.ts</text><circle cx="900" cy="842" r="10" fill="var(--accent)"/><text x="900" y="846" text-anchor="middle" fill="var(--bg)" font-size="11">30</text></g>
+<g><title>src-tauri/migrations/0009_prompt_version_instruction.sql (create, step 22)</title><rect x="680" y="942" width="180" height="60" rx="8" fill="var(--surface)" stroke="var(--create)" stroke-width="2" stroke-dasharray="4 2"/><text x="770" y="969" text-anchor="middle" fill="var(--text)" font-size="13"><tspan x="770" dy="0">0009_prompt_version_</tspan><tspan x="770" dy="15">instruction.sql</tspan></text><circle cx="680" cy="942" r="10" fill="var(--accent)"/><text x="680" y="946" text-anchor="middle" fill="var(--bg)" font-size="11">22</text></g>
+<g><title>src-tauri/src/ (7 files: models.rs, ai/mod.rs, commands.rs, store/promptfile.rs, store/itemfile.rs, db/sqlite.rs, db/mod.rs) (modify, step 23)</title><rect x="680" y="1042" width="180" height="60" rx="8" fill="var(--surface)" stroke="var(--modify)" stroke-width="2"/><text x="770" y="1069" text-anchor="middle" fill="var(--text)" font-size="13"><tspan x="770" dy="0">src-tauri/src/ (7</tspan><tspan x="770" dy="15">files)</tspan></text><circle cx="680" cy="1042" r="10" fill="var(--accent)"/><text x="680" y="1046" text-anchor="middle" fill="var(--bg)" font-size="11">23</text></g>
+<g><title>src-tauri/tests/ (9 files: repo_prompts.rs, repo.rs, streaming.rs, project_manager.rs, on_disk_compat.rs, export_import.rs, drafts.rs; fixtures/v1_0_0/prompts/ffffffff-ffff-ffff-ffff-ffffffffffff/prompt.md and &lt;version-uuid&gt;.md) (modify, step 26)</title><rect x="680" y="1142" width="180" height="60" rx="8" fill="var(--surface)" stroke="var(--modify)" stroke-width="2"/><text x="770" y="1169" text-anchor="middle" fill="var(--text)" font-size="13"><tspan x="770" dy="0">src-tauri/tests/ (9</tspan><tspan x="770" dy="15">files)</tspan></text><circle cx="680" cy="1142" r="10" fill="var(--accent)"/><text x="680" y="1146" text-anchor="middle" fill="var(--bg)" font-size="11">26</text></g>
+<g><title>docs/DESIGN.md (modify, step 34)</title><rect x="900" y="1242" width="180" height="60" rx="8" fill="var(--surface)" stroke="var(--modify)" stroke-width="2"/><text x="990" y="1276" text-anchor="middle" fill="var(--text)" font-size="13">DESIGN.md</text><circle cx="900" cy="1242" r="10" fill="var(--accent)"/><text x="900" y="1246" text-anchor="middle" fill="var(--bg)" font-size="11">34</text></g>
+<g><title>CLAUDE.md (notes-app) (modify, step 34)</title><rect x="900" y="1342" width="180" height="60" rx="8" fill="var(--surface)" stroke="var(--modify)" stroke-width="2"/><text x="990" y="1376" text-anchor="middle" fill="var(--text)" font-size="13">CLAUDE.md</text><circle cx="900" cy="1342" r="10" fill="var(--accent)"/><text x="900" y="1346" text-anchor="middle" fill="var(--bg)" font-size="11">34</text></g>
+<g><title>plans/plan.17.smoke.html (create, step 35)</title><rect x="900" y="1442" width="180" height="60" rx="8" fill="var(--surface)" stroke="var(--create)" stroke-width="2" stroke-dasharray="4 2"/><text x="990" y="1476" text-anchor="middle" fill="var(--text)" font-size="13">plan.17.smoke.html</text><circle cx="900" cy="1442" r="10" fill="var(--accent)"/><text x="900" y="1446" text-anchor="middle" fill="var(--bg)" font-size="11">35</text></g>
+<path d="M20,172 L8,172 L8,72 L19,72" fill="none" stroke="var(--border)" stroke-width="1.5" marker-end="url(#a)"><title>src/components/Editor.tsx depends on src/components/ReviewCard.tsx (new)</title></path>
+<path d="M20,272 L8,272 L8,72 L19,72" fill="none" stroke="var(--border)" stroke-width="1.5" marker-end="url(#a)"><title>src/components/PromptEditor.tsx depends on src/components/ReviewCard.tsx (new)</title></path>
+<path d="M20,372 L8,372 L8,72 L19,72" fill="none" stroke="var(--border)" stroke-width="1.5" marker-end="url(#a)"><title>src/components/ScratchEditor.tsx depends on src/components/ReviewCard.tsx (new)</title></path>
+<path d="M200,172 L459,72" fill="none" stroke="var(--border)" stroke-width="1.5" marker-end="url(#a)"><title>src/components/Editor.tsx depends on src/components/SelectionBackdrop.tsx (new)</title></path>
+<path d="M200,272 L459,72" fill="none" stroke="var(--border)" stroke-width="1.5" marker-end="url(#a)"><title>src/components/PromptEditor.tsx depends on src/components/SelectionBackdrop.tsx (new)</title></path>
+<path d="M200,372 L459,72" fill="none" stroke="var(--border)" stroke-width="1.5" marker-end="url(#a)"><title>src/components/ScratchEditor.tsx depends on src/components/SelectionBackdrop.tsx (new)</title></path>
+<path d="M20,172 L8,172 L8,572 L19,572" fill="none" stroke="var(--border)" stroke-width="1.5" marker-end="url(#a)"><title>src/components/Editor.tsx depends on src/lib/rework.ts (new)</title></path>
+<path d="M20,272 L8,272 L8,572 L19,572" fill="none" stroke="var(--border)" stroke-width="1.5" marker-end="url(#a)"><title>src/components/PromptEditor.tsx depends on src/lib/rework.ts (new)</title></path>
+<path d="M20,372 L8,372 L8,572 L19,572" fill="none" stroke="var(--border)" stroke-width="1.5" marker-end="url(#a)"><title>src/components/ScratchEditor.tsx depends on src/lib/rework.ts (new)</title></path>
+<path d="M20,172 L8,172 L8,672 L19,672" fill="none" stroke="var(--border)" stroke-width="1.5" stroke-dasharray="6 4" marker-end="url(#a)"><title>src/components/Editor.tsx depends on src/lib/api.ts (existing)</title></path>
+<path d="M20,272 L8,272 L8,672 L19,672" fill="none" stroke="var(--border)" stroke-width="1.5" stroke-dasharray="6 4" marker-end="url(#a)"><title>src/components/PromptEditor.tsx depends on src/lib/api.ts (existing)</title></path>
+<path d="M20,372 L8,372 L8,672 L19,672" fill="none" stroke="var(--border)" stroke-width="1.5" stroke-dasharray="6 4" marker-end="url(#a)"><title>src/components/ScratchEditor.tsx depends on src/lib/api.ts (existing)</title></path>
+<path d="M200,72 L459,572" fill="none" stroke="var(--border)" stroke-width="1.5" marker-end="url(#a)"><title>src/components/ReviewCard.tsx depends on src/lib/diff.ts (new)</title></path>
+<path d="M200,72 L459,672" fill="none" stroke="var(--border)" stroke-width="1.5" marker-end="url(#a)"><title>src/components/ReviewCard.tsx depends on src/lib/reviewLayout.ts (new)</title></path>
+<path d="M460,72 L448,72 L448,772 L459,772" fill="none" stroke="var(--border)" stroke-width="1.5" marker-end="url(#a)"><title>src/components/SelectionBackdrop.tsx depends on src/lib/selection.ts (new)</title></path>
+<path d="M240,872 L228,872 L228,72 L239,72" fill="none" stroke="var(--border)" stroke-width="1.5" stroke-dasharray="6 4" marker-end="url(#a)"><title>src/App.tsx depends on src/components/PromptsPage.tsx (existing)</title></path>
+<path d="M240,872 L228,872 L228,172 L239,172" fill="none" stroke="var(--border)" stroke-width="1.5" stroke-dasharray="6 4" marker-end="url(#a)"><title>src/App.tsx depends on src/components/ScratchPage.tsx (existing)</title></path>
+<path d="M240,872 L228,872 L228,272 L239,272" fill="none" stroke="var(--border)" stroke-width="1.5" stroke-dasharray="6 4" marker-end="url(#a)"><title>src/App.tsx depends on src/components/ItemList.tsx (existing)</title></path>
+<path d="M240,72 L228,72 L228,372 L239,372" fill="none" stroke="var(--border)" stroke-width="1.5" stroke-dasharray="6 4" marker-end="url(#a)"><title>src/components/PromptsPage.tsx depends on src/components/PromptList.tsx (existing)</title></path>
+<path d="M240,872 L228,872 L228,572 L239,572" fill="none" stroke="var(--border)" stroke-width="1.5" stroke-dasharray="6 4" marker-end="url(#a)"><title>src/App.tsx depends on src/lib/openTabs.ts (existing)</title></path>
+<path d="M240,72 L228,72 L228,572 L239,572" fill="none" stroke="var(--border)" stroke-width="1.5" stroke-dasharray="6 4" marker-end="url(#a)"><title>src/components/PromptsPage.tsx depends on src/lib/openTabs.ts (existing)</title></path>
+<path d="M240,172 L228,172 L228,572 L239,572" fill="none" stroke="var(--border)" stroke-width="1.5" stroke-dasharray="6 4" marker-end="url(#a)"><title>src/components/ScratchPage.tsx depends on src/lib/openTabs.ts (existing)</title></path>
+<path d="M900,72 L888,72 L888,872 L899,872" fill="none" stroke="var(--border)" stroke-width="1.5" stroke-dasharray="6 4" marker-end="url(#a)"><title>src/components/PromptHistoryDialog.tsx depends on src/types.ts (existing)</title></path>
+<path d="M680,1072 L668,1072 L668,972 L679,972" fill="none" stroke="var(--border)" stroke-width="1.5" marker-end="url(#a)"><title>src-tauri/src/ (7 files: models.rs depends on src-tauri/migrations/0009_prompt_version_instruction.sql (new)</title></path>
+<path d="M900,872 L861,1072" fill="none" stroke="var(--border)" stroke-width="1.5" stroke-dasharray="6 4" marker-end="url(#a)"><title>src/types.ts depends on src-tauri/src/ (7 files: models.rs (existing)</title></path>
+<path d="M680,1172 L668,1172 L668,1072 L679,1072" fill="none" stroke="var(--border)" stroke-width="1.5" stroke-dasharray="6 4" marker-end="url(#a)"><title>src-tauri/tests/ (9 files: repo_prompts.rs depends on src-tauri/src/ (7 files: models.rs (existing)</title></path>
+</svg>
+<figcaption class="legend">Dashed border = create; solid border = modify; arrow = dependency, pointing at the file depended on (solid new, dashed existing); numbered circle = first implementation step touching the file; column 1 = Phases 0-1 / column 2 = Phase 2 / column 3 = Phases 3-4 / column 4 = Phase 5 / column 5 = Phases 6-7. Collapsed boxes list their files in the table below.</figcaption>
+</figure>
+<table><caption>Files in this plan (first step that touches each)</caption><tr><th>Path</th><th>Action</th><th>Step</th></tr>
+<tr><td>src/components/ReviewCard.tsx</td><td>create</td><td>1</td></tr>
+<tr><td>src/components/Editor.tsx</td><td>modify</td><td>2</td></tr>
+<tr><td>src/components/PromptEditor.tsx</td><td>modify</td><td>2</td></tr>
+<tr><td>src/components/ScratchEditor.tsx</td><td>modify</td><td>2</td></tr>
+<tr><td>src/components/AiBar.tsx</td><td>modify</td><td>4</td></tr>
+<tr><td>src/components/PromptsPage.tsx</td><td>modify</td><td>10</td></tr>
+<tr><td>src/components/ScratchPage.tsx</td><td>modify</td><td>10</td></tr>
+<tr><td>src/components/ItemList.tsx</td><td>modify</td><td>11</td></tr>
+<tr><td>src/components/PromptList.tsx</td><td>modify</td><td>11</td></tr>
+<tr><td>src/components/EditorTabs.tsx</td><td>modify</td><td>12</td></tr>
+<tr><td>src/components/SelectionBackdrop.tsx</td><td>create</td><td>19</td></tr>
+<tr><td>src/components/PromptHistoryDialog.tsx</td><td>modify</td><td>32</td></tr>
+<tr><td>src/lib/rework.ts</td><td>create</td><td>3</td></tr>
+<tr><td>src/lib/rework.test.ts</td><td>create</td><td>3</td></tr>
+<tr><td>src/lib/api.ts</td><td>modify</td><td>7</td></tr>
+<tr><td>src/lib/openTabs.ts</td><td>modify</td><td>8</td></tr>
+<tr><td>src/lib/openTabs.test.ts</td><td>modify</td><td>8</td></tr>
+<tr><td>src/lib/diff.ts</td><td>create</td><td>14</td></tr>
+<tr><td>src/lib/diff.test.ts</td><td>create</td><td>14</td></tr>
+<tr><td>src/lib/reviewLayout.ts</td><td>create</td><td>15</td></tr>
+<tr><td>src/lib/reviewLayout.test.ts</td><td>create</td><td>15</td></tr>
+<tr><td>src/lib/selection.ts</td><td>modify</td><td>19</td></tr>
+<tr><td>src/lib/selection.test.ts</td><td>modify</td><td>19</td></tr>
+<tr><td>src/styles.css</td><td>modify</td><td>5</td></tr>
+<tr><td>src/App.tsx</td><td>modify</td><td>9</td></tr>
+<tr><td>src/types.ts</td><td>modify</td><td>30</td></tr>
+<tr><td>src-tauri/migrations/0009_prompt_version_instruction.sql</td><td>create</td><td>22</td></tr>
+<tr><td>src-tauri/src/models.rs</td><td>modify</td><td>23</td></tr>
+<tr><td>src-tauri/src/store/promptfile.rs</td><td>modify</td><td>24</td></tr>
+<tr><td>src-tauri/src/db/sqlite.rs</td><td>modify</td><td>25</td></tr>
+<tr><td>src-tauri/src/db/mod.rs</td><td>modify</td><td>25</td></tr>
+<tr><td>src-tauri/src/store/itemfile.rs</td><td>modify</td><td>26</td></tr>
+<tr><td>src-tauri/src/ai/mod.rs</td><td>modify</td><td>27</td></tr>
+<tr><td>src-tauri/src/commands.rs</td><td>modify</td><td>27</td></tr>
+<tr><td>src-tauri/tests/repo_prompts.rs</td><td>modify</td><td>26</td></tr>
+<tr><td>src-tauri/tests/repo.rs</td><td>modify</td><td>26</td></tr>
+<tr><td>src-tauri/tests/streaming.rs</td><td>modify</td><td>27</td></tr>
+<tr><td>src-tauri/tests/project_manager.rs</td><td>modify</td><td>28</td></tr>
+<tr><td>src-tauri/tests/on_disk_compat.rs</td><td>modify</td><td>28</td></tr>
+<tr><td>src-tauri/tests/export_import.rs</td><td>modify</td><td>28</td></tr>
+<tr><td>src-tauri/tests/drafts.rs</td><td>modify</td><td>28</td></tr>
+<tr><td>src-tauri/tests/fixtures/v1_0_0/prompts/ffffffff-ffff-ffff-ffff-ffffffffffff/prompt.md</td><td>create</td><td>28</td></tr>
+<tr><td>src-tauri/tests/fixtures/v1_0_0/prompts/ffffffff-ffff-ffff-ffff-ffffffffffff/&lt;version-uuid&gt;.md</td><td>create</td><td>28</td></tr>
+<tr><td>docs/DESIGN.md</td><td>modify</td><td>34</td></tr>
+<tr><td>CLAUDE.md (notes-app)</td><td>modify</td><td>34</td></tr>
+<tr><td>plans/plan.17.smoke.html</td><td>create</td><td>35</td></tr>
+</table>
+</body></html>

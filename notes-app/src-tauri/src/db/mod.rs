@@ -88,8 +88,10 @@ pub trait PromptRepository: Send + Sync {
     /// Import a prompt with its FULL version history VERBATIM (plan.8 move).
     /// Unlike `create` (which mints fresh ids and a single first version), this
     /// preserves the prompt `id`/`reusable`/`created_at`/`schema_version` and EACH
-    /// version's `id`/`title`/`body`/`source`/`created_at` (the user chose an
-    /// id-preserving move — byte-identical history). `prompt_schema_version` is the
+    /// version's `id`/`title`/`body`/`source`/`created_at`/`instruction` (the user
+    /// chose an id-preserving move — byte-identical history). A build older than
+    /// plan.17 has no `instruction` field, so a move done by one drops that value
+    /// (value loss, never version loss). `prompt_schema_version` is the
     /// SOURCE head's marker, carried across so a cross-store move never re-stamps
     /// it to the current constant (plan.10 Step 6a). Writes `prompt.md` + one
     /// immutable version file per version into this store, then inserts the index

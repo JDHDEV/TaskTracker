@@ -303,10 +303,28 @@ pub(crate) fn read_capped(path: &Path) -> std::io::Result<Option<String>> {
 /// not guarantee durability across an OS crash / power loss — acceptable for a
 /// local notes store whose index is rebuilt from these files on the next load.
 pub fn write_item(items_dir: &Path, item: &Item) -> Result<(), ItemFileError> {
-    let name = file_name(&item.id)?;
+    write_serialized(items_dir, &item.id, &serialize(item))
+}
+
+/// The repository's write (plan.17 SEC-1): refuses a file the next scan would
+/// skip, checked BEFORE the temp file so an over-cap save leaves nothing on
+/// disk. Only `create`/`update`/`convert_note_to_task` use this. The Stage-1 →
+/// Stage-2 conversion (`migrate_db_to_files`) deliberately keeps the uncapped
+/// `write_item`: the cap is an untrusted-clone DoS guard, not a limit on the
+/// user's own migrated notes — refusing there would lock an old project out,
+/// which the on-disk compatibility rule forbids.
+pub fn write_item_capped(items_dir: &Path, item: &Item) -> Result<(), ItemFileError> {
+    let bytes = serialize(item);
+    if bytes.len() as u64 > MAX_ITEM_FILE_BYTES {
+        return Err(ItemFileError::TooLarge);
+    }
+    write_serialized(items_dir, &item.id, &bytes)
+}
+
+fn write_serialized(items_dir: &Path, id: &str, bytes: &str) -> Result<(), ItemFileError> {
+    let name = file_name(id)?;
     let target = items_dir.join(&name);
     let tmp = items_dir.join(format!(".{name}.tmp"));
-    let bytes = serialize(item);
     std::fs::write(&tmp, bytes.as_bytes())
         .map_err(|e| ItemFileError::Malformed(format!("write failed: {}", e.kind())))?;
     std::fs::rename(&tmp, &target)

@@ -9,11 +9,12 @@
 //! the default-impl delegation, and the `RewriteEvent` wire shape); the
 //! no-write-until-Replace behavior is covered by manual smoke only.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
-use notes_app_lib::ai::{AiProvider, ChunkSink, RewriteErrorCode, RewriteEvent};
-use notes_app_lib::error::Result;
+use notes_app_lib::ai::{validate_instruction, AiProvider, ChunkSink, RewriteErrorCode, RewriteEvent};
+use notes_app_lib::error::{AppError, Result};
+use notes_app_lib::models::MAX_INSTRUCTION_BYTES;
 
 /// Collects emitted chunks and can be told to report cancelled.
 struct MockSink {
@@ -326,4 +327,105 @@ async fn markup_in_a_delta_is_accumulated_verbatim_unsanitized() {
         sink.collected()
     );
     assert_eq!(result, format!("before {markup} after"));
+}
+
+// --- (f) R-1: the instruction cap is enforced before any provider call -----
+
+/// Counts how many times `rewrite`/`rewrite_stream` were invoked — proves the
+/// guard short-circuits before any provider call, not merely that it returns
+/// `Err` (the Tauri commands themselves cannot be exercised outside a running
+/// app, so this is the closest a test gets to the real call site).
+struct CountingProvider {
+    rewrite_calls: AtomicUsize,
+    rewrite_stream_calls: AtomicUsize,
+}
+
+impl CountingProvider {
+    fn new() -> Self {
+        Self { rewrite_calls: AtomicUsize::new(0), rewrite_stream_calls: AtomicUsize::new(0) }
+    }
+}
+
+#[async_trait::async_trait]
+impl AiProvider for CountingProvider {
+    fn id(&self) -> &'static str {
+        "counting"
+    }
+
+    async fn rewrite(&self, _http: &reqwest::Client, text: &str, _instruction: &str) -> Result<String> {
+        self.rewrite_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(text.to_string())
+    }
+
+    async fn rewrite_stream(
+        &self,
+        _http: &reqwest::Client,
+        text: &str,
+        _instruction: &str,
+        sink: &dyn ChunkSink,
+    ) -> Result<String> {
+        self.rewrite_stream_calls.fetch_add(1, Ordering::SeqCst);
+        sink.send_chunk(text);
+        Ok(text.to_string())
+    }
+}
+
+/// Mirrors what `ai_rewrite_stream` does in `commands.rs`: validate the
+/// instruction FIRST, and only call the provider if that passes. A local
+/// helper because the Tauri command itself can't be exercised outside a
+/// running app — this is the pure guard both commands wrap around the
+/// provider call.
+async fn guarded_stream(
+    provider: &dyn AiProvider,
+    http: &reqwest::Client,
+    text: &str,
+    instruction: &str,
+    sink: &dyn ChunkSink,
+) -> Result<String> {
+    validate_instruction(instruction)?; // cap first: nothing else has run yet
+    provider.rewrite_stream(http, text, instruction, sink).await
+}
+
+#[tokio::test]
+async fn oversized_instruction_is_rejected_by_the_validator_before_any_provider_call() {
+    let provider = CountingProvider::new();
+    let sink = MockSink::new();
+    let over = "x".repeat(MAX_INSTRUCTION_BYTES + 1);
+
+    let err = guarded_stream(&provider, &http_client(), "body", &over, &sink).await.unwrap_err();
+    match err {
+        AppError::Invalid(msg) => assert_eq!(msg, "that instruction is too long"),
+        other => panic!("expected Invalid, got {other:?}"),
+    }
+    assert_eq!(provider.rewrite_calls.load(Ordering::SeqCst), 0, "rewrite must never be called");
+    assert_eq!(
+        provider.rewrite_stream_calls.load(Ordering::SeqCst),
+        0,
+        "the guard must short-circuit before any provider call"
+    );
+
+    // Exactly at the cap passes through and the provider is called once.
+    let at_cap = "x".repeat(MAX_INSTRUCTION_BYTES);
+    let result = guarded_stream(&provider, &http_client(), "body", &at_cap, &sink).await.unwrap();
+    assert_eq!(result, "body");
+    assert_eq!(provider.rewrite_stream_calls.load(Ordering::SeqCst), 1);
+}
+
+/// RED companion: calling the provider WITHOUT the validator records one call
+/// even for an oversized instruction — documents exactly what the guard in
+/// `guarded_stream` (and, in the real app, both AI rewrite commands) prevents.
+#[tokio::test]
+async fn without_the_guard_the_provider_is_called_even_for_an_oversized_instruction() {
+    let provider = CountingProvider::new();
+    let sink = MockSink::new();
+    let over = "x".repeat(MAX_INSTRUCTION_BYTES + 1);
+
+    let result = provider.rewrite_stream(&http_client(), "body", &over, &sink).await.unwrap();
+
+    assert_eq!(result, "body");
+    assert_eq!(
+        provider.rewrite_stream_calls.load(Ordering::SeqCst),
+        1,
+        "without the guard the provider runs regardless of instruction size"
+    );
 }

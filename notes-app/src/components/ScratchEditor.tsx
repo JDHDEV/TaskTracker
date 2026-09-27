@@ -7,7 +7,7 @@ import {
   useState,
 } from "react";
 import type { Draft, ProviderId } from "../types";
-import { aiRewriteStream, onContextMenuAction } from "../lib/api";
+import { aiRewriteStream, confirmDialog, onContextMenuAction } from "../lib/api";
 import {
   sendDestinationOf,
   type ContextMenuAction,
@@ -18,6 +18,7 @@ import { buildScratchDraft, contentHash } from "../lib/drafts";
 import { useDraftBackup } from "../hooks/useDraftBackup";
 import { reportAiError } from "../lib/aiErrors";
 import { handleLineClipboardKeyDown, handleLinePaste } from "../lib/lineEdit";
+import { selectionConfirmMessage, shouldClearInstruction } from "../lib/rework";
 import { tabDomId, tabPanelDomId } from "../lib/openTabs";
 import {
   captureSelection,
@@ -27,6 +28,8 @@ import {
   type SelectionRange,
 } from "../lib/selection";
 import AiBar from "./AiBar";
+import ReviewCard from "./ReviewCard";
+import SelectionBackdrop from "./SelectionBackdrop";
 
 /** One project's scratch pad: the owning project and the pad text as last
  *  read from / saved to its `scratch.md`. */
@@ -129,6 +132,24 @@ const ScratchEditor = forwardRef<ScratchEditorHandle, Props>(function ScratchEdi
   const [selectionRework, setSelectionRework] = useState<CapturedSelection | null>(null);
   const pendingCaretRef = useRef<SelectionRange | null>(null);
 
+  // Plan 17 (D2–D5) — the Editor.tsx wiring: controlled instruction (+ live
+  // ref mirror), the request-time capture `reworkRequest`, and the
+  // selection-confirm range + guard (kept apart from `selectionRework` so an
+  // open card is never disturbed by a cancelled confirm — see Editor.tsx).
+  const [instruction, setInstruction] = useState("");
+  const instructionRef = useRef(instruction);
+  useEffect(() => {
+    instructionRef.current = instruction;
+  }, [instruction]);
+  const [reworkRequest, setReworkRequest] = useState<{
+    original: string;
+    instruction: string;
+  } | null>(null);
+  const [confirmingSel, setConfirmingSel] = useState<CapturedSelection | null>(null);
+  const confirmingRef = useRef(false);
+  // The selection-highlight mirror (Phase 4), scroll-synced from the textarea.
+  const hlRef = useRef<HTMLDivElement>(null);
+
   function trackSelection() {
     const ta = bodyRef.current;
     if (!ta) return;
@@ -136,6 +157,10 @@ const ScratchEditor = forwardRef<ScratchEditorHandle, Props>(function ScratchEdi
     selRef.current = start === end ? null : { start, end };
     const len = captureSelection(selRef.current, body)?.text.length ?? 0;
     if (len !== selectionLength) setSelectionLength(len);
+  }
+
+  function syncHighlightScroll() {
+    if (hlRef.current && bodyRef.current) hlRef.current.scrollTop = bodyRef.current.scrollTop;
   }
 
   function clearSelection() {
@@ -236,6 +261,10 @@ const ScratchEditor = forwardRef<ScratchEditorHandle, Props>(function ScratchEdi
     selRef.current = null;
     setSelectionLength(0);
     pendingCaretRef.current = null;
+    setInstruction("");
+    setReworkRequest(null);
+    setConfirmingSel(null);
+    confirmingRef.current = false;
     return () => {
       stopRef.current?.();
       stopRef.current = null;
@@ -278,18 +307,49 @@ const ScratchEditor = forwardRef<ScratchEditorHandle, Props>(function ScratchEdi
   });
 
   async function rework(instruction: string, provider: ProviderId) {
-    void draftBackup.flushNow(); // plan.15 D6: snapshot before an AI entry point
     const sel = captureSelection(selRef.current, body);
     const text = sel ? sel.text : body;
     if (!text.trim()) {
       onError("There is no text to rework yet.", { key: "scratch-no-text" });
       return;
     }
+    // Plan 17 D5: confirm a SELECTION rework before the draft flush and any
+    // IPC (Cancel changes nothing); highlight behind the dialog; re-check the
+    // range after OK; reset the guard on every exit path (see Editor.tsx).
+    if (sel) {
+      if (confirmingRef.current) return;
+      confirmingRef.current = true;
+      setConfirmingSel(sel);
+      try {
+        const msg = selectionConfirmMessage(sel.text.length, instruction);
+        const ok = await confirmDialog(msg.message, {
+          okLabel: msg.okLabel,
+          cancelLabel: msg.cancelLabel,
+          kind: "info",
+        });
+        if (!ok) return;
+        if (isSelectionStale(bodyRef.current?.value ?? body, sel)) {
+          onError("The selected text changed — select it again.", {
+            key: "scratch-selection-changed",
+          });
+          return;
+        }
+      } catch (err) {
+        onError(String(err));
+        return;
+      } finally {
+        confirmingRef.current = false;
+        setConfirmingSel(null);
+      }
+    }
+    void draftBackup.flushNow(); // plan.15 D6: snapshot before an AI entry point
     stopRef.current?.();
     setAiBusy(true);
     setStreaming(true);
     setProposal("");
     setSelectionRework(sel);
+    // Plan 17 D4: the request-time original + the instruction that was sent.
+    setReworkRequest({ original: text, instruction });
 
     let cancelled = false;
     const requestId = crypto.randomUUID();
@@ -313,6 +373,9 @@ const ScratchEditor = forwardRef<ScratchEditorHandle, Props>(function ScratchEdi
     } catch (err) {
       if (cancelled) return;
       setProposal(null);
+      // Plan 17 step 6: a failed stream leaves no selection mode behind.
+      setSelectionRework(null);
+      setReworkRequest(null);
       await reportAiError(provider, err, onError); // keyed when no key stored (F5)
     } finally {
       if (!cancelled) {
@@ -328,6 +391,7 @@ const ScratchEditor = forwardRef<ScratchEditorHandle, Props>(function ScratchEdi
     stopRef.current = null;
     setProposal(null);
     setSelectionRework(null);
+    setReworkRequest(null); // the instruction stays in the box (D3)
     setStreaming(false);
     setAiBusy(false);
   }
@@ -340,6 +404,13 @@ const ScratchEditor = forwardRef<ScratchEditorHandle, Props>(function ScratchEdi
   }
 
   const stale = selectionRework !== null && isSelectionStale(body, selectionRework);
+  // Plan 17 D6 / R-6: the highlight mirror shows only while the range is valid
+  // and a selection rework is confirming or pending (see Editor.tsx).
+  const highlightSel = confirmingSel ?? (proposal !== null ? selectionRework : null);
+  const showHighlight = highlightSel !== null && !isSelectionStale(body, highlightSel);
+  useLayoutEffect(() => {
+    if (showHighlight) syncHighlightScroll();
+  }, [showHighlight]);
 
   return (
     <section
@@ -355,6 +426,8 @@ const ScratchEditor = forwardRef<ScratchEditorHandle, Props>(function ScratchEdi
         dirty={dirty}
         generatingTitle={false}
         saveBlocked={false}
+        instruction={instruction}
+        onInstructionChange={setInstruction}
         onRework={(i, p) => void rework(i, p)}
         onSave={() => void save()}
         selectionLength={selectionLength}
@@ -362,89 +435,98 @@ const ScratchEditor = forwardRef<ScratchEditorHandle, Props>(function ScratchEdi
       />
 
       {proposal !== null && (
-        <div
-          className="review"
-          role="region"
-          aria-label={selectionRework ? "AI selection rewrite proposal" : "AI rewrite proposal"}
-        >
-          <div className="review-head">
-            <span className="review-mark">
-              {streaming
-                ? "Streaming…"
-                : selectionRework
-                  ? "Proposed rewrite (selection)"
-                  : "Proposed rewrite"}
-            </span>
-            <button
-              className="btn"
-              disabled={streaming || saving || stale}
-              title={stale ? "The selected text changed — discard and rework again." : undefined}
-              onClick={async () => {
-                // The ONLY splice site (§4 H4): into the captured range or not at all.
-                const next = selectionRework
-                  ? spliceProposal(body, selectionRework, proposal)
-                  : { ok: true as const, body: proposal, caret: null };
-                if (!next.ok) return;
-                edit(next.body);
-                pendingCaretRef.current = next.caret;
-                const ok = await save({ body: next.body });
-                if (ok) {
-                  setProposal(null);
-                  setSelectionRework(null);
-                }
-              }}
-            >
-              Replace text
-            </button>
-            <button className="btn btn-quiet" onClick={discardProposal}>
-              Discard
-            </button>
-          </div>
-          <pre className="review-body">{proposal}</pre>
-          <span className="sr-only" role="status" aria-live="polite">
-            {streaming
+        <ReviewCard
+          ariaLabel={selectionRework ? "AI selection rewrite proposal" : "AI rewrite proposal"}
+          chipLabel={
+            streaming
+              ? "Streaming…"
+              : selectionRework
+                ? "Proposed rewrite (selection)"
+                : "Proposed rewrite"
+          }
+          proposal={proposal}
+          streaming={streaming}
+          original={reworkRequest?.original ?? null}
+          editedSinceRequest={
+            selectionRework === null && reworkRequest !== null && body !== reworkRequest.original
+          }
+          replaceDisabled={streaming || saving || stale}
+          replaceTitle={stale ? "The selected text changed — discard and rework again." : undefined}
+          onReplaceText={async () => {
+            // The ONLY splice site (§4 H4): into the captured range or not at all.
+            const next = selectionRework
+              ? spliceProposal(body, selectionRework, proposal)
+              : { ok: true as const, body: proposal, caret: null };
+            if (!next.ok) return;
+            edit(next.body);
+            pendingCaretRef.current = next.caret;
+            const ok = await save({ body: next.body });
+            if (ok) {
+              setProposal(null);
+              setSelectionRework(null);
+              // D3: empty the box only while it still holds the sent
+              // instruction (read live — the closure predates the save).
+              if (
+                reworkRequest &&
+                shouldClearInstruction(instructionRef.current, reworkRequest.instruction)
+              ) {
+                setInstruction("");
+              }
+              setReworkRequest(null);
+            }
+          }}
+          onDiscard={discardProposal}
+          statusMessage={
+            streaming
               ? "Streaming rewrite"
               : selectionRework
                 ? "Selection rewrite ready"
-                : "Rewrite ready"}
-          </span>
-        </div>
+                : "Rewrite ready"
+          }
+        />
       )}
 
-      <textarea
-        className="body"
-        ref={bodyRef}
-        value={body}
-        // Plan.16 D4: the pad surface — "Insert timestamp" plus, on a
-        // non-empty selection, the three send-to items, all on the native menu.
-        data-menu-surface="scratch"
-        placeholder="Scratch space for this project. Select text and right-click to send it somewhere."
-        onChange={(e) => {
-          edit(e.target.value);
-          clearSelection(); // a manual edit invalidates the tracked offsets
-        }}
-        onSelect={trackSelection}
-        onKeyUp={trackSelection}
-        onMouseUp={trackSelection}
-        // Plan.15 D6: leaving the field is a natural checkpoint — flush now.
-        onBlur={() => void draftBackup.flushNow()}
-        // F6 (D9): whole-line Ctrl+X/C/V on a collapsed selection — keyboard
-        // only. Right-click is WebView2's own menu, which carries the app's
-        // items ("Insert timestamp", the send-to entries) injected from Rust
-        // (plan.16); the app draws no menu of its own.
-        onKeyDown={(e) => {
-          if (bodyRef.current) handleLineClipboardKeyDown(e, bodyRef.current);
-        }}
-        onPaste={(e) => {
-          const ta = bodyRef.current;
-          if (!ta) return;
-          handleLinePaste(e, ta, (nextBody, caret) => {
-            edit(nextBody);
-            clearSelection();
-            pendingCaretRef.current = { start: caret, end: caret };
-          });
-        }}
-      />
+      {/* Permanent wrapper (plan 17 D6) — see Editor.tsx. */}
+      <div className="body-wrap">
+        {showHighlight && (
+          <SelectionBackdrop body={body} sel={highlightSel} hlRef={hlRef} />
+        )}
+        <textarea
+          className={showHighlight ? "body body-transparent" : "body"}
+          ref={bodyRef}
+          value={body}
+          // Plan.16 D4: the pad surface — "Insert timestamp" plus, on a
+          // non-empty selection, the three send-to items, all on the native menu.
+          data-menu-surface="scratch"
+          placeholder="Scratch space for this project. Select text and right-click to send it somewhere."
+          onChange={(e) => {
+            edit(e.target.value);
+            clearSelection(); // a manual edit invalidates the tracked offsets
+          }}
+          onSelect={trackSelection}
+          onKeyUp={trackSelection}
+          onMouseUp={trackSelection}
+          onScroll={syncHighlightScroll}
+          // Plan.15 D6: leaving the field is a natural checkpoint — flush now.
+          onBlur={() => void draftBackup.flushNow()}
+          // F6 (D9): whole-line Ctrl+X/C/V on a collapsed selection — keyboard
+          // only. Right-click is WebView2's own menu, which carries the app's
+          // items ("Insert timestamp", the send-to entries) injected from Rust
+          // (plan.16); the app draws no menu of its own.
+          onKeyDown={(e) => {
+            if (bodyRef.current) handleLineClipboardKeyDown(e, bodyRef.current);
+          }}
+          onPaste={(e) => {
+            const ta = bodyRef.current;
+            if (!ta) return;
+            handleLinePaste(e, ta, (nextBody, caret) => {
+              edit(nextBody);
+              clearSelection();
+              pendingCaretRef.current = { start: caret, end: caret };
+            });
+          }}
+        />
+      </div>
     </section>
   );
 });

@@ -6,7 +6,7 @@
 //! prompts/
 //!   <prompt-uuid>/
 //!     prompt.md            mutable prompt-level state: id, reusable, created_at
-//!     <version-uuid>.md    immutable version: id, source, created_at, title + body
+//!     <version-uuid>.md    immutable version: id, source, created_at, title [+ instruction] + body
 //!     <version-uuid>.md    (another immutable version)
 //! ```
 //!
@@ -35,7 +35,12 @@
 //! branches each adding a version produce two disjoint files that git merges
 //! cleanly with both preserved. "Current version" is DERIVED (head of
 //! `ORDER BY created_at DESC, id ASC`), never a stored pointer, so nothing
-//! mutable conflicts on merge.
+//! mutable conflicts on merge. An accepted AI rewrite additionally carries the
+//! instruction that produced it as an OPTIONAL quoted `instruction:` scalar
+//! after `title` (plan.17 1b) — written only when present, so a version without
+//! one re-exports byte-identically to the pre-feature layout, and read via
+//! `normalize_instruction` (absent, blank, malformed, or on a manual version →
+//! `None`; a malformed value is a per-file warning, never a skipped version).
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -72,6 +77,11 @@ pub struct PromptVersionRecord {
     /// hand-edited/merged file with a garbage source can never poison the index.
     pub source: String,
     pub created_at: String,
+    /// The AI instruction behind an accepted rewrite (plan.17 1b). Meaningful
+    /// only when `source` is `"aiEnhanced"` and non-blank — `serialize_version`
+    /// and `parse_version` both route it through `normalize_instruction`, so a
+    /// value that fails that gate is never written and never read.
+    pub instruction: Option<String>,
 }
 
 /// Why a single prompt/version file could not be parsed. Carried out of `scan`
@@ -111,10 +121,13 @@ pub struct ScannedPrompt {
 
 /// The result of a two-level `prompts/` scan: every prompt that yielded at least
 /// one version, plus a `(name, reason)` per entry that was skipped — so a rebuild
-/// imports the good and reports the bad instead of aborting.
+/// imports the good and reports the bad instead of aborting. `warnings` are
+/// degradations, not skips (mirroring `itemfile::ScanOutcome`): the version
+/// imported, but an optional value was read as absent — surfaced, not silent.
 pub struct PromptScanOutcome {
     pub prompts: Vec<ScannedPrompt>,
     pub errors: Vec<(String, PromptFileError)>,
+    pub warnings: Vec<String>,
 }
 
 /// The canonical directory name for a prompt: `<id>`, UUID-only. Both derives
@@ -149,6 +162,21 @@ fn normalize_source(raw: &str) -> String {
     }
 }
 
+/// The single gate for a version's `instruction` (plan.17 D10): `Some` only when
+/// `source` is the exact `"aiEnhanced"` marker AND the value is non-blank; the
+/// kept value is VERBATIM (untrimmed — the user's text, not a normalized form).
+/// A manual version never carries one, and blank collapses to `None` so "no
+/// instruction" has exactly one on-disk form (no line). Used at serialize,
+/// parse, create, update and import, so the files and the index always agree.
+/// No length cap here — that is `ai::validate_instruction`, applied only where
+/// new input enters (create/update), never to a value already on disk.
+pub(crate) fn normalize_instruction(source: &str, raw: Option<&str>) -> Option<String> {
+    match raw {
+        Some(s) if source == "aiEnhanced" && !s.trim().is_empty() => Some(s.to_string()),
+        _ => None,
+    }
+}
+
 // --- Serialize --------------------------------------------------------------
 
 /// Serialize a prompt head to its canonical `prompt.md` bytes. Pure and
@@ -169,13 +197,23 @@ pub fn serialize_prompt(p: &PromptRecord) -> String {
 /// Serialize a version to its canonical `<id>.md` bytes. Fixed key order; the
 /// body follows the closing fence verbatim (raw text, recovered byte-for-byte).
 /// `prompt_id` is deliberately NOT written (derived from the parent dir on scan).
+/// The optional `instruction:` line comes AFTER `title` and ONLY when
+/// `normalize_instruction` keeps it, so a version without one is byte-identical
+/// to the pre-plan.17 layout (existing files and goldens never change).
 pub fn serialize_version(v: &PromptVersionRecord) -> String {
     let mut out = String::new();
     out.push_str("---\n");
+    let source = normalize_source(&v.source);
     line(&mut out, "id", &v.id);
-    line(&mut out, "source", &normalize_source(&v.source));
+    line(&mut out, "source", &source);
     line(&mut out, "created_at", &v.created_at);
     quoted_line(&mut out, "title", &v.title);
+    // Always via `quoted_line`: the value is free text that may hold newlines,
+    // a `---` fence, a `key: value` line, or a conflict marker — `quote` keeps
+    // it on one physical line so none of those can ever start a line (R-2).
+    if let Some(instruction) = normalize_instruction(&source, v.instruction.as_deref()) {
+        quoted_line(&mut out, "instruction", &instruction);
+    }
     out.push_str("---\n");
     out.push_str(&v.body);
     out
@@ -211,7 +249,20 @@ pub fn parse_prompt(text: &str) -> Result<PromptRecord, PromptFileError> {
 /// `prompt_id` supplied by the caller (the parent directory name — never read
 /// from the file). `id` must be a UUID; `source` is normalized; `title` is
 /// required; the body is everything after the closing fence, verbatim.
+/// Discards the degradation warnings of `parse_version_with_warnings`.
 pub fn parse_version(text: &str, prompt_id: &str) -> Result<PromptVersionRecord, PromptFileError> {
+    parse_version_with_warnings(text, prompt_id).map(|(record, _warnings)| record)
+}
+
+/// `parse_version` plus the per-file degradation warnings (plan.17 R-3): a
+/// present-but-unreadable `instruction:` value (unquoted, unterminated, a
+/// dangling escape) reads as `None` and is REPORTED here — never an `Err`, so a
+/// hand-edited or badly merged line can never drop the whole version the way a
+/// bad `title` does. Warning text is fixed and never echoes file content (R-14).
+pub fn parse_version_with_warnings(
+    text: &str,
+    prompt_id: &str,
+) -> Result<(PromptVersionRecord, Vec<String>), PromptFileError> {
     if has_conflict_markers(text) {
         return Err(PromptFileError::ConflictMarkers);
     }
@@ -228,14 +279,24 @@ pub fn parse_version(text: &str, prompt_id: &str) -> Result<PromptVersionRecord,
         .transpose()
         .map_err(map_item_err)?
         .ok_or_else(|| PromptFileError::Malformed("missing title".into()))?;
-    Ok(PromptVersionRecord {
-        id,
-        prompt_id: prompt_id.to_string(),
-        title,
-        body: body.to_string(),
-        source,
-        created_at,
-    })
+    let mut warnings = Vec::new();
+    let raw_instruction = fields.get("instruction").and_then(|v| unquote(v).ok());
+    if fields.contains_key("instruction") && raw_instruction.is_none() {
+        warnings.push(format!("{id}.md: unreadable instruction value ignored"));
+    }
+    let instruction = normalize_instruction(&source, raw_instruction.as_deref());
+    Ok((
+        PromptVersionRecord {
+            id,
+            prompt_id: prompt_id.to_string(),
+            title,
+            body: body.to_string(),
+            source,
+            created_at,
+            instruction,
+        },
+        warnings,
+    ))
 }
 
 // --- Write / remove ---------------------------------------------------------
@@ -244,8 +305,10 @@ pub fn parse_version(text: &str, prompt_id: &str) -> Result<PromptVersionRecord,
 /// needed, atomically (temp-then-rename) so a crash never leaves a half-written
 /// head. The dir name is UUID-derived (H2).
 pub fn write_prompt(prompts_dir: &Path, p: &PromptRecord) -> Result<(), PromptFileError> {
+    let serialized = serialize_prompt(p);
+    check_write_size(&serialized)?;
     let dir = ensure_prompt_dir(prompts_dir, &p.id)?;
-    write_atomic(&dir, "prompt.md", &serialize_prompt(p))
+    write_atomic(&dir, "prompt.md", &serialized)
 }
 
 /// Write a version file into `<prompts_dir>/<prompt-uuid>/`, atomically. Both the
@@ -253,9 +316,21 @@ pub fn write_prompt(prompts_dir: &Path, p: &PromptRecord) -> Result<(), PromptFi
 /// (H2). NEVER overwrites an existing version file in practice — the id is a
 /// freshly minted UUID — so history is append-only.
 pub fn write_version(prompts_dir: &Path, v: &PromptVersionRecord) -> Result<(), PromptFileError> {
+    let serialized = serialize_version(v);
+    check_write_size(&serialized)?;
     let dir = ensure_prompt_dir(prompts_dir, &v.prompt_id)?;
     let name = version_file_name(&v.id)?;
-    write_atomic(&dir, &name, &serialize_version(v))
+    write_atomic(&dir, &name, &serialized)
+}
+
+/// Write-side cap (plan.17 SEC-1): refuse to write a file the next scan would
+/// skip. Checked on the serialized bytes BEFORE the dir is created or the temp
+/// file is written, so an over-cap save leaves nothing on disk.
+fn check_write_size(serialized: &str) -> Result<(), PromptFileError> {
+    if serialized.len() as u64 > MAX_ITEM_FILE_BYTES {
+        return Err(PromptFileError::TooLarge);
+    }
+    Ok(())
 }
 
 /// Remove an entire prompt directory (its `prompt.md` and every version). A
@@ -308,10 +383,11 @@ fn write_atomic(dir: &Path, name: &str, contents: &str) -> Result<(), PromptFile
 pub fn scan(prompts_dir: &Path) -> PromptScanOutcome {
     let mut prompts = Vec::new();
     let mut errors = Vec::new();
+    let mut warnings = Vec::new();
 
     let entries = match std::fs::read_dir(prompts_dir) {
         Ok(e) => e,
-        Err(_) => return PromptScanOutcome { prompts, errors }, // missing dir → empty scan
+        Err(_) => return PromptScanOutcome { prompts, errors, warnings }, // missing dir → empty scan
     };
     let mut dirs: Vec<PathBuf> = entries
         .filter_map(|e| e.ok().map(|e| e.path()))
@@ -330,7 +406,7 @@ pub fn scan(prompts_dir: &Path) -> PromptScanOutcome {
             continue;
         }
 
-        let versions = scan_versions(&dir, &dir_name, &mut errors);
+        let versions = scan_versions(&dir, &dir_name, &mut errors, &mut warnings);
         if versions.is_empty() {
             // Nothing to show: a prompt row requires a current version.
             errors.push((dir_name, PromptFileError::Malformed("prompt has no versions".into())));
@@ -349,16 +425,17 @@ pub fn scan(prompts_dir: &Path) -> PromptScanOutcome {
         prompts.push(ScannedPrompt { prompt, versions });
     }
 
-    PromptScanOutcome { prompts, errors }
+    PromptScanOutcome { prompts, errors, warnings }
 }
 
-/// Parse every version file in one prompt dir, appending failures to `errors`.
-/// `prompt.md` is skipped here (it is the head, read separately). Sorted for
-/// determinism.
+/// Parse every version file in one prompt dir, appending failures to `errors`
+/// and degradations to `warnings`. `prompt.md` is skipped here (it is the head,
+/// read separately). Sorted for determinism.
 fn scan_versions(
     dir: &Path,
     prompt_id: &str,
     errors: &mut Vec<(String, PromptFileError)>,
+    warnings: &mut Vec<String>,
 ) -> Vec<PromptVersionRecord> {
     let mut versions = Vec::new();
     let entries = match std::fs::read_dir(dir) {
@@ -396,8 +473,11 @@ fn scan_versions(
             }
         }
         match read_capped(&path) {
-            Ok(Some(text)) => match parse_version(&text, prompt_id) {
-                Ok(v) => versions.push(v),
+            Ok(Some(text)) => match parse_version_with_warnings(&text, prompt_id) {
+                Ok((v, degraded)) => {
+                    warnings.extend(degraded);
+                    versions.push(v);
+                }
                 Err(e) => errors.push((name, e)),
             },
             Ok(None) => errors.push((name, PromptFileError::TooLarge)),
@@ -557,6 +637,7 @@ mod tests {
             body: body.into(),
             source: source.into(),
             created_at: created_at.into(),
+            instruction: None,
         }
     }
 
@@ -678,6 +759,165 @@ mod tests {
         for forbidden in ["token", "apikey", "api_key", "secret", "password", "authorization", "bearer"] {
             assert!(!text.to_lowercase().contains(forbidden), "a prompt file must never contain {forbidden}");
         }
+    }
+
+    // --- instruction (plan.17 1b) -------------------------------------------
+
+    fn ai_version_with(instruction: Option<&str>) -> PromptVersionRecord {
+        PromptVersionRecord {
+            instruction: instruction.map(str::to_string),
+            ..version(VID, "Draft the release email", "a body\nwith lines\n", "aiEnhanced", TS)
+        }
+    }
+
+    #[test]
+    fn normalize_instruction_keeps_only_a_non_blank_value_on_an_ai_enhanced_source() {
+        assert_eq!(normalize_instruction("aiEnhanced", Some("make it shorter")), Some("make it shorter".into()));
+        // Verbatim: surrounding whitespace is the user's text, not trimmed away.
+        assert_eq!(normalize_instruction("aiEnhanced", Some("  spaced  ")), Some("  spaced  ".into()));
+        assert_eq!(normalize_instruction("aiEnhanced", Some("")), None);
+        assert_eq!(normalize_instruction("aiEnhanced", Some("   \n\t ")), None);
+        assert_eq!(normalize_instruction("aiEnhanced", None), None);
+        assert_eq!(normalize_instruction("manual", Some("make it shorter")), None);
+        assert_eq!(normalize_instruction("bogus", Some("make it shorter")), None);
+    }
+
+    #[test]
+    fn instruction_round_trips_adversarial_values_on_an_ai_enhanced_version() {
+        // Every shape that could break a line-oriented frontmatter if it were
+        // written raw (R-2): a fence, a key line, the load-bearing keys, both
+        // conflict markers, quotes, a trailing backslash, CRLF, a lone CR, a
+        // tab, NUL, U+2028, and an emoji.
+        let instruction = format!(
+            "first line\n---\nkey: value\nid: {VID}\nsource: aiEnhanced\ntitle: \"x\"\n\
+             <<<<<<< HEAD\nours\n=======\ntheirs\n>>>>>>> x\n\
+             say \"hi\" \\ and end with a backslash \\\r\nlone\rcr\ttab\0nul\u{2028}sep 🎉"
+        );
+        let v = ai_version_with(Some(&instruction));
+        let serialized = serialize_version(&v);
+        assert!(!has_conflict_markers(&serialized), "quoting must keep markers off a line start");
+        let frontmatter = serialized.split("---\n").nth(1).unwrap();
+        assert!(!frontmatter.contains('\r'), "no raw CR may reach the frontmatter");
+        assert!(frontmatter.contains("instruction: \""), "written as a quoted scalar after title");
+        assert!(
+            frontmatter.find("title: ").unwrap() < frontmatter.find("instruction: ").unwrap(),
+            "instruction comes after title"
+        );
+        let (parsed, warnings) = parse_version_with_warnings(&serialized, PID).unwrap();
+        assert!(warnings.is_empty(), "a well-formed instruction produces no warning: {warnings:?}");
+        assert_eq!(parsed, v, "id, source, title, body and instruction all survive");
+        assert_eq!(serialize_version(&parsed), serialized, "re-export is byte-identical");
+    }
+
+    #[test]
+    fn a_version_without_an_instruction_writes_no_instruction_line() {
+        let text = serialize_version(&ai_version_with(None));
+        assert!(!text.contains("instruction"), "None must leave no trace: {text}");
+    }
+
+    #[test]
+    fn a_version_without_an_instruction_keeps_the_pre_feature_byte_layout() {
+        // The exact bytes plan.7 wrote: every existing file and golden must
+        // re-export unchanged, so the new key can only ever ADD a line.
+        let v = version(VID, "t", "b", "manual", TS);
+        assert_eq!(
+            serialize_version(&v),
+            format!("---\nid: {VID}\nsource: manual\ncreated_at: {TS}\ntitle: \"t\"\n---\nb")
+        );
+        let ai = version(VID2, "t2", "", "aiEnhanced", TS2);
+        assert_eq!(
+            serialize_version(&ai),
+            format!("---\nid: {VID2}\nsource: aiEnhanced\ncreated_at: {TS2}\ntitle: \"t2\"\n---\n")
+        );
+    }
+
+    #[test]
+    fn a_manual_version_with_an_instruction_writes_no_line_and_parses_to_none() {
+        let v = PromptVersionRecord { instruction: Some("x".into()), ..version(VID, "t", "b", "manual", TS) };
+        let text = serialize_version(&v);
+        assert!(!text.contains("instruction"), "manual never carries one: {text}");
+        assert_eq!(parse_version(&text, PID).unwrap().instruction, None);
+    }
+
+    #[test]
+    fn a_manual_file_carrying_an_instruction_line_parses_with_none() {
+        // A hand-edited or merged file: the line is read (no error, no warning)
+        // and then dropped by the source gate.
+        let text = format!("---\nid: {VID}\nsource: manual\ncreated_at: {TS}\ntitle: \"t\"\ninstruction: \"x\"\n---\nbody");
+        let (parsed, warnings) = parse_version_with_warnings(&text, PID).unwrap();
+        assert_eq!(parsed.instruction, None);
+        assert_eq!(parsed.body, "body");
+        assert!(warnings.is_empty(), "a well-formed value on a manual version is not a degradation");
+    }
+
+    #[test]
+    fn a_blank_instruction_normalizes_to_none_on_write_and_on_read() {
+        for blank in ["", "   "] {
+            let text = serialize_version(&ai_version_with(Some(blank)));
+            assert!(!text.contains("instruction"), "blank writes no line: {text}");
+            let hand = format!("---\nid: {VID}\nsource: aiEnhanced\ncreated_at: {TS}\ntitle: \"t\"\ninstruction: \"{blank}\"\n---\nb");
+            let (parsed, warnings) = parse_version_with_warnings(&hand, PID).unwrap();
+            assert_eq!(parsed.instruction, None);
+            assert!(warnings.is_empty(), "blank is a valid value, not a degradation");
+        }
+    }
+
+    #[test]
+    fn a_malformed_instruction_value_degrades_to_none_with_one_fixed_warning() {
+        // Unquoted, unterminated, and a dangling escape: each is Ok (the
+        // version is never dropped — R-3), the body is kept, and exactly one
+        // warning names the file without echoing the value (R-14).
+        for bad in ["plain unquoted", "\"unterminated", "\"dangling\\"] {
+            let text = format!("---\nid: {VID}\nsource: aiEnhanced\ncreated_at: {TS}\ntitle: \"t\"\ninstruction: {bad}\n---\nkept body");
+            let (parsed, warnings) = parse_version_with_warnings(&text, PID)
+                .unwrap_or_else(|e| panic!("{bad:?} must not fail the version: {e}"));
+            assert_eq!(parsed.instruction, None);
+            assert_eq!(parsed.body, "kept body");
+            assert_eq!(parsed.title, "t");
+            assert_eq!(warnings.len(), 1, "{bad:?}: {warnings:?}");
+            assert_eq!(warnings[0], format!("{VID}.md: unreadable instruction value ignored"));
+            assert!(!warnings[0].contains("unquoted") && !warnings[0].contains("unterminated"));
+            // The thin wrapper still parses it, silently.
+            assert_eq!(parse_version(&text, PID).unwrap().instruction, None);
+        }
+    }
+
+    #[test]
+    fn a_file_with_an_instruction_and_an_unknown_future_key_parses() {
+        let text = format!("---\nid: {VID}\nsource: aiEnhanced\ncreated_at: {TS}\ntitle: \"t\"\ninstruction: \"tighten it\"\nfuture_key: 1\n---\nb");
+        let (parsed, warnings) = parse_version_with_warnings(&text, PID).unwrap();
+        assert_eq!(parsed.instruction, Some("tighten it".into()));
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn scan_surfaces_an_unreadable_instruction_as_a_warning_not_a_skip() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write_prompt(root, &head()).unwrap();
+        std::fs::write(
+            root.join(PID).join(format!("{VID}.md")),
+            format!("---\nid: {VID}\nsource: aiEnhanced\ncreated_at: {TS}\ntitle: \"t\"\ninstruction: not quoted\n---\nbody"),
+        )
+        .unwrap();
+        let out = scan(root);
+        assert!(out.errors.is_empty(), "a bad instruction is never an error: {:?}", out.errors);
+        assert_eq!(out.prompts.len(), 1);
+        assert_eq!(out.prompts[0].versions.len(), 1, "the version is imported");
+        assert_eq!(out.prompts[0].versions[0].instruction, None);
+        assert_eq!(out.warnings, vec![format!("{VID}.md: unreadable instruction value ignored")]);
+    }
+
+    #[test]
+    fn write_version_refuses_an_over_cap_file_and_leaves_nothing_on_disk() {
+        // SEC-1: the serialized bytes are checked before the dir or the temp
+        // file exist, so a refused save is invisible to the next scan.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let body = "x".repeat(MAX_ITEM_FILE_BYTES as usize + 1);
+        let v = version(VID, "t", &body, "manual", TS);
+        assert_eq!(write_version(root, &v), Err(PromptFileError::TooLarge));
+        assert!(!root.join(PID).exists(), "no prompt dir, no temp file");
     }
 
     // --- two-level scan -----------------------------------------------------

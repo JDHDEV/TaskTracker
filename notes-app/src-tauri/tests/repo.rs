@@ -1156,3 +1156,21 @@ async fn convert_note_to_task_leaves_tag_vocabulary_unchanged() {
         "a todo task's tags stay in the vocabulary"
     );
 }
+
+// ---------------------------------------------------------------------------
+// SEC-1 placement (plan.17): the write-side file-size cap lives in
+// `itemfile::write_item`, which only runs when the store has an `items_dir`.
+// This in-memory repo (`connect_in_memory`) has none, so it cannot enforce the
+// cap — that is exercised against real files in `tests/project_manager.rs`
+// (`item_over_cap_body_is_rejected_and_nothing_is_written`). This test just
+// records the placement decision: an index-only store accepts what the file
+// store would refuse.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn over_cap_body_is_not_capped_by_the_index_only_store() {
+    let repo = SqliteRepository::connect_in_memory().await.unwrap();
+    let big = "x".repeat(5 * 1024 * 1024); // > MAX_ITEM_FILE_BYTES, no files dir to enforce it
+    let item = repo.create(NewItem { body: Some(big.clone()), ..new_item(Kind::Note, "t", "") }).await.unwrap();
+    assert_eq!(item.body.len(), big.len(), "the index-only store has no size cap to enforce");
+}

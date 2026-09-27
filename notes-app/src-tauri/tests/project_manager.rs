@@ -79,6 +79,7 @@ fn new_prompt(project_id: &str, title: &str, body: &str) -> NewPrompt {
         body: Some(body.into()),
         reusable: None,
         source: None,
+        instruction: None,
     }
 }
 
@@ -1757,6 +1758,157 @@ async fn migration_0008_preserves_row_count_and_rowids_on_a_raw_pre_0008_db() {
     pool.close().await;
 }
 
+// ---------------------------------------------------------------------------
+// Migration 0009 (plan.17 1b): adds the nullable `prompt_versions.instruction`
+// column. Same shape as the 0008 tests above — a REAL existing store this
+// build has never opened, with prompts already on disk as canonical files
+// (whose version files may already carry an `instruction:` line) but an
+// index.db still at migration level 8.
+// ---------------------------------------------------------------------------
+
+/// Build a fresh index at `path` with ONLY migrations up to (and including)
+/// version 8 applied — the schema shape every store had before 0009 added the
+/// nullable `instruction` column — then stamp the `meta` identity rows exactly
+/// as `build_pre_0008_index` does. Copies that helper one migration later.
+async fn build_pre_0009_index(path: &Path, project_id: &str, project_name: &str) {
+    let options = sqlx::sqlite::SqliteConnectOptions::new()
+        .filename(path)
+        .create_if_missing(true)
+        .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+        .foreign_keys(true);
+    let pool =
+        sqlx::sqlite::SqlitePoolOptions::new().max_connections(1).connect_with(options).await.unwrap();
+
+    let full = sqlx::migrate!("./migrations");
+    let truncated_migrations: Vec<sqlx::migrate::Migration> =
+        full.migrations.iter().filter(|m| m.version <= 8).cloned().collect();
+    assert!(
+        full.migrations.iter().any(|m| m.version == 9),
+        "sanity: the full migrator must still carry 0009, or this helper tests nothing"
+    );
+    let truncated = sqlx::migrate::Migrator {
+        migrations: std::borrow::Cow::Owned(truncated_migrations),
+        ..full
+    };
+    truncated.run(&pool).await.unwrap();
+
+    let max_version: i64 =
+        sqlx::query_scalar("SELECT COALESCE(MAX(version), 0) FROM _sqlx_migrations")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(max_version, 8, "sanity: exactly migrations 0001..=0008 must be applied");
+
+    // Stamp identity, mirroring create_at's four-row meta commit.
+    let mut tx = pool.begin().await.unwrap();
+    for (key, value) in [
+        ("project_id", project_id.to_string()),
+        ("project_name", project_name.to_string()),
+        ("schema_version", max_version.to_string()),
+        ("created_at", "2026-09-26T00:00:00.000+00:00".to_string()),
+    ] {
+        sqlx::query("INSERT INTO meta (key, value) VALUES (?1, ?2)")
+            .bind(key)
+            .bind(value)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+    }
+    tx.commit().await.unwrap();
+
+    // Sanity: this really is the pre-0009 shape — no instruction column yet.
+    let columns: Vec<String> =
+        sqlx::query_scalar("SELECT name FROM pragma_table_info('prompt_versions')")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert!(
+        !columns.iter().any(|c| c == "instruction"),
+        "sanity: the truncated DB must not yet carry the instruction column: {columns:?}"
+    );
+
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn pre_0009_index_opens_migrates_and_serves_instruction() {
+    let (mgr, _app) = new_manager().await;
+    let (info, dir) = create_project(&mgr, "Legacy").await;
+
+    // A prompt whose current version already carries an instruction, written
+    // to the canonical files by the CURRENT build before the index is rolled
+    // back — mirrors upgrade_0007_store_applies_0008_and_search_survives:
+    // the files are the compatibility surface, not the rebuildable index.
+    let prompt = mgr.create_prompt(new_prompt(&info.id, "t", "v1")).await.unwrap();
+    mgr.update_prompt(
+        &prompt.id,
+        UpdatePrompt {
+            body: Some("v2".into()),
+            source: Some("aiEnhanced".into()),
+            instruction: Some("make it warmer".into()),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    mgr.unload(&info.id).await.unwrap();
+
+    // Roll the index back to a pre-0009 shape, IN PLACE — the canonical
+    // prompt files (with their instruction: line already on disk) are never
+    // touched, only the rebuildable index.
+    for suffix in ["", "-wal", "-shm"] {
+        let path = dir.path().join(format!("index.db{suffix}"));
+        fs_retry(|| match std::fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e),
+        });
+    }
+    build_pre_0009_index(&dir.path().join("index.db"), &info.id, &info.name).await;
+
+    // The hardening gate passes at level 8, THEN `migrate!` applies 0009,
+    // THEN `rebuild_from_dir` repopulates the index from the untouched files
+    // — so a store an older (pre-0009) build has never seen still opens.
+    let (reopened, warnings) = mgr.load(&info.id).await.unwrap();
+    assert_eq!(reopened.id, info.id, "the store must open, not be refused as a newer-version DB");
+    assert!(warnings.is_empty(), "a clean upgrade must report no per-file warnings: {warnings:?}");
+
+    // The migrated schema now carries the column (a side read-only connection
+    // — safe alongside the manager's own live pool under WAL, the same
+    // pattern `pin_prompt_updated_at` uses for a side WRITE).
+    let side_pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(
+            sqlx::sqlite::SqliteConnectOptions::new()
+                .filename(dir.path().join("index.db"))
+                .create_if_missing(false)
+                .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal),
+        )
+        .await
+        .unwrap();
+    let columns: Vec<String> =
+        sqlx::query_scalar("SELECT name FROM pragma_table_info('prompt_versions')")
+            .fetch_all(&side_pool)
+            .await
+            .unwrap();
+    assert!(
+        columns.iter().any(|c| c == "instruction"),
+        "the migrated schema must carry the instruction column: {columns:?}"
+    );
+    side_pool.close().await;
+
+    // And it is actually served back, not just present as an empty column.
+    let hist = mgr.prompt_versions(&prompt.id).await.unwrap();
+    assert_eq!(hist.len(), 2, "every pre-0009 version must survive the upgrade");
+    assert_eq!(
+        hist[0].instruction.as_deref(),
+        Some("make it warmer"),
+        "the rebuilt index serves the instruction straight from the canonical file"
+    );
+    assert_eq!(hist[1].instruction, None);
+}
+
 #[tokio::test]
 async fn create_prompt_lands_only_in_target_store() {
     let (mgr, _app) = new_manager().await;
@@ -2031,6 +2183,7 @@ async fn list_prompts_fan_out_dedupes_a_pathological_shared_id_across_two_stores
                 body: "body".into(),
                 source: "manual".into(),
                 created_at: ts.into(),
+                instruction: None,
             },
         )
         .unwrap();
@@ -2148,6 +2301,7 @@ async fn list_prompts_fan_out_reflects_a_reload_mid_session_not_stale_data() {
             body: "body".into(),
             source: "manual".into(),
             created_at: ts.into(),
+            instruction: None,
         },
     )
     .unwrap();
@@ -2203,6 +2357,7 @@ async fn reload_rebuilds_prompts_and_full_history_from_files_out_of_band() {
             body: "pulled body".into(),
             source: "manual".into(),
             created_at: ts.into(),
+            instruction: None,
         },
     )
     .unwrap();
@@ -2260,6 +2415,7 @@ async fn missing_prompt_md_is_synthesized_with_all_versions_intact() {
             body: "b1".into(),
             source: "manual".into(),
             created_at: ts1.into(),
+            instruction: None,
         },
     )
     .unwrap();
@@ -2272,6 +2428,7 @@ async fn missing_prompt_md_is_synthesized_with_all_versions_intact() {
             body: "b2".into(),
             source: "manual".into(),
             created_at: ts2.into(),
+            instruction: None,
         },
     )
     .unwrap();
@@ -2322,6 +2479,7 @@ async fn reload_reports_a_conflict_marker_prompt_version_and_imports_the_rest() 
             body: "b".into(),
             source: "manual".into(),
             created_at: ts.into(),
+            instruction: None,
         },
     )
     .unwrap();
@@ -2467,6 +2625,256 @@ async fn move_prompt_survives_reload_of_both_projects() {
     assert_eq!(hist.len(), 2, "the full history rebuilds from the target's files");
 }
 
+// ---------------------------------------------------------------------------
+// Instruction history on disk (plan.17 1b): the on-disk assertions and the
+// SEC-1 write cap live HERE rather than in `tests/repo_prompts.rs`, because
+// that file's in-memory repo has no `prompts_dir`/`items_dir` to write real
+// files against (see its module docs).
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn prompt_ai_enhanced_version_file_on_disk_carries_the_instruction_line() {
+    let (mgr, _app) = new_manager().await;
+    let (info, dir) = create_project(&mgr, "Alpha").await;
+    let p = mgr.create_prompt(new_prompt(&info.id, "t", "v1")).await.unwrap();
+    mgr.update_prompt(
+        &p.id,
+        UpdatePrompt {
+            body: Some("v2".into()),
+            source: Some("aiEnhanced".into()),
+            instruction: Some("tighten it".into()),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    let hist = mgr.prompt_versions(&p.id).await.unwrap();
+    let newest = &hist[0];
+    assert_eq!(newest.body, "v2");
+    let path = dir.path().join("prompts").join(&p.id).join(format!("{}.md", newest.id));
+    let text = std::fs::read_to_string(&path).unwrap();
+    let lines: Vec<&str> = text.lines().collect();
+    let title_idx = lines.iter().position(|l| l.starts_with("title:")).expect("a title: line must exist");
+    assert_eq!(
+        lines[title_idx + 1],
+        "instruction: \"tighten it\"",
+        "the instruction line sits immediately after title: {text}"
+    );
+}
+
+#[tokio::test]
+async fn manual_version_file_has_no_instruction_line() {
+    let (mgr, _app) = new_manager().await;
+    let (info, dir) = create_project(&mgr, "Alpha").await;
+    let p = mgr.create_prompt(new_prompt(&info.id, "t", "v1")).await.unwrap();
+    mgr.update_prompt(&p.id, UpdatePrompt { body: Some("v2".into()), ..Default::default() }).await.unwrap();
+
+    let hist = mgr.prompt_versions(&p.id).await.unwrap();
+    let newest = &hist[0];
+    let path = dir.path().join("prompts").join(&p.id).join(format!("{}.md", newest.id));
+    let text = std::fs::read_to_string(&path).unwrap();
+    assert!(!text.contains("instruction"), "a manual version file must carry no instruction line: {text}");
+}
+
+#[tokio::test]
+async fn reload_rebuilds_prompt_instruction_from_files() {
+    let (mgr, _app) = new_manager().await;
+    let (info, _dir) = create_project(&mgr, "Alpha").await;
+    let p = mgr.create_prompt(new_prompt(&info.id, "t", "v1")).await.unwrap();
+    mgr.update_prompt(
+        &p.id,
+        UpdatePrompt {
+            body: Some("v2".into()),
+            source: Some("aiEnhanced".into()),
+            instruction: Some("make it shorter".into()),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    let warnings = mgr.reload(&info.id).await.unwrap();
+    assert!(warnings.is_empty(), "clean files reload without warnings: {warnings:?}");
+
+    let hist = mgr.prompt_versions(&p.id).await.unwrap();
+    assert_eq!(hist.len(), 2);
+    assert_eq!(
+        hist[0].instruction.as_deref(),
+        Some("make it shorter"),
+        "the instruction survives an out-of-band index rebuild"
+    );
+    assert_eq!(hist[1].instruction, None, "the original manual version still carries none");
+}
+
+#[tokio::test]
+async fn hand_written_instruction_line_is_picked_up_on_reload() {
+    // Not written via `promptfile::write_version` — a RAW hand-edited file
+    // (the git-pull / manual-edit case), with an escaped `\n` in the quoted
+    // instruction value, to prove the on-disk FORMAT is read, not just the
+    // writer's own output.
+    let (mgr, _app) = new_manager().await;
+    let (info, dir) = create_project(&mgr, "Alpha").await;
+    let prompts_dir = dir.path().join("prompts");
+
+    let pid = "99999999-0000-0000-0000-000000000001";
+    let vid = "99999999-0000-0000-0000-000000000002";
+    let ts = "2026-07-14T00:00:00.000+00:00";
+    promptfile::write_prompt(
+        &prompts_dir,
+        &promptfile::PromptRecord { id: pid.into(), reusable: false, created_at: ts.into(), schema_version: "1.0.0".into() },
+    )
+    .unwrap();
+    std::fs::create_dir_all(prompts_dir.join(pid)).unwrap();
+    std::fs::write(
+        prompts_dir.join(pid).join(format!("{vid}.md")),
+        format!(
+            "---\nid: {vid}\nsource: aiEnhanced\ncreated_at: {ts}\ntitle: \"t\"\n\
+             instruction: \"line one\\nline two\"\n---\nbody\n"
+        ),
+    )
+    .unwrap();
+
+    let warnings = mgr.reload(&info.id).await.unwrap();
+    assert!(warnings.is_empty(), "a well-formed hand-written instruction is not a warning: {warnings:?}");
+
+    let hist = mgr.prompt_versions(pid).await.unwrap();
+    assert_eq!(hist.len(), 1);
+    assert_eq!(
+        hist[0].instruction.as_deref(),
+        Some("line one\nline two"),
+        "the escaped \\n in the hand-written file unescapes to a real newline"
+    );
+}
+
+#[tokio::test]
+async fn move_prompt_preserves_instruction_and_survives_reload_of_both_projects() {
+    let (mgr, _app) = new_manager().await;
+    let (a, _dir_a) = create_project(&mgr, "Alpha").await;
+    let (b, _dir_b) = create_project(&mgr, "Beta").await;
+    let p = mgr.create_prompt(new_prompt(&a.id, "t", "v1")).await.unwrap();
+    mgr.update_prompt(
+        &p.id,
+        UpdatePrompt {
+            body: Some("v2".into()),
+            source: Some("aiEnhanced".into()),
+            instruction: Some("keep it punchy".into()),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let before = mgr.prompt_versions(&p.id).await.unwrap();
+    assert!(before.iter().any(|v| v.instruction.is_some()), "sanity: something must actually carry one");
+
+    mgr.move_prompt(&p.id, &b.id).await.unwrap();
+    let after_move = mgr.prompt_versions(&p.id).await.unwrap();
+    for (x, y) in before.iter().zip(after_move.iter()) {
+        assert_eq!(x.instruction, y.instruction, "the move preserves each version's instruction");
+    }
+
+    mgr.reload(&a.id).await.unwrap();
+    mgr.reload(&b.id).await.unwrap();
+    let after_reload = mgr.prompt_versions(&p.id).await.unwrap();
+    assert_eq!(after_reload.len(), 2);
+    assert!(
+        after_reload.iter().any(|v| v.instruction.as_deref() == Some("keep it punchy")),
+        "the instruction survives a reload of the target project's rebuilt files"
+    );
+    let in_a = mgr
+        .list_prompts(&PromptListFilter { project_id: Some(a.id.clone()), ..Default::default() })
+        .await
+        .unwrap();
+    assert!(in_a.is_empty(), "the source has no prompt files left after the move + reload");
+}
+
+// ---------------------------------------------------------------------------
+// SEC-1 (plan.17 D11): the write-side file-size cap. Exercised here (not in
+// repo.rs/repo_prompts.rs) because it lives in the file writers
+// (`promptfile::write_version`/`write_prompt`, `itemfile::write_item`), which
+// only run when the store has a real `prompts_dir`/`items_dir` — see the
+// placement-decision tests of the same name in repo.rs and repo_prompts.rs.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn prompt_over_cap_body_is_rejected_and_nothing_is_written() {
+    let (mgr, _app) = new_manager().await;
+    let (info, dir) = create_project(&mgr, "Alpha").await;
+
+    // --- create: an over-cap body leaves no prompt directory at all. The
+    // implementation writes the version file BEFORE prompt.md specifically so
+    // a capped create leaves nothing behind — assert that directly.
+    let big = "x".repeat(itemfile::MAX_ITEM_FILE_BYTES as usize + 1);
+    let err = mgr.create_prompt(new_prompt(&info.id, "t", &big)).await.unwrap_err();
+    match err {
+        AppError::Invalid(msg) => assert_eq!(msg, "that text is too large to save (limit 4 MB)"),
+        other => panic!("expected Invalid, got {other:?}"),
+    }
+    assert!(
+        !dir.path().join("prompts").exists(),
+        "a capped create must leave no prompt directory at all (version-before-head ordering)"
+    );
+    let listed = mgr
+        .list_prompts(&PromptListFilter { project_id: Some(info.id.clone()), ..Default::default() })
+        .await
+        .unwrap();
+    assert!(listed.is_empty(), "list_prompts must be unchanged by the rejected create");
+
+    // --- update: an over-cap body on an EXISTING prompt appends no version.
+    let p = mgr.create_prompt(new_prompt(&info.id, "small", "b")).await.unwrap();
+    let before_count = mgr.get_prompt(&p.id).await.unwrap().version_count;
+    let before_files: usize = std::fs::read_dir(dir.path().join("prompts").join(&p.id)).unwrap().count();
+
+    let err = mgr
+        .update_prompt(&p.id, UpdatePrompt { body: Some(big.clone()), ..Default::default() })
+        .await
+        .unwrap_err();
+    match err {
+        AppError::Invalid(msg) => assert_eq!(msg, "that text is too large to save (limit 4 MB)"),
+        other => panic!("expected Invalid, got {other:?}"),
+    }
+    let after = mgr.get_prompt(&p.id).await.unwrap();
+    assert_eq!(after.version_count, before_count, "the rejected update appends no version");
+    let after_files: usize = std::fs::read_dir(dir.path().join("prompts").join(&p.id)).unwrap().count();
+    assert_eq!(after_files, before_files, "no new version file is written for the rejected update");
+}
+
+#[tokio::test]
+async fn item_over_cap_body_is_rejected_and_nothing_is_written() {
+    let (mgr, _app) = new_manager().await;
+    let (info, dir) = create_project(&mgr, "Alpha").await;
+
+    let big = "x".repeat(itemfile::MAX_ITEM_FILE_BYTES as usize + 1);
+    let err = mgr
+        .create(NewItem { body: Some(big.clone()), ..new_item(&info.id, Kind::Note, "t") })
+        .await
+        .unwrap_err();
+    match err {
+        AppError::Invalid(msg) => assert_eq!(msg, "that text is too large to save (limit 4 MB)"),
+        other => panic!("expected Invalid, got {other:?}"),
+    }
+    let listed = mgr
+        .list_all(&ListFilter { project_id: Some(info.id.clone()), ..Default::default() })
+        .await
+        .unwrap();
+    assert!(listed.is_empty(), "list must be unchanged by the rejected create");
+    assert_eq!(count_md_files(&dir.path().join("items")), 0, "no items/<id>.md is written for the rejected create");
+
+    // --- update: an over-cap body on an EXISTING item leaves it untouched.
+    let it = mgr.create(new_item(&info.id, Kind::Note, "small")).await.unwrap();
+    let err = mgr
+        .update(&it.id, UpdateItem { body: Some(big.clone()), ..Default::default() })
+        .await
+        .unwrap_err();
+    match err {
+        AppError::Invalid(msg) => assert_eq!(msg, "that text is too large to save (limit 4 MB)"),
+        other => panic!("expected Invalid, got {other:?}"),
+    }
+    let after = mgr.get(&it.id).await.unwrap();
+    assert_eq!(after.body, "", "the rejected update leaves the existing body untouched");
+    assert_eq!(count_md_files(&dir.path().join("items")), 1, "still exactly one item file — no partial write");
+}
+
 #[tokio::test]
 async fn move_prompt_to_same_project_is_rejected_and_leaves_the_source_unchanged() {
     let (mgr, _app) = new_manager().await;
@@ -2609,6 +3017,7 @@ async fn move_prompt_preserves_the_source_schema_version_not_the_current_constan
             body: "body".into(),
             source: "manual".into(),
             created_at: ts.into(),
+            instruction: None,
         },
     )
     .unwrap();
@@ -2654,6 +3063,7 @@ async fn reusable_toggle_on_a_legacy_prompt_preserves_its_marker_not_the_current
             body: "body".into(),
             source: "manual".into(),
             created_at: ts.into(),
+            instruction: None,
         },
     )
     .unwrap();

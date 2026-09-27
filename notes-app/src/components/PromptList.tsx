@@ -1,9 +1,14 @@
 import type { ProjectInfo, Prompt } from "../types";
 import { displayTitle, formatWhen } from "../lib/prompts";
+import { promptTabKey } from "./PromptsPage";
 
 interface Props {
   prompts: Prompt[];
   selectedId: string | null;
+  /** Plan 17 feature 7: tab keys (promptTabKey — the composite `prompt-<proj>:<id>`
+   *  key PromptsPage builds, never a bare id) of open prompts with unsaved
+   *  edits — those rows show the unsaved dot + an sr-only name suffix. */
+  dirtyKeys: ReadonlySet<string>;
   loaded: ProjectInfo[];
   projectId: string;
   reusableOnly: boolean;
@@ -21,6 +26,7 @@ const FILTERS: { id: boolean; label: string }[] = [
 export default function PromptList({
   prompts,
   selectedId,
+  dirtyKeys,
   loaded,
   projectId,
   reusableOnly,
@@ -102,6 +108,12 @@ export default function PromptList({
             >
               <span className="row-top">
                 <span className="row-title">{displayTitle(p.title, p.body)}</span>
+                {dirtyKeys.has(promptTabKey(p)) && (
+                  <>
+                    <span className="etab-unsaved" aria-hidden="true" title="Unsaved changes" />
+                    <span className="sr-only">, unsaved changes</span>
+                  </>
+                )}
                 {p.reusable && <span className="pill pill-on">REUSABLE</span>}
                 <span className="row-when">{formatWhen(p.updatedAt, now)}</span>
               </span>

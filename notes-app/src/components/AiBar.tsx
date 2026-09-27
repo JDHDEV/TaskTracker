@@ -1,6 +1,7 @@
-import { useState } from "react";
+import { useId, useRef, useState } from "react";
 import type { ProviderId } from "../types";
 import { getPreferredProvider, setPreferredProvider } from "../lib/aiProvider";
+import { shouldSubmitOnKey } from "../lib/rework";
 
 interface Props {
   busy: boolean;
@@ -15,6 +16,12 @@ interface Props {
    *  prompts (plan.7) get a prompt-engineering-flavored set. Defaults "item"
    *  so every existing caller is unaffected. */
   variant?: "item" | "prompt";
+  /** Plan 17 (D2/D3): the instruction box is CONTROLLED by the editor, which
+   *  owns the value, its reset on reseed, and the clear-on-accept rule — the
+   *  bar never empties it on submit, so a discarded rework leaves the
+   *  instruction in place. */
+  instruction: string;
+  onInstructionChange: (value: string) => void;
   onRework: (instruction: string, provider: ProviderId) => void;
   onSave: () => void;
   /** Prompt editor only (plan.9): revert unsaved title/body edits to the most
@@ -48,12 +55,18 @@ const PROVIDERS: { id: ProviderId; label: string }[] = [
   { id: "openai", label: "GPT" },
 ];
 
+/** UX-only ceiling on the instruction box; the backend's byte cap (R-1) is
+ *  the enforcement. 2 000 UTF-16 units stay under 8 KiB at 4 bytes/char. */
+const INSTRUCTION_MAX_LENGTH = 2000;
+
 export default function AiBar({
   busy,
   dirty,
   generatingTitle,
   saveBlocked,
   variant = "item",
+  instruction,
+  onInstructionChange,
   onRework,
   onSave,
   onDiscard,
@@ -61,9 +74,12 @@ export default function AiBar({
   onClearSelection,
 }: Props) {
   const [provider, setProvider] = useState<ProviderId>(getPreferredProvider);
-  const [custom, setCustom] = useState("");
   const presets = variant === "prompt" ? PROMPT_PRESETS : ITEM_PRESETS;
   const hasSelection = typeof selectionLength === "number" && selectionLength > 0;
+  const customRef = useRef<HTMLTextAreaElement>(null);
+  // Every open tab keeps its AiBar mounted, so the hint's id must be unique
+  // per instance — a literal id would be duplicated across tabs.
+  const hintId = useId();
 
   function pickProvider(next: ProviderId) {
     setProvider(next);
@@ -71,10 +87,23 @@ export default function AiBar({
   }
 
   function submitCustom() {
-    const instruction = custom.trim();
-    if (!instruction) return;
-    onRework(instruction, provider);
-    setCustom("");
+    const trimmed = instruction.trim();
+    if (!trimmed) return;
+    // Deliberately no clear here (D3): the editor decides after Replace text.
+    onRework(trimmed, provider);
+  }
+
+  // A preset chip fills the box (DESIGN.md: chips fill, they don't submit) and
+  // moves focus into it with the caret at the end. The DOM value is set first
+  // so the caret range is valid before React commits the same string.
+  function pickPreset(preset: string) {
+    onInstructionChange(preset);
+    const ta = customRef.current;
+    if (ta) {
+      ta.value = preset;
+      ta.focus();
+      ta.setSelectionRange(preset.length, preset.length);
+    }
   }
 
   return (
@@ -96,22 +125,49 @@ export default function AiBar({
       </select>
 
       {presets.map((preset) => (
-        <button key={preset} className="chip" onClick={() => setCustom(preset)}>
+        <button key={preset} className="chip" onClick={() => pickPreset(preset)}>
           {preset}
         </button>
       ))}
 
-      <input
+      <textarea
+        ref={customRef}
+        rows={1}
         className="aibar-custom"
         placeholder="Or type your own instruction…"
-        value={custom}
-        disabled={busy}
-        onChange={(e) => setCustom(e.target.value)}
-        onKeyDown={(e) => e.key === "Enter" && submitCustom()}
+        aria-label="Rework instruction"
+        aria-describedby={hintId}
+        maxLength={INSTRUCTION_MAX_LENGTH}
+        value={instruction}
+        // readOnly, not disabled, while busy: `disabled` dumps focus to <body>
+        // the moment Rework is pressed (D2).
+        readOnly={busy}
+        aria-disabled={busy}
+        onChange={(e) => onInstructionChange(e.target.value)}
+        onKeyDown={(e) => {
+          if (
+            shouldSubmitOnKey(
+              {
+                key: e.key,
+                shiftKey: e.shiftKey,
+                isComposing: e.nativeEvent.isComposing,
+                keyCode: e.keyCode,
+              },
+              instruction,
+              busy,
+            )
+          ) {
+            e.preventDefault();
+            submitCustom();
+          }
+        }}
       />
+      <span id={hintId} className="sr-only">
+        Enter to rework, Shift+Enter for a new line
+      </span>
       <button
         className="btn"
-        disabled={busy || !custom.trim()}
+        disabled={busy || !instruction.trim()}
         onClick={submitCustom}
       >
         {busy ? "Working…" : "Rework"}

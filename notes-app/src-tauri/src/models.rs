@@ -10,6 +10,13 @@ use sqlx::types::Json;
 /// and parse-default to this same value (they are already 1.0.0-shaped).
 pub const CURRENT_SCHEMA_VERSION: &str = "1.0.0";
 
+/// Cap on an AI rework instruction, in raw UTF-8 bytes (`str::len`, not chars).
+/// Enforced in ONE place — `ai::validate_instruction` — by both rewrite commands
+/// before any provider call and by prompt create/update before any file write
+/// (plan.17 R-1). The UI's `maxLength` is UX only. Not applied on rebuild or
+/// import: a value already on disk is preserved verbatim.
+pub const MAX_INSTRUCTION_BYTES: usize = 8 * 1024;
+
 /// Notes and tasks share one shape; `kind` discriminates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, sqlx::Type)]
 #[serde(rename_all = "lowercase")]
@@ -235,6 +242,12 @@ pub struct PromptVersion {
     pub body: String,
     pub source: String,
     pub created_at: String,
+    /// The AI instruction behind an accepted rewrite (plan.17 1b). Present ONLY
+    /// on an `aiEnhanced` version and only when non-blank; `None` for a manual
+    /// version, a pre-feature version, or a blank instruction. Deliberately NO
+    /// `#[sqlx(default)]`: a `versions()` SELECT that forgets the column must
+    /// fail loudly, not silently strip the value from a cross-project move.
+    pub instruction: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -255,6 +268,12 @@ pub struct NewPrompt {
     /// Any value other than `"aiEnhanced"` normalizes to `"manual"`.
     #[serde(default)]
     pub source: Option<String>,
+    /// The instruction that produced the accepted proposal (plan.17 1b). Kept on
+    /// the first version ONLY when `source` normalizes to `"aiEnhanced"` and the
+    /// value is non-blank; otherwise dropped. Capped at `MAX_INSTRUCTION_BYTES`
+    /// (a longer value is rejected before any file write).
+    #[serde(default)]
+    pub instruction: Option<String>,
 }
 
 /// Partial update. Omitted fields mean "unchanged". A `title`/`body` change
@@ -273,6 +292,13 @@ pub struct UpdatePrompt {
     pub reusable: Option<bool>,
     #[serde(default)]
     pub source: Option<String>,
+    /// The instruction that produced the accepted proposal (plan.17 1b). Kept on
+    /// the appended version ONLY when `source` normalizes to `"aiEnhanced"`, the
+    /// value is non-blank, AND a version is actually appended — it never feeds
+    /// the content-changed test, so an instruction-only patch appends nothing.
+    /// Capped at `MAX_INSTRUCTION_BYTES` (rejected before any file write).
+    #[serde(default)]
+    pub instruction: Option<String>,
 }
 
 /// Which prompts to list. With `projectId` set, the manager serves that ONE

@@ -50,6 +50,26 @@ export function isSelectionStale(body: string, sel: CapturedSelection): boolean 
 }
 
 /**
+ * Split the body around a captured range for the selection highlight (plan 17
+ * feature 4): `before + selected + after` always rejoins to `body` exactly.
+ * Null when there is no selection or the range is stale (R-6): a highlight is
+ * drawn only while the captured range still holds the captured text — it is
+ * never re-searched or relocated (plan 13 D4), it simply disappears.
+ */
+export function selectionSegments(
+  body: string,
+  sel: CapturedSelection | null,
+): { before: string; selected: string; after: string } | null {
+  if (sel === null) return null;
+  if (isSelectionStale(body, sel)) return null;
+  return {
+    before: body.slice(0, sel.start),
+    selected: sel.text,
+    after: body.slice(sel.end),
+  };
+}
+
+/**
  * Splice `proposal` over the captured range. Refuses (and leaves nothing
  * changed) when the range is stale. On success `caret` covers the inserted
  * text, so the caller can re-select it after the controlled-textarea update.

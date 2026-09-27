@@ -312,6 +312,7 @@ async fn deleting_a_prompt_sweeps_its_draft_server_side() {
             body: Some("body".into()),
             reusable: None,
             source: None,
+            instruction: None,
         })
         .await
         .unwrap();

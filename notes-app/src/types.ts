@@ -100,6 +100,11 @@ export interface PromptVersion {
   body: string;
   source: PromptSource;
   createdAt: string; // RFC 3339
+  /** Plan 17 (1b): the AI instruction behind an ACCEPTED rewrite, carried on
+   *  the resulting aiEnhanced version. Null on manual versions, pre-feature
+   *  versions and blank instructions. Stored in the version file — it goes
+   *  into git with the prompt's history. */
+  instruction: string | null;
 }
 
 export interface NewPrompt {
@@ -112,6 +117,10 @@ export interface NewPrompt {
    *  "aiEnhanced" when a new draft's first persisted content is an accepted AI
    *  enhance proposal, so history labels it correctly. */
   source?: PromptSource;
+  /** Plan 17: sent only with `source: "aiEnhanced"` — the instruction that
+   *  produced the accepted proposal (request-time capture, never the live
+   *  box). The backend ignores it otherwise; capped at 8 KiB server-side. */
+  instruction?: string;
 }
 
 /** Omitted fields are left unchanged. A title/body change appends a version;
@@ -122,6 +131,10 @@ export interface UpdatePrompt {
   body?: string;
   reusable?: boolean;
   source?: PromptSource;
+  /** Plan 17: sent only with `source: "aiEnhanced"`; the backend ignores it
+   *  otherwise, and a patch that changes only the instruction appends no
+   *  version. */
+  instruction?: string;
 }
 
 /** projectId selects one store. Omit it for the "All projects" scope: the

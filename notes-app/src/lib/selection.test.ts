@@ -1,5 +1,5 @@
 import { describe, it, expect } from "vitest";
-import { captureSelection, isSelectionStale, spliceProposal } from "./selection";
+import { captureSelection, isSelectionStale, selectionSegments, spliceProposal } from "./selection";
 import type { CapturedSelection } from "./selection";
 
 describe("captureSelection", () => {
@@ -235,5 +235,128 @@ describe("RED evidence: guard vs. an unguarded splice", () => {
     // instead of producing corrupted text.
     const guarded = spliceProposal(editedBody, sel, proposal);
     expect(guarded).toEqual({ ok: false, reason: "stale" });
+  });
+});
+
+describe("selectionSegments", () => {
+  it("rejoins the body exactly for a selection at the very start", () => {
+    const body = "Hello world";
+    const sel = captureSelection({ start: 0, end: 5 }, body) as CapturedSelection; // "Hello"
+    const seg = selectionSegments(body, sel);
+    expect(seg).not.toBeNull();
+    expect(seg!.before + seg!.selected + seg!.after).toBe(body);
+    expect(seg!.before).toBe("");
+    expect(seg!.selected).toBe(sel.text);
+  });
+
+  it("rejoins the body exactly for a selection in the middle", () => {
+    const body = "one two three";
+    const sel = captureSelection({ start: 4, end: 7 }, body) as CapturedSelection; // "two"
+    const seg = selectionSegments(body, sel);
+    expect(seg).not.toBeNull();
+    expect(seg!.before + seg!.selected + seg!.after).toBe(body);
+    expect(seg!.before).toBe("one ");
+    expect(seg!.selected).toBe(sel.text);
+    expect(seg!.after).toBe(" three");
+  });
+
+  it("rejoins the body exactly for a selection at the very end", () => {
+    const body = "Hello world";
+    const sel = captureSelection({ start: 6, end: 11 }, body) as CapturedSelection; // "world"
+    const seg = selectionSegments(body, sel);
+    expect(seg).not.toBeNull();
+    expect(seg!.before + seg!.selected + seg!.after).toBe(body);
+    expect(seg!.after).toBe("");
+    expect(seg!.selected).toBe(sel.text);
+  });
+
+  it("rejoins the body exactly when the whole body is selected", () => {
+    const body = "one two three";
+    const sel = captureSelection({ start: 0, end: body.length }, body) as CapturedSelection;
+    const seg = selectionSegments(body, sel);
+    expect(seg).not.toBeNull();
+    expect(seg).toEqual({ before: "", selected: body, after: "" });
+    expect(seg!.selected).toBe(sel.text);
+  });
+
+  it("rejoins the body exactly when the body has a trailing newline", () => {
+    const body = "one two three\n";
+    const sel = captureSelection({ start: 4, end: 7 }, body) as CapturedSelection; // "two"
+    const seg = selectionSegments(body, sel);
+    expect(seg).not.toBeNull();
+    expect(seg!.before + seg!.selected + seg!.after).toBe(body);
+    expect(seg!.after).toBe(" three\n");
+  });
+
+  it("rejoins the body exactly with an emoji sitting at the left boundary of the selection", () => {
+    const EMOJI = String.fromCodePoint(0x1f600); // "😀", two UTF-16 code units
+    const body = `pre ${EMOJI}fox jumps`;
+    const start = body.indexOf(EMOJI); // selection starts exactly at the emoji
+    const end = start + EMOJI.length + "fox".length;
+    const sel = captureSelection({ start, end }, body) as CapturedSelection;
+    const seg = selectionSegments(body, sel);
+    expect(seg).not.toBeNull();
+    expect(seg!.before + seg!.selected + seg!.after).toBe(body);
+    expect(seg!.selected).toBe(sel.text);
+    expect(seg!.selected.startsWith(EMOJI)).toBe(true);
+  });
+
+  it("rejoins the body exactly with an emoji sitting at the right boundary of the selection", () => {
+    const EMOJI = String.fromCodePoint(0x1f600);
+    const body = `the fox${EMOJI} post`;
+    const end = body.indexOf(EMOJI) + EMOJI.length; // selection ends exactly after the emoji
+    const start = "the ".length;
+    const sel = captureSelection({ start, end }, body) as CapturedSelection;
+    const seg = selectionSegments(body, sel);
+    expect(seg).not.toBeNull();
+    expect(seg!.before + seg!.selected + seg!.after).toBe(body);
+    expect(seg!.selected).toBe(sel.text);
+    expect(seg!.selected).toBe("fox" + EMOJI);
+    expect(seg!.selected.endsWith(EMOJI)).toBe(true);
+    // The surrogate pair survives intact as one character, not split into a
+    // lone half: "f", "o", "x", the emoji — four code points, not five units.
+    expect(Array.from(seg!.selected)).toEqual(["f", "o", "x", EMOJI]);
+  });
+
+  it("returns null when the body was edited BEFORE the captured range (stale)", () => {
+    const body = "Hello world";
+    const sel = captureSelection({ start: 6, end: 11 }, body) as CapturedSelection; // "world"
+    const edited = "Hi " + body; // shifts "world" out from under [6, 11)
+    expect(selectionSegments(edited, sel)).toBeNull();
+  });
+
+  it("returns null when the body was edited INSIDE the captured range (stale)", () => {
+    const body = "Hello world";
+    const sel = captureSelection({ start: 0, end: 5 }, body) as CapturedSelection; // "Hello"
+    const edited = "Hallo world"; // same length, different content within the range
+    expect(selectionSegments(edited, sel)).toBeNull();
+  });
+
+  it("returns null when sel is null", () => {
+    expect(selectionSegments("Hello world", null)).toBeNull();
+  });
+});
+
+describe("selectionSegments RED evidence: guard vs. an unguarded slice", () => {
+  it("RED evidence: an unguarded body.slice(sel.start, sel.end) mis-highlights a stale body; selectionSegments refuses", () => {
+    const originalBody = "The quick brown fox jumps over the lazy dog.";
+    const sel = captureSelection({ start: 10, end: 19 }, originalBody) as CapturedSelection;
+    expect(sel.text).toBe("brown fox");
+
+    // The user typed "Hello! " at the very front while a rework proposal for
+    // "brown fox" was pending, shifting the real "brown fox" span to the right.
+    const editedBody = "Hello! " + originalBody;
+
+    // An unguarded slice at the stale indices highlights the WRONG span: not
+    // "brown fox" but a fragment straddling "quick br" — text the user never
+    // selected.
+    const naiveHighlight = editedBody.slice(sel.start, sel.end);
+    expect(naiveHighlight).not.toBe(sel.text);
+    // The mis-highlighted fragment: partway into "quick", not "brown fox".
+    expect(naiveHighlight).toBe(" quick br");
+
+    // The guarded helper detects the same staleness and draws nothing at all
+    // instead of marking the wrong text.
+    expect(selectionSegments(editedBody, sel)).toBeNull();
   });
 });

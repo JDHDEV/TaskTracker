@@ -346,6 +346,9 @@ impl SqliteRepository {
         // read as a default (an unknown status → todo) — surfaced, not silent.
         warnings.extend(outcome.warnings.iter().cloned());
         warnings.extend(prompt_outcome.errors.iter().map(|(name, e)| format!("{name}: {e}")));
+        // Same for prompts (plan.17 R-3): an unreadable `instruction:` value
+        // imports the version with the field absent — reported, never skipped.
+        warnings.extend(prompt_outcome.warnings.iter().cloned());
 
         let mut tx = self.pool.begin().await?;
         sqlx::query("DELETE FROM items").execute(&mut *tx).await?;
@@ -440,8 +443,8 @@ impl SqliteRepository {
             for version in fresh {
                 sqlx::query(
                     "INSERT INTO prompt_versions \
-                     (id, prompt_id, title, body, source, created_at) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                     (id, prompt_id, title, body, source, created_at, instruction) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 )
                 .bind(&version.id)
                 .bind(&version.prompt_id)
@@ -449,6 +452,9 @@ impl SqliteRepository {
                 .bind(&version.body)
                 .bind(&version.source)
                 .bind(&version.created_at)
+                // Files win: already gated by `normalize_instruction` at parse;
+                // no length cap on a value that is already on disk.
+                .bind(&version.instruction)
                 .execute(&mut *tx)
                 .await?;
             }
@@ -661,7 +667,7 @@ impl ItemRepository for SqliteRepository {
         // File-then-index (Stage 2): the canonical file is written before the
         // index row, so the git-tracked store is the source of truth.
         if let Some(dir) = &self.items_dir {
-            itemfile::write_item(dir, &item).map_err(save_file_error)?;
+            itemfile::write_item_capped(dir, &item).map_err(save_file_error)?;
         }
 
         sqlx::query(
@@ -757,7 +763,7 @@ impl ItemRepository for SqliteRepository {
         // File-then-index (Stage 2): mirror the merged item to its canonical file
         // before updating the index row.
         if let Some(dir) = &self.items_dir {
-            itemfile::write_item(dir, &item).map_err(save_file_error)?;
+            itemfile::write_item_capped(dir, &item).map_err(save_file_error)?;
         }
 
         sqlx::query(
@@ -798,7 +804,7 @@ impl ItemRepository for SqliteRepository {
 
         // File-then-index (Stage 2), like update().
         if let Some(dir) = &self.items_dir {
-            itemfile::write_item(dir, &item).map_err(save_file_error)?;
+            itemfile::write_item_capped(dir, &item).map_err(save_file_error)?;
         }
         sqlx::query(
             "UPDATE items SET kind = ?1, status = ?2, priority = ?3, due_at = ?4, \
@@ -952,6 +958,9 @@ impl SqliteRepository {
                     body: v.body.clone(),
                     source: v.source.clone(),
                     created_at: v.created_at.clone(),
+                    // Verbatim from the source (the serializer applies the
+                    // `aiEnhanced`-only gate; no cap on a moved value).
+                    instruction: v.instruction.clone(),
                 };
                 promptfile::write_version(dir, &record).map_err(save_prompt_file_error)?;
             }
@@ -971,8 +980,8 @@ impl SqliteRepository {
         .await?;
         for v in versions {
             sqlx::query(
-                "INSERT INTO prompt_versions (id, prompt_id, title, body, source, created_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                "INSERT INTO prompt_versions (id, prompt_id, title, body, source, created_at, instruction) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             )
             .bind(&v.id)
             .bind(prompt_id)
@@ -982,6 +991,12 @@ impl SqliteRepository {
             // source value can never enter the index.
             .bind(normalize_prompt_source(Some(v.source.as_str())))
             .bind(&v.created_at)
+            // The same gate the file write applied, so the row and the file
+            // agree; no length cap on import (the value is already stored).
+            .bind(promptfile::normalize_instruction(
+                normalize_prompt_source(Some(v.source.as_str())),
+                v.instruction.as_deref(),
+            ))
             .execute(&mut *tx)
             .await?;
         }
@@ -1067,6 +1082,13 @@ impl PromptRepository for SqliteRepository {
         // frontend sends "aiEnhanced" when a new draft's first persisted content
         // is an accepted AI-enhance proposal. Normalized to the closed set.
         let source = normalize_prompt_source(input.source.as_deref());
+        // The instruction behind an accepted rewrite (plan.17 1b): kept only on
+        // an `aiEnhanced` first version and only when non-blank, and capped
+        // BEFORE any file write so an over-long value never reaches disk.
+        let instruction = promptfile::normalize_instruction(source, input.instruction.as_deref());
+        if let Some(s) = instruction.as_deref() {
+            crate::ai::validate_instruction(s)?;
+        }
 
         // Backend-owned ids + timestamp (H2): never client-supplied. The prompt
         // and its first version share `created_at` so the derived `updatedAt`
@@ -1089,13 +1111,24 @@ impl PromptRepository for SqliteRepository {
             body: body.clone(),
             source: source.to_string(),
             created_at: now.clone(),
+            instruction: instruction.clone(),
         };
 
-        // File-then-index: write `prompt.md` and the first version file before
-        // the index rows, so the git-tracked store is the source of truth.
+        // File-then-index: write the first version file and `prompt.md` before
+        // the index rows, so the git-tracked store is the source of truth. The
+        // version goes FIRST: it carries the body, so it is the write the size
+        // cap can refuse (SEC-1) — refusing it before the head exists leaves no
+        // version-less `prompt.md` behind. A crash between the two is covered
+        // by the scanner synthesizing a head from the version (H2).
         if let Some(dir) = &self.prompts_dir {
-            promptfile::write_prompt(dir, &head).map_err(save_prompt_file_error)?;
             promptfile::write_version(dir, &version).map_err(save_prompt_file_error)?;
+            if let Err(e) = promptfile::write_prompt(dir, &head) {
+                // Best-effort: the id was just minted, so the dir holds only
+                // what this call wrote — never leave a headless version behind
+                // for the next reload to surface (and a retry to duplicate).
+                let _ = promptfile::remove_prompt(dir, &prompt_id);
+                return Err(save_prompt_file_error(e));
+            }
         }
 
         let mut tx = self.pool.begin().await?;
@@ -1110,8 +1143,8 @@ impl PromptRepository for SqliteRepository {
         .execute(&mut *tx)
         .await?;
         sqlx::query(
-            "INSERT INTO prompt_versions (id, prompt_id, title, body, source, created_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO prompt_versions (id, prompt_id, title, body, source, created_at, instruction) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         )
         .bind(&version_id)
         .bind(&prompt_id)
@@ -1119,6 +1152,7 @@ impl PromptRepository for SqliteRepository {
         .bind(&body)
         .bind(source)
         .bind(&now)
+        .bind(&instruction)
         .execute(&mut *tx)
         .await?;
         tx.commit().await?;
@@ -1152,6 +1186,14 @@ impl PromptRepository for SqliteRepository {
         // Normalize `source` to the closed set — the accept-proposal path sends
         // "aiEnhanced"; anything else (incl. a manual save) is "manual".
         let source = normalize_prompt_source(patch.source.as_deref());
+        // The instruction behind an accepted rewrite (plan.17 1b): kept only on
+        // an `aiEnhanced` version and only when non-blank, and capped BEFORE any
+        // file write. It never feeds `content_changed` above, so a patch that
+        // changes only the instruction appends no version (R-8).
+        let instruction = promptfile::normalize_instruction(source, patch.instruction.as_deref());
+        if let Some(s) = instruction.as_deref() {
+            crate::ai::validate_instruction(s)?;
+        }
 
         // Files first (append the version, rewrite the head), then the index rows
         // in one transaction. An existing version file is NEVER touched (H2).
@@ -1166,6 +1208,7 @@ impl PromptRepository for SqliteRepository {
                     body: new_body.clone(),
                     source: source.to_string(),
                     created_at: now.clone(),
+                    instruction: instruction.clone(),
                 };
                 promptfile::write_version(dir, &version).map_err(save_prompt_file_error)?;
             }
@@ -1185,8 +1228,8 @@ impl PromptRepository for SqliteRepository {
         let mut tx = self.pool.begin().await?;
         if content_changed {
             sqlx::query(
-                "INSERT INTO prompt_versions (id, prompt_id, title, body, source, created_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                "INSERT INTO prompt_versions (id, prompt_id, title, body, source, created_at, instruction) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             )
             .bind(&version_id)
             .bind(id)
@@ -1194,6 +1237,7 @@ impl PromptRepository for SqliteRepository {
             .bind(&new_body)
             .bind(source)
             .bind(&now)
+            .bind(&instruction)
             .execute(&mut *tx)
             .await?;
         }
@@ -1211,7 +1255,7 @@ impl PromptRepository for SqliteRepository {
 
     async fn versions(&self, prompt_id: &str) -> Result<Vec<PromptVersion>> {
         let versions = sqlx::query_as::<_, PromptVersion>(
-            "SELECT id, prompt_id, title, body, source, created_at \
+            "SELECT id, prompt_id, title, body, source, created_at, instruction \
              FROM prompt_versions WHERE prompt_id = ?1 \
              ORDER BY created_at DESC, id ASC",
         )
@@ -1315,16 +1359,28 @@ fn scrub_open_error(_err: sqlx::Error) -> AppError {
 
 /// Map a canonical-file write/remove failure. `ItemFileError`'s message carries
 /// only an `io::ErrorKind` word and field names — never a path or SQLite text —
-/// so it is safe to surface (Section 4.6).
+/// so it is safe to surface (Section 4.6). The write-side size cap (plan.17
+/// SEC-1) gets its own fixed copy, matching the scratch pad's.
 fn save_file_error(e: itemfile::ItemFileError) -> AppError {
-    AppError::Invalid(format!("couldn't save the item to disk: {e}"))
+    match e {
+        itemfile::ItemFileError::TooLarge => {
+            AppError::Invalid("that text is too large to save (limit 4 MB)".into())
+        }
+        other => AppError::Invalid(format!("couldn't save the item to disk: {other}")),
+    }
 }
 
 /// Map a prompt/version file write/remove failure. Like `PromptFileError`'s
 /// `Display`, it carries only an `io::ErrorKind` word and field names — never a
 /// path, prompt body, or SQLite text — so it is safe to surface (Section 4.6/M3).
+/// The write-side size cap (plan.17 SEC-1) gets the same fixed copy as items.
 fn save_prompt_file_error(e: promptfile::PromptFileError) -> AppError {
-    AppError::Invalid(format!("couldn't save the prompt to disk: {e}"))
+    match e {
+        promptfile::PromptFileError::TooLarge => {
+            AppError::Invalid("that text is too large to save (limit 4 MB)".into())
+        }
+        other => AppError::Invalid(format!("couldn't save the prompt to disk: {other}")),
+    }
 }
 
 /// Normalize a client-supplied prompt `source` to the closed set: anything but

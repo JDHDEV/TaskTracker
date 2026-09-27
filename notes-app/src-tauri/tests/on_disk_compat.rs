@@ -42,6 +42,10 @@ const PROMPT_B: &str = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
 const VERSION_C: &str = "cccccccc-cccc-cccc-cccc-cccccccccccc";
 const VERSION_D: &str = "dddddddd-dddd-dddd-dddd-dddddddddddd";
 const VERSION_E: &str = "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee";
+// plan.17 1b: a third prompt whose sole version carries an `instruction:`
+// line with escaped `\n` sequences and an embedded `---`.
+const PROMPT_F: &str = "ffffffff-ffff-ffff-ffff-ffffffffffff";
+const VERSION_INSTRUCTION: &str = "99999999-9999-9999-9999-999999999999";
 
 fn fixtures() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests").join("fixtures").join("v1_0_0")
@@ -294,7 +298,12 @@ fn every_v1_prompt_fixture_still_scans_with_full_version_history() {
         "v1.0.0 prompt files must still parse; skipped: {:?}",
         outcome.errors
     );
-    assert_eq!(outcome.prompts.len(), 2, "both fixture prompts must be imported");
+    assert_eq!(outcome.prompts.len(), 3, "all three fixture prompts must be imported");
+    assert!(
+        outcome.warnings.is_empty(),
+        "no fixture may degrade on import; warnings: {:?}",
+        outcome.warnings
+    );
 
     let a = outcome
         .prompts
@@ -319,6 +328,45 @@ fn every_v1_prompt_fixture_still_scans_with_full_version_history() {
     let enhanced = a.versions.iter().find(|v| v.id == VERSION_D).unwrap();
     assert_eq!(enhanced.source, "aiEnhanced", "aiEnhanced must survive normalization");
     assert_eq!(enhanced.title, "Enhanced draft");
+    assert_eq!(enhanced.instruction, None, "this pre-plan.17 aiEnhanced version carries none");
+}
+
+#[test]
+fn v1_prompt_version_with_instruction_parses_field_for_field() {
+    // plan.17 1b: the new fixture prompt F carries one aiEnhanced version
+    // whose `instruction:` value has escaped `\n` sequences AND a literal
+    // `---` segment embedded mid-value — never a real frontmatter fence,
+    // since the whole value sits quoted on one physical line.
+    let outcome = promptfile::scan(&prompts_dir());
+    assert!(outcome.errors.is_empty(), "the new fixture must parse cleanly: {:?}", outcome.errors);
+    assert!(
+        outcome.warnings.is_empty(),
+        "a well-formed instruction must produce no warning: {:?}",
+        outcome.warnings
+    );
+
+    let f = outcome
+        .prompts
+        .iter()
+        .find(|p| p.prompt.id == PROMPT_F)
+        .expect("prompt F survived the scan");
+    assert!(!f.prompt.reusable);
+    assert_eq!(f.prompt.created_at, "2026-09-26T09:00:00.000+00:00");
+    assert_eq!(f.prompt.schema_version, "1.0.0");
+    assert_eq!(f.versions.len(), 1);
+
+    let v = &f.versions[0];
+    assert_eq!(v.id, VERSION_INSTRUCTION);
+    assert_eq!(v.prompt_id, PROMPT_F, "prompt_id is derived from the parent dir, never read from the file");
+    assert_eq!(v.source, "aiEnhanced");
+    assert_eq!(v.title, "Tighten the onboarding email");
+    assert_eq!(v.body, "Draft a short onboarding email.\n");
+    assert_eq!(
+        v.instruction.as_deref(),
+        Some("Tighten this.\nKeep the list.\n---\nNo headings."),
+        "the escaped \\n sequences unescape to real newlines, and the embedded \
+         --- survives as plain text inside the value"
+    );
 }
 
 #[test]
@@ -346,6 +394,9 @@ fn current_shape_prompt_fixtures_reserialize_byte_identically() {
 
     for name in [
         "prompts/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa/cccccccc-cccc-cccc-cccc-cccccccccccc.md",
+        // dddddddd is aiEnhanced with NO instruction — pins the "write only
+        // when Some" guard: a pre-plan.17 aiEnhanced version must still
+        // re-export without ever gaining an instruction line.
         "prompts/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa/dddddddd-dddd-dddd-dddd-dddddddddddd.md",
     ] {
         let bytes = read(name);
@@ -357,4 +408,20 @@ fn current_shape_prompt_fixtures_reserialize_byte_identically() {
             "{name} must re-export byte-identically"
         );
     }
+
+    // plan.17 1b: the new prompt F head and its instruction-bearing version.
+    let f_head_name = "prompts/ffffffff-ffff-ffff-ffff-ffffffffffff/prompt.md";
+    let f_head_bytes = read(f_head_name);
+    let f_head = promptfile::parse_prompt(&f_head_bytes).unwrap_or_else(|e| panic!("{f_head_name}: {e}"));
+    assert_eq!(promptfile::serialize_prompt(&f_head), f_head_bytes, "prompt F head must be byte-stable");
+
+    let f_version_name = "prompts/ffffffff-ffff-ffff-ffff-ffffffffffff/99999999-9999-9999-9999-999999999999.md";
+    let f_version_bytes = read(f_version_name);
+    let f_version = promptfile::parse_version(&f_version_bytes, PROMPT_F)
+        .unwrap_or_else(|e| panic!("{f_version_name}: {e}"));
+    assert_eq!(
+        promptfile::serialize_version(&f_version),
+        f_version_bytes,
+        "{f_version_name} must re-export byte-identically — an instruction-bearing version"
+    );
 }

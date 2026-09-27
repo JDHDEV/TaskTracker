@@ -9,6 +9,9 @@ export type StatusFilter = "all" | Status;
 interface Props {
   items: Item[];
   selectedId: string | null;
+  /** Plan 17 feature 7: tab keys (itemKey) of open items with unsaved edits —
+   *  those rows show the unsaved dot + an sr-only name suffix. */
+  dirtyKeys: ReadonlySet<string>;
   kind: KindFilter;
   search: string;
   tagFilter: string[];
@@ -60,6 +63,7 @@ function when(iso: string): string {
 export default function ItemList({
   items,
   selectedId,
+  dirtyKeys,
   kind,
   search,
   tagFilter,
@@ -196,6 +200,15 @@ export default function ItemList({
                     />
                   )}
                   <span className="row-title">{item.title}</span>
+                  {dirtyKeys.has(itemKey(item)) && (
+                    // The same dot as the tab strip (a different SHAPE from
+                    // .row-on's --mark border); a title= inside a <button>
+                    // never reaches its accessible name, the sr-only text does.
+                    <>
+                      <span className="etab-unsaved" aria-hidden="true" title="Unsaved changes" />
+                      <span className="sr-only">, unsaved changes</span>
+                    </>
+                  )}
                   {item.kind === "task" &&
                     item.priority &&
                     item.priority !== "normal" && (

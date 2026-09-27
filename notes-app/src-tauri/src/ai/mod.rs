@@ -5,6 +5,7 @@ pub mod openai;
 use serde::Serialize;
 
 use crate::error::{AppError, Result};
+use crate::models::MAX_INSTRUCTION_BYTES;
 
 /// A vendor-neutral sink for streamed rewrite output. This keeps Tauri's
 /// `Channel` type out of the provider impls the same way `ItemRepository`
@@ -96,6 +97,19 @@ no explanations, no quotation marks around the result.";
 /// Builds the single user message both providers send.
 pub fn rewrite_user_message(text: &str, instruction: &str) -> String {
     format!("Instruction: {instruction}\n\nText to rework:\n{text}")
+}
+
+/// The one definition of the instruction cap (plan.17 R-1): reject an
+/// instruction longer than `MAX_INSTRUCTION_BYTES` (raw UTF-8 bytes; exactly at
+/// the cap passes) with a fixed message that never echoes the text. Pure, so
+/// tests can call it without a live Tauri app — the rewrite commands run it
+/// FIRST (before any key lookup or provider call) and prompt create/update run
+/// it before any file write.
+pub fn validate_instruction(instruction: &str) -> Result<()> {
+    if instruction.len() > MAX_INSTRUCTION_BYTES {
+        return Err(AppError::Invalid("that instruction is too long".into()));
+    }
+    Ok(())
 }
 
 /// The rework instruction that turns the shared editor brief into a title

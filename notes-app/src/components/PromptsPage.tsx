@@ -15,6 +15,8 @@ import {
   activateTab,
   activeTab,
   closeTab,
+  dirtyCount,
+  dirtyKeys,
   emptyTabs,
   hasTab,
   openTab,
@@ -58,6 +60,10 @@ interface Props {
    *  active one), so App's unload confirm warns before an unload closes any of
    *  them — including a dirty background prompt tab. */
   onOpenPromptsChange: (projectIds: string[]) => void;
+  /** Plan 17 feature 7: report how many open prompt tabs carry unsaved edits,
+   *  so App can badge the Prompts page tab even while this page is hidden.
+   *  Fires on count changes only (dirty flips are transition-only). */
+  onDirtyCountChange: (n: number) => void;
   /** One-shot "send to prompt" seed: opens a dirty draft tab in `projectId`
    *  pre-filled with `body`. Plan 13's send-selection passes no `title` (it
    *  defaults empty — `displayTitle` derives a label); Plan 14's "Create prompt
@@ -93,8 +99,10 @@ function newDraft(projectId: string, body = "", title = ""): Prompt {
 // Prompt tab keys are namespaced with a `prompt-` prefix so they can never
 // collide with item-tab keys (both pages stay mounted, so both tab strips — and
 // their derived ARIA DOM ids — live in the document at once, and both draft
-// counters would otherwise mint an identical `draft-1`).
-function promptTabKey(p: Prompt): string {
+// counters would otherwise mint an identical `draft-1`). Exported (plan 17)
+// so PromptList can match rail rows against the dirty-tab set by the SAME
+// composite key — a bare `p.id` lookup would silently never match.
+export function promptTabKey(p: Prompt): string {
   return `prompt-${itemKey(p)}`;
 }
 
@@ -107,6 +115,7 @@ export default function PromptsPage({
   onNotice,
   onResolve,
   onOpenPromptsChange,
+  onDirtyCountChange,
   seed,
   session,
   sessionReady,
@@ -431,6 +440,16 @@ export default function PromptsPage({
     onOpenPromptsChange(openPromptProjectIds);
   }, [openPromptProjectIds, onOpenPromptsChange]);
 
+  // Plan 17 feature 7 (D9): the dirty prompt tabs, for the rail's row markers,
+  // and their count, reported up for the Prompts page-tab badge. Both memoised
+  // on `tabs`, so a keystroke (which never reaches this page) costs nothing and
+  // the report fires only when the count actually changes.
+  const promptDirtyKeys = useMemo(() => dirtyKeys(tabs), [tabs]);
+  const promptDirtyN = useMemo(() => dirtyCount(tabs), [tabs]);
+  useEffect(() => {
+    onDirtyCountChange(promptDirtyN);
+  }, [promptDirtyN, onDirtyCountChange]);
+
   const tabDescriptors = useMemo<EditorTabDescriptor[]>(
     // No status dot / pin on prompt tabs — titles only.
     () =>
@@ -603,6 +622,7 @@ export default function PromptsPage({
       <PromptList
         prompts={prompts}
         selectedId={selectedId}
+        dirtyKeys={promptDirtyKeys}
         loaded={loaded}
         projectId={projectId}
         reusableOnly={reusableOnly}
