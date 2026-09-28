@@ -11,6 +11,24 @@
 // on-disk draft-backup id, stable across restarts). The reducer treats the key
 // as opaque, so two distinct entities/projects never collapse as long as the
 // caller keys them distinctly.
+//
+// Plan 18 (D3): the state also carries the strip's Back/Forward `history`
+// (navHistory.ts), maintained HERE — every activeKey change goes through these
+// reducers, so openTab/activateTab record a visit, closeTab/closeTabs prune the
+// closed key (and re-visit the neighbour that took over, D4), promoteTab
+// renames the draft key, and navigateTab moves the cursor WITHOUT recording.
+// The history is in-memory only; session.ts never persists it (R-8).
+
+import {
+  back,
+  emptyHistory,
+  forward,
+  prune,
+  rename,
+  visit,
+  type NavDirection,
+  type NavHistory,
+} from "./navHistory";
 
 /** One open tab: its stable key, a snapshot of the entity it edits, and whether
  *  the mounted editor currently has unsaved edits (surfaced via onDirtyChange). */
@@ -20,15 +38,18 @@ export interface Tab<T> {
   isDirty: boolean;
 }
 
-/** The open-tab set (tab order) plus which one is active (null = empty state). */
+/** The open-tab set (tab order), which one is active (null = empty state), and
+ *  the Back/Forward history over previously viewed tabs (open keys only;
+ *  `history.entries[history.index]` is the active key while tabs exist). */
 export interface OpenTabsState<T> {
   tabs: Tab<T>[];
   activeKey: string | null;
+  history: NavHistory;
 }
 
 /** The initial empty state — no tabs, no active key (renders the placeholder). */
 export function emptyTabs<T>(): OpenTabsState<T> {
-  return { tabs: [], activeKey: null };
+  return { tabs: [], activeKey: null, history: emptyHistory() };
 }
 
 // Stable DOM ids derived from a tab key, so the tab (`role="tab"`) and its editor
@@ -87,13 +108,15 @@ export function openTab<T>(
   return {
     tabs: [...state.tabs, { key, item, isDirty: initialDirty }],
     activeKey: key,
+    history: visit(state.history, key),
   };
 }
 
-/** Activate an already-open tab. Unknown key → no-op (no dangling activeKey). */
+/** Activate an already-open tab (recorded as a history visit). Unknown key →
+ *  no-op (no dangling activeKey). */
 export function activateTab<T>(state: OpenTabsState<T>, key: string): OpenTabsState<T> {
   if (!hasTab(state, key) || state.activeKey === key) return state;
-  return { ...state, activeKey: key };
+  return { ...state, activeKey: key, history: visit(state.history, key) };
 }
 
 /**
@@ -106,11 +129,66 @@ export function closeTab<T>(state: OpenTabsState<T>, key: string): OpenTabsState
   const index = state.tabs.findIndex((t) => t.key === key);
   if (index === -1) return state;
   const tabs = state.tabs.filter((t) => t.key !== key);
-  if (state.activeKey !== key) return { tabs, activeKey: state.activeKey };
+  // The closed key leaves the history (D5: Back never reopens a closed tab).
+  let history = prune(state.history, (k) => tabs.some((t) => t.key === k));
+  if (state.activeKey !== key) return { tabs, activeKey: state.activeKey, history };
   // Closing the active tab: right neighbor (now at the same index) if present,
-  // otherwise the left neighbor, otherwise nothing left → empty state.
+  // otherwise the left neighbor, otherwise nothing left → empty state. The
+  // neighbour's activation is a visit (D4): prune's clamp may land elsewhere,
+  // and `entries[index]` must stay the active key.
   const neighbor = tabs[index] ?? tabs[index - 1] ?? null;
-  return { tabs, activeKey: neighbor ? neighbor.key : null };
+  if (neighbor) history = visit(history, neighbor.key);
+  return { tabs, activeKey: neighbor ? neighbor.key : null, history };
+}
+
+/**
+ * Close several tabs at once (Plan 18 "Close all"). Unknown and duplicate keys
+ * are ignored; an empty or all-unknown list → identical reference. When the
+ * active tab is among them, the nearest surviving RIGHT neighbour of its
+ * original position takes over, else the nearest surviving left one, else the
+ * empty state — the same rule as closeTab, applied once to the whole set (so
+ * the result can differ from folding closeTab, which walks neighbour by
+ * neighbour). History is pruned and the take-over is a visit (D4).
+ */
+export function closeTabs<T>(state: OpenTabsState<T>, keys: readonly string[]): OpenTabsState<T> {
+  const closing = new Set(keys);
+  if (!state.tabs.some((t) => closing.has(t.key))) return state;
+  const tabs = state.tabs.filter((t) => !closing.has(t.key));
+  let activeKey = state.activeKey;
+  if (activeKey !== null && closing.has(activeKey)) {
+    const origin = state.tabs.findIndex((t) => t.key === activeKey);
+    let neighbor: Tab<T> | null = null;
+    for (let i = origin + 1; i < state.tabs.length && !neighbor; i++)
+      if (!closing.has(state.tabs[i].key)) neighbor = state.tabs[i];
+    for (let i = origin - 1; i >= 0 && !neighbor; i--)
+      if (!closing.has(state.tabs[i].key)) neighbor = state.tabs[i];
+    activeKey = neighbor ? neighbor.key : null;
+  }
+  let history = prune(state.history, (k) => tabs.some((t) => t.key === k));
+  if (activeKey !== null && activeKey !== state.activeKey) history = visit(history, activeKey);
+  return { tabs, activeKey, history };
+}
+
+/**
+ * Back/Forward (Plan 18): move the history cursor one step and activate the
+ * key it lands on WITHOUT recording a visit (navigation never records itself).
+ * Identical reference at either end, or when the target is somehow not open
+ * (R-8: entries are validated on use, never trusted).
+ */
+export function navigateTab<T>(state: OpenTabsState<T>, dir: NavDirection): OpenTabsState<T> {
+  const step = dir === "back" ? back(state.history) : forward(state.history);
+  if (!step || !hasTab(state, step.key)) return state;
+  return { ...state, activeKey: step.key, history: step.history };
+}
+
+/**
+ * Collapse the history to just the active key (or nothing). Called ONCE after
+ * an owner's session restore, whose replayed openTab calls would otherwise
+ * read as a walk through every restored tab.
+ */
+export function resetHistory<T>(state: OpenTabsState<T>): OpenTabsState<T> {
+  const history = state.activeKey === null ? emptyHistory() : visit(emptyHistory(), state.activeKey);
+  return { ...state, history };
 }
 
 /** Set a tab's unsaved flag. Unknown key → no-op; other tabs untouched. */
@@ -165,5 +243,7 @@ export function promoteTab<T>(
   return {
     tabs,
     activeKey: state.activeKey === oldKey ? newKey : state.activeKey,
+    // The draft's visits follow it to the saved key (no dangling draft entry).
+    history: rename(state.history, oldKey, newKey),
   };
 }

@@ -48,19 +48,27 @@ import {
   activateTab,
   activeTab,
   closeTab,
+  closeTabs,
   dirtyKeys,
   emptyTabs,
   hasTab,
+  navigateTab,
   openTab,
   promoteTab,
+  resetHistory,
   setDirty,
   setTabItem,
   type OpenTabsState,
 } from "./lib/openTabs";
+import { canBack, canForward, type NavDirection } from "./lib/navHistory";
+import { runCloseAll } from "./lib/closeAll";
 import ItemList, { KindFilter, StatusFilter } from "./components/ItemList";
 import DraftConflictBar from "./components/DraftConflictBar";
 import Editor, { type EditorHandle } from "./components/Editor";
-import EditorTabs, { type EditorTabDescriptor } from "./components/EditorTabs";
+import EditorTabs, {
+  focusTabFromShortcut,
+  type EditorTabDescriptor,
+} from "./components/EditorTabs";
 import SettingsDialog from "./components/SettingsDialog";
 import ManageProjectsDialog from "./components/ManageProjectsDialog";
 import AboutDialog from "./components/AboutDialog";
@@ -69,6 +77,7 @@ import ScratchPage from "./components/ScratchPage";
 import Toasts from "./components/Toasts";
 import { useToasts } from "./hooks/useToasts";
 import { useContextMenuSurface } from "./hooks/useContextMenuSurface";
+import { useBackForwardKeys } from "./hooks/useBackForwardKeys";
 
 type Page = "worknotes" | "prompts" | "scratch";
 // Tablist order — the arrow-key walk (with wrap) follows this.
@@ -129,6 +138,12 @@ export default function App() {
   // Imperative save() handles per open tab, so the close-dirty "Save" branch can
   // persist a background (non-active) tab whose buffer lives only in its editor.
   const editorRefs = useRef(new Map<string, EditorHandle>());
+  // Plan 17 (§12 F13): a per-tab MOUNT key that survives the draft→saved
+  // promotion. `promoteTab` renames the tab key, and keying the editor element
+  // on the tab key remounted it on the first save — wiping the retained
+  // rework instruction (and the buffer's undo stack). Set at promotion, read
+  // in the render below, dropped when the tab closes.
+  const mountKeys = useRef(new Map<string, string>());
 
   const [showSettings, setShowSettings] = useState(false);
   const [showProjects, setShowProjects] = useState(false);
@@ -185,6 +200,8 @@ export default function App() {
       if (!hasTab(tabs, key)) restoredDraftsRef.current.delete(key);
     for (const key of Array.from(supersededRef.current.keys()))
       if (!hasTab(tabs, key)) supersededRef.current.delete(key);
+    for (const key of Array.from(mountKeys.current.keys()))
+      if (!hasTab(tabs, key)) mountKeys.current.delete(key);
     setConflicts((m) => {
       if (![...m.keys()].some((key) => !hasTab(tabs, key))) return m;
       const next = new Map(m);
@@ -484,7 +501,9 @@ export default function App() {
         }
         const ak = s?.worknotes.activeKey;
         if (ak && hasTab(next, ak)) next = activateTab(next, ak);
-        return next;
+        // Plan 18: the replayed opens above are not a walk the user took —
+        // start the Back/Forward history at the restored active tab.
+        return resetHistory(next);
       });
       if (newConflicts.size > 0) {
         setConflicts(newConflicts);
@@ -648,11 +667,12 @@ export default function App() {
     setTabs((s) => openTab(s, `draft-${crypto.randomUUID()}`, draftItem, true)); // a fresh draft starts dirty
   }
 
-  // "Send selection to…" from a scratch pad (D5): a pre-filled, UNSAVED draft in
-  // the pad's project, title empty (R4 titles it on Save); the pad is untouched
-  // (copy, not cut) and nothing is written until the destination's own Save.
-  // Focus lands on the destination page's tab: the pad's panel goes `hidden`,
-  // which would otherwise drop a keyboard user's focus to <body>.
+  // "Send selection to…" from a scratch pad: a pre-filled, UNSAVED draft in
+  // the pad's project, title empty (R4 titles it on Save). It is a MOVE (plan
+  // 18 D6, superseding plan 13 D5's copy): the pad's own editor removed the
+  // text before calling this, and nothing is written until the destination's
+  // own Save. Focus lands on the destination page's tab: the pad's panel goes
+  // `hidden`, which would otherwise drop a keyboard user's focus to <body>.
   function sendSelectionToItem(kind: Kind, projectId: string, body: string) {
     openNewDraft(kind, projectId, body);
     setPage("worknotes");
@@ -705,7 +725,10 @@ export default function App() {
       await refreshAll();
       // Promote the draft tab to the created item's real key so the tab stays
       // open and its rail row now activates it instead of opening a duplicate.
-      setTabs((s) => promoteTab(s, draftKey, itemKey(created), created));
+      // The mounted editor keeps its instance across the rename (mountKeys).
+      const newKey = itemKey(created);
+      mountKeys.current.set(newKey, mountKeys.current.get(draftKey) ?? draftKey);
+      setTabs((s) => promoteTab(s, draftKey, newKey, created));
       return true;
     } catch (err) {
       showError(String(err));
@@ -719,6 +742,67 @@ export default function App() {
     setTabs((s) => closeTab(s, key));
     editorRefs.current.delete(key);
   }
+
+  // Plan 18 "Close all" (D1/D2, R-4/R-5): one aggregate flow over THIS strip
+  // through the injectable sequencer — Q1 (Cancel = nothing changes), Q2
+  // Save/Discard for the dirty saved tabs, then one Discard confirm per
+  // never-saved draft, each brought to the front first. Reads `tabsRef` fresh,
+  // guards re-entry, discards only through the mounted editor's handle (seal
+  // the queue, then delete), and folds the closed set into the pure closeTabs
+  // reducer. Tabs that stayed open (a kept draft, a failed save) are reported
+  // by a keyed toast; the failed saves have already raised their own errors.
+  const closingAllRef = useRef(false);
+  function requestCloseAll() {
+    if (closingAllRef.current) return;
+    closingAllRef.current = true;
+    void (async () => {
+      try {
+        const open = tabsRef.current.tabs;
+        const { closed, kept } = await runCloseAll({
+          tabs: open.map((t) => ({ key: t.key, isDirty: t.isDirty, isDraft: t.item.id === "" })),
+          confirm: api.confirmDialog,
+          save: async (k) => (await editorRefs.current.get(k)?.save()) ?? false,
+          discard: async (k) => {
+            await editorRefs.current.get(k)?.discardDraft();
+          },
+          activate: (k) => setTabs((s) => activateTab(s, k)),
+          confirmDraft: (k) =>
+            api.confirmDialog(
+              `Discard this unsaved ${open.find((t) => t.key === k)?.item.kind ?? "note"}?`,
+            ),
+        });
+        if (closed.length === 0) return; // cancelled, or nothing could close
+        setTabs((s) => closeTabs(s, closed));
+        closed.forEach((k) => editorRefs.current.delete(k));
+        if (kept.length > 0) {
+          showNotice(
+            `${kept.length} tab${kept.length === 1 ? "" : "s"} stayed open: unsaved or save failed.`,
+            { key: "close-all-kept" },
+          );
+        }
+      } finally {
+        closingAllRef.current = false;
+      }
+    })();
+  }
+
+  // Plan 18 Back/Forward (D3/D5): per strip, in memory, closed tabs pruned.
+  // The ‹ › buttons and the Alt+Left/Right + mouse-button hook (enabled only
+  // while this page is visible with tabs open) both land here; navigation
+  // never records itself (navigateTab). The shortcut path also moves focus to
+  // the tab that became active (the buttons keep their own focus).
+  function navigateHistory(dir: NavDirection, fromShortcut: boolean) {
+    if (closingAllRef.current) return; // R-8: never while Close all is pending
+    const preview = navigateTab(tabsRef.current, dir);
+    if (preview === tabsRef.current) return;
+    setTabs((s) => navigateTab(s, dir));
+    if (fromShortcut && preview.activeKey) focusTabFromShortcut(preview.activeKey);
+  }
+  useBackForwardKeys({
+    enabled: page === "worknotes" && tabs.tabs.length > 0,
+    onBack: () => navigateHistory("back", true),
+    onForward: () => navigateHistory("forward", true),
+  });
 
   // Conflict-bar resolutions (plan.15 D4). "Keep saved version" deletes the
   // kept draft file and dismisses the bar; "Restore unsaved edits" seeds the
@@ -915,6 +999,9 @@ export default function App() {
   // Roving-tab-index page tablist: Left/Right walks PAGES in order (wrapping),
   // activating the neighbour and moving focus there — standard WAI-ARIA tabs.
   function onPageTabKeyDown(e: KeyboardEvent<HTMLButtonElement>) {
+    // R-6 (plan 18): Alt+Left/Right is the tab-strip Back/Forward chord —
+    // never also walk the pages.
+    if (e.altKey || e.ctrlKey || e.metaKey) return;
     if (e.key !== "ArrowLeft" && e.key !== "ArrowRight") return;
     e.preventDefault();
     const i = PAGES.indexOf(page);
@@ -1040,6 +1127,12 @@ export default function App() {
               onNew={() => openNewDraft("note")}
               listLabel="Open items"
               newLabel="Open another item"
+              onCloseAll={requestCloseAll}
+              closeAllLabel="Close all open items"
+              onBack={() => navigateHistory("back", false)}
+              onForward={() => navigateHistory("forward", false)}
+              canBack={canBack(tabs.history)}
+              canForward={canForward(tabs.history)}
             />
             {tabs.tabs.map((t) => {
               const isDraft = t.item.id === "";
@@ -1049,7 +1142,7 @@ export default function App() {
               const draftId = isDraft ? (draftIdFromTabKey(t.key) ?? "") : t.item.id;
               const conflict = conflicts.get(t.key);
               return (
-                <Fragment key={t.key}>
+                <Fragment key={mountKeys.current.get(t.key) ?? t.key}>
                 {conflict && (
                   <DraftConflictBar
                     title={itemTabTitle(t.item)}

@@ -455,7 +455,9 @@ const Editor = forwardRef<EditorHandle, Props>(function Editor(
     selRef.current = null;
     setSelectionLength(0);
     pendingCaretRef.current = null;
-    setInstruction("");
+    // Deliberately NOT `setInstruction("")`: this instance only ever reseeds
+    // on its own draft→saved promotion (same content, new id), where the
+    // retained instruction must survive (plan 17 D3, §12 F13).
     setReworkRequest(null);
     setConfirmingSel(null);
     confirmingRef.current = false;

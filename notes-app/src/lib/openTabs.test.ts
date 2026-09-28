@@ -3,17 +3,21 @@ import {
   activateTab,
   activeTab,
   closeTab,
+  closeTabs,
   dirtyCount,
   dirtyKeys,
   emptyTabs,
   hasTab,
+  navigateTab,
   openTab,
   promoteTab,
+  resetHistory,
   setDirty,
   setTabItem,
   tabDomId,
   tabPanelDomId,
 } from "./openTabs";
+import { canBack, canForward } from "./navHistory";
 
 // Items are plain strings ("Item A", etc.) — the reducer is generic on the
 // string `key`; identity is what these tests exercise, not item shape.
@@ -393,5 +397,328 @@ describe("tabDomId / tabPanelDomId", () => {
   it("produce distinct ids for distinct keys", () => {
     expect(tabDomId("a")).not.toBe(tabDomId("b"));
     expect(tabPanelDomId("a")).not.toBe(tabPanelDomId("b"));
+  });
+});
+
+// --- Plan 18 (D3/D4/D5): closeTabs (bulk close) + the history field carried
+// on OpenTabsState, maintained by these same reducers.
+
+describe("closeTabs", () => {
+  // Fixture: five tabs a, b, c, d, e opened in order, "c" made active.
+  function fiveTabs() {
+    let state = openTab(emptyTabs<string>(), "a", "Item A");
+    state = openTab(state, "b", "Item B");
+    state = openTab(state, "c", "Item C");
+    state = openTab(state, "d", "Item D");
+    state = openTab(state, "e", "Item E");
+    return activateTab(state, "c");
+  }
+
+  it("closing every open key empties the state: no tabs, activeKey null, history empty", () => {
+    const state = fiveTabs();
+    const result = closeTabs(state, ["a", "b", "c", "d", "e"]);
+    expect(result.tabs).toEqual([]);
+    expect(result.activeKey).toBeNull();
+    expect(result.history).toEqual({ entries: [], index: -1 });
+  });
+
+  it("closing a subset that excludes the active tab leaves activeKey and survivor order unchanged", () => {
+    const state = fiveTabs(); // active "c"
+    const result = closeTabs(state, ["b", "e"]);
+    expect(result.tabs.map((t) => t.key)).toEqual(["a", "c", "d"]);
+    expect(result.activeKey).toBe("c");
+  });
+
+  it("closing a subset including the active tab activates the nearest surviving RIGHT neighbour of its original position", () => {
+    const state = fiveTabs(); // active "c" at original index 2
+    const result = closeTabs(state, ["c", "d"]);
+    expect(result.tabs.map((t) => t.key)).toEqual(["a", "b", "e"]);
+    expect(result.activeKey).toBe("e");
+  });
+
+  it("falls back to the nearest surviving LEFT neighbour when every right-hand candidate is also closing", () => {
+    const state = fiveTabs(); // active "c" at original index 2
+    const result = closeTabs(state, ["c", "d", "e"]);
+    expect(result.tabs.map((t) => t.key)).toEqual(["a", "b"]);
+    expect(result.activeKey).toBe("b");
+  });
+
+  it("keeps a surviving dirty tab's isDirty flag intact through a bulk close", () => {
+    let state = fiveTabs();
+    state = setDirty(state, "b", true);
+    state = activateTab(state, "b");
+
+    const result = closeTabs(state, ["a", "c"]);
+
+    expect(result.activeKey).toBe("b");
+    expect(result.tabs.find((t) => t.key === "b")).toEqual({ key: "b", item: "Item B", isDirty: true });
+  });
+
+  it("ignores unknown keys mixed into the list", () => {
+    const state = fiveTabs();
+    const result = closeTabs(state, ["does-not-exist", "b"]);
+    expect(result.tabs.map((t) => t.key)).toEqual(["a", "c", "d", "e"]);
+  });
+
+  it("an empty list is a no-op: identical reference", () => {
+    const state = fiveTabs();
+    const result = closeTabs(state, []);
+    expect(result).toBe(state);
+  });
+
+  it("a list of only unknown keys is a no-op: identical reference", () => {
+    const state = fiveTabs();
+    const result = closeTabs(state, ["nope", "also-nope"]);
+    expect(result).toBe(state);
+  });
+
+  it("duplicate keys in the list behave as if the key were listed once", () => {
+    const state = fiveTabs();
+    const result = closeTabs(state, ["b", "b", "b"]);
+    expect(result.tabs.map((t) => t.key)).toEqual(["a", "c", "d", "e"]);
+  });
+
+  it("surviving tabs' item snapshots keep the same object reference (no copy)", () => {
+    const state = fiveTabs();
+    const aTabBefore = state.tabs.find((t) => t.key === "a");
+    const result = closeTabs(state, ["b"]);
+    expect(result.tabs.find((t) => t.key === "a")).toBe(aTabBefore);
+  });
+
+  it("oracle: the surviving tabs array matches folding closeTab over the same keys, and activeKey matches too when the active tab survives the batch", () => {
+    const state = fiveTabs(); // active "c"
+    const keys = ["b", "e"]; // active tab NOT among these
+
+    const viaCloseTabs = closeTabs(state, keys);
+    const viaFold = keys.reduce((s, k) => closeTab(s, k), state);
+
+    expect(viaCloseTabs.tabs).toEqual(viaFold.tabs);
+    expect(viaCloseTabs.activeKey).toBe(viaFold.activeKey);
+  });
+
+  it("oracle: the surviving tabs array matches folding closeTab over the same keys even when the active tab is among them (activeKey is a documented, intentional difference and is not compared here)", () => {
+    const state = fiveTabs(); // active "c"
+    const keys = ["c", "d"]; // active tab included
+
+    const viaCloseTabs = closeTabs(state, keys);
+    const viaFold = keys.reduce((s, k) => closeTab(s, k), state);
+
+    expect(viaCloseTabs.tabs).toEqual(viaFold.tabs);
+  });
+
+  it("closes a promoted draft by its NEW key: closeTabs still finds it after promoteTab renamed it", () => {
+    let state = openTab(emptyTabs<string>(), "a", "Item A");
+    state = openTab(state, "draft-1", "New draft", true);
+    state = promoteTab(state, "draft-1", "real:1", "Saved Item");
+
+    const result = closeTabs(state, ["real:1"]);
+    expect(hasTab(result, "real:1")).toBe(false);
+    expect(hasTab(result, "draft-1")).toBe(false); // the old key never existed in this state either
+  });
+
+  it("closing a draft by its OLD key first makes a later promoteTab of that key a no-op", () => {
+    let state = openTab(emptyTabs<string>(), "a", "Item A");
+    state = openTab(state, "draft-1", "New draft", true);
+
+    state = closeTabs(state, ["draft-1"]);
+    const result = promoteTab(state, "draft-1", "real:1", "Saved Item");
+
+    expect(result).toBe(state); // promoteTab: hasTab(state, "draft-1") is false -> no-op
+  });
+});
+
+describe("history through the reducers", () => {
+  it("openTab visits record entries in order: a, b, c -> entries [a, b, c]", () => {
+    let state = openTab(emptyTabs<string>(), "a", "Item A");
+    state = openTab(state, "b", "Item B");
+    state = openTab(state, "c", "Item C");
+    expect(state.history).toEqual({ entries: ["a", "b", "c"], index: 2 });
+  });
+
+  it("activateTab records a visit, even to a previously-visited key: a, b, c, activate a -> entries [a, b, c, a]", () => {
+    let state = openTab(emptyTabs<string>(), "a", "Item A");
+    state = openTab(state, "b", "Item B");
+    state = openTab(state, "c", "Item C");
+    state = activateTab(state, "a");
+    expect(state.history).toEqual({ entries: ["a", "b", "c", "a"], index: 3 });
+  });
+
+  it("closeTab prunes the closed key out of the history entirely", () => {
+    let state = openTab(emptyTabs<string>(), "a", "Item A");
+    state = openTab(state, "b", "Item B");
+    state = openTab(state, "c", "Item C");
+    state = closeTab(state, "b");
+    expect(state.history.entries).not.toContain("b");
+  });
+
+  it("D4: closing the active tab re-visits the neighbour that takes over, so entries[index] === activeKey", () => {
+    // [a, b, c, d], then visit d (already active), a, c -> close c (active).
+    // Neighbour is "d" (the tab now at c's old index after removal), but the
+    // pruned history's clamped cursor alone would land on "a" -- the
+    // re-visit is what makes entries[index] agree with the new activeKey.
+    let state = openTab(emptyTabs<string>(), "a", "Item A");
+    state = openTab(state, "b", "Item B");
+    state = openTab(state, "c", "Item C");
+    state = openTab(state, "d", "Item D"); // active d; entries [a,b,c,d]
+    state = activateTab(state, "a"); // entries [a,b,c,d,a]
+    state = activateTab(state, "c"); // entries [a,b,c,d,a,c]
+
+    const result = closeTab(state, "c");
+
+    expect(result.activeKey).toBe("d");
+    expect(result.history).toEqual({ entries: ["a", "b", "d", "a", "d"], index: 4 });
+    expect(result.history.entries[result.history.index]).toBe(result.activeKey);
+    expect(result.history.entries).not.toContain("c");
+  });
+
+  it("promoteTab renames the history entry; navigating back then forward lands on the promoted key, not the stale draft key", () => {
+    let state = openTab(emptyTabs<string>(), "a", "Item A");
+    state = openTab(state, "draft-1", "New draft", true); // entries [a, draft-1], active draft-1
+
+    const promoted = promoteTab(state, "draft-1", "real:1", "Saved Item");
+    expect(promoted.history.entries).toEqual(["a", "real:1"]);
+    expect(promoted.history.entries).not.toContain("draft-1");
+
+    const afterBack = navigateTab(promoted, "back");
+    expect(afterBack.activeKey).toBe("a");
+
+    const afterForward = navigateTab(afterBack, "forward");
+    expect(afterForward.activeKey).toBe("real:1"); // the promoted key, not "draft-1"
+  });
+});
+
+describe("navigateTab", () => {
+  function threeTabs() {
+    let state = openTab(emptyTabs<string>(), "a", "Item A");
+    state = openTab(state, "b", "Item B");
+    state = openTab(state, "c", "Item C");
+    return state; // active "c", entries [a,b,c], index 2
+  }
+
+  it("back sets activeKey to the previous entry WITHOUT recording a new visit (same entries array reference)", () => {
+    const state = threeTabs();
+    const result = navigateTab(state, "back");
+    expect(result.activeKey).toBe("b");
+    expect(result.history.entries).toBe(state.history.entries); // no new entry appended
+    expect(result.history.index).toBe(1);
+  });
+
+  it("forward after a back sets activeKey to the next entry WITHOUT recording a new visit", () => {
+    const state = threeTabs();
+    const back1 = navigateTab(state, "back"); // -> "b"
+    const result = navigateTab(back1, "forward"); // -> "c"
+    expect(result.activeKey).toBe("c");
+    expect(result.history.entries).toBe(state.history.entries);
+  });
+
+  it("forward at the end of history is a no-op: identical reference", () => {
+    const state = threeTabs(); // already at the newest entry
+    const result = navigateTab(state, "forward");
+    expect(result).toBe(state);
+  });
+
+  it("back at the start of history is a no-op: identical reference", () => {
+    const state = threeTabs();
+    const atStart = navigateTab(navigateTab(state, "back"), "back"); // -> "a", the oldest
+    const result = navigateTab(atStart, "back");
+    expect(result).toBe(atStart);
+  });
+});
+
+describe("resetHistory", () => {
+  it("collapses a history built by replaying several openTab calls to a single entry: the active key", () => {
+    let state = openTab(emptyTabs<string>(), "a", "Item A");
+    state = openTab(state, "b", "Item B");
+    state = openTab(state, "c", "Item C");
+    expect(state.history.entries).toEqual(["a", "b", "c"]); // before reset: a full walk
+
+    const result = resetHistory(state);
+    expect(result.history).toEqual({ entries: ["c"], index: 0 });
+  });
+
+  it("resets to empty history when there is no active tab", () => {
+    const result = resetHistory(emptyTabs<string>());
+    expect(result.history).toEqual({ entries: [], index: -1 });
+  });
+});
+
+describe("dirtyCount / dirtyKeys through closeTabs", () => {
+  it("a mixed bulk close leaves dirtyKeys/dirtyCount reflecting exactly the tabs that stayed open and dirty", () => {
+    let state = openTab(emptyTabs<string>(), "a", "Item A");
+    state = openTab(state, "b", "Item B");
+    state = openTab(state, "c", "Item C");
+    state = setDirty(state, "b", true);
+    state = setDirty(state, "c", true);
+
+    const result = closeTabs(state, ["a", "b"]);
+    expect(dirtyKeys(result)).toEqual(new Set(["c"]));
+    expect(dirtyCount(result)).toBe(1);
+  });
+
+  it("simulates a 'save all': setDirty(key, false) for successful saves, then closeTabs over only the successes — a failed save's tab stays open, dirty, and in dirtyKeys", () => {
+    let state = openTab(emptyTabs<string>(), "a", "Item A");
+    state = openTab(state, "b", "Item B");
+    state = setDirty(state, "a", true);
+    state = setDirty(state, "b", true);
+
+    // "a"'s save succeeds; "b"'s save fails, so it is never marked clean and
+    // (mirroring runCloseAll's real "kept" behaviour) never passed to closeTabs.
+    state = setDirty(state, "a", false);
+    const result = closeTabs(state, ["a"]);
+
+    expect(hasTab(result, "b")).toBe(true);
+    expect(dirtyKeys(result)).toEqual(new Set(["b"]));
+    expect(dirtyCount(result)).toBe(1);
+  });
+});
+
+// --- Integration: navHistory + openTabs together, and the invariant that
+// separate strips (separate OpenTabsState objects) never leak into one
+// another's history.
+describe("integration: navHistory + openTabs replay", () => {
+  it("a long replay of open/activate/close/promote/navigate keeps entries[index] === activeKey after every step (hasTab as the open predicate)", () => {
+    let state = openTab(emptyTabs<string>(), "a", "Item A");
+    state = openTab(state, "b", "Item B");
+    state = openTab(state, "draft-1", "New draft", true);
+    state = activateTab(state, "a");
+    state = closeTab(state, "b");
+    expect(state.history.entries[state.history.index]).toBe(state.activeKey);
+
+    state = promoteTab(state, "draft-1", "real:1", "Saved");
+    expect(state.history.entries[state.history.index]).toBe(state.activeKey);
+
+    state = activateTab(state, "real:1");
+    state = navigateTab(state, "back");
+    expect(state.activeKey).toBe("a"); // real:1 was already current; back lands on "a"
+
+    state = navigateTab(state, "forward");
+    expect(state.activeKey).toBe("real:1");
+  });
+
+  it("closing every tab (Close all) leaves canBack and canForward both false", () => {
+    let state = openTab(emptyTabs<string>(), "a", "Item A");
+    state = openTab(state, "b", "Item B");
+    state = openTab(state, "c", "Item C");
+
+    const result = closeTabs(state, ["a", "b", "c"]);
+
+    expect(canBack(result.history)).toBe(false);
+    expect(canForward(result.history)).toBe(false);
+  });
+
+  it("separate strips never leak keys into one another's history, even with colliding suffixes", () => {
+    let itemsStrip = openTab(emptyTabs<string>(), "projA:1", "Item in project A");
+    itemsStrip = openTab(itemsStrip, "projB:1", "Item in project B");
+
+    let promptsStrip = openTab(emptyTabs<string>(), "prompt-x:1", "Prompt x");
+    promptsStrip = openTab(promptsStrip, "x:1", "Item x");
+
+    expect(itemsStrip.history.entries).toEqual(["projA:1", "projB:1"]);
+    expect(itemsStrip.history.entries).not.toContain("prompt-x:1");
+    expect(itemsStrip.history.entries).not.toContain("x:1");
+
+    expect(promptsStrip.history.entries).toEqual(["prompt-x:1", "x:1"]);
+    expect(promptsStrip.history.entries).not.toContain("projA:1");
+    expect(promptsStrip.history.entries).not.toContain("projB:1");
   });
 });

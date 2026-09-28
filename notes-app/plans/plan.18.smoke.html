@@ -1,0 +1,223 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Plan 18 smoke checklist</title>
+<style>
+  :root {
+    --bg: #f4f3ef; --surface: #ffffff; --ink: #23272a; --muted: #6e7378; --line: #dcdad4;
+    --mark: #f6e05e; --mark-soft: #fbf3c9; --mark-ink: #6b5c0e; --ok: #4c8a64; --warn: #b4533a;
+    --note-bg: #eef3f8; --note-ink: #1d4b7a;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #1d1c1a; --surface: #272623; --ink: #eceae4; --muted: #a0a09a; --line: #3a3833;
+      --mark: #f6e05e; --mark-soft: #3a3418; --mark-ink: #f3e08a; --ok: #6fb98a; --warn: #e07a62;
+      --note-bg: #1f2b38; --note-ink: #a9c7e6;
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: var(--bg); color: var(--ink); }
+  body {
+    font-family: "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, sans-serif;
+    font-size: 15px; line-height: 1.5; padding: 24px 16px 80px;
+  }
+  main { max-width: 900px; margin: 0 auto; }
+  h1 { font-size: 22px; margin: 0 0 4px; }
+  h2 { font-size: 17px; margin: 32px 0 8px; padding-top: 12px; border-top: 1px solid var(--line); }
+  h2 small { font-weight: 400; color: var(--muted); font-size: 13px; margin-left: 8px; }
+  p, li { max-width: 78ch; }
+  .lede { color: var(--muted); margin: 0 0 16px; }
+  .sticky {
+    position: sticky; top: 0; z-index: 2; display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+    padding: 10px 12px; margin: 0 -4px 16px; background: var(--surface); border: 1px solid var(--line); border-radius: 8px;
+  }
+  .bar { flex: 1 1 200px; height: 10px; background: var(--line); border-radius: 5px; overflow: hidden; }
+  .bar > div { height: 100%; width: 0; background: var(--ok); transition: width 160ms ease; }
+  .count { font-variant-numeric: tabular-nums; color: var(--muted); font-size: 13px; white-space: nowrap; }
+  button {
+    font: inherit; font-size: 13px; padding: 5px 10px; border: 1px solid var(--line); border-radius: 6px;
+    background: var(--surface); color: var(--ink); cursor: pointer;
+  }
+  button:hover { border-color: var(--muted); }
+  ol.steps { list-style: none; margin: 0; padding: 0; counter-reset: step; }
+  ol.steps > li {
+    counter-increment: step; display: grid; grid-template-columns: 28px 1fr; gap: 10px;
+    padding: 10px 12px; margin: 0 0 8px; background: var(--surface); border: 1px solid var(--line); border-radius: 8px;
+  }
+  ol.steps > li.done { opacity: 0.62; }
+  ol.steps > li > input { width: 18px; height: 18px; margin: 3px 0 0; accent-color: var(--ok); cursor: pointer; }
+  ol.steps > li > label { cursor: pointer; }
+  ol.steps > li > label::before { content: counter(step) ". "; color: var(--muted); font-variant-numeric: tabular-nums; }
+  .pass { display: block; margin-top: 6px; color: var(--ok); }
+  .pass::before { content: "PASS: "; font-weight: 600; }
+  .expected { display: block; margin-top: 6px; padding: 6px 10px; background: var(--note-bg); color: var(--note-ink); border-radius: 6px; }
+  .expected::before { content: "Expected, not a defect: "; font-weight: 600; }
+  .record { display: block; margin-top: 6px; color: var(--muted); }
+  .record::before { content: "Record: "; font-weight: 600; }
+  .setup { padding: 10px 12px; background: var(--mark-soft); border: 1px solid var(--mark); border-radius: 8px; color: var(--mark-ink); }
+  .setup code, li code, p code { font-family: "Cascadia Mono", Consolas, ui-monospace, monospace; font-size: 0.92em; }
+  kbd { font-family: inherit; font-size: 0.9em; padding: 1px 5px; border: 1px solid var(--line); border-bottom-width: 2px; border-radius: 4px; background: var(--bg); }
+  .fail-note { color: var(--warn); }
+  .r7 { border-color: var(--warn); }
+  @media (max-width: 600px) { body { padding: 16px 12px 80px; } }
+</style>
+</head>
+<body>
+<main>
+  <h1>Plan 18 smoke checklist — tab strip &amp; navigation batch</h1>
+  <p class="lede">worknotes · plan 18 (Close all, overflow fix + thin scrollbar, Back/Forward history, scratch move-on-send, <em>High contrast (VS Code)</em> palette). Progress is kept in this browser's storage; use <em>Reset</em> to start over. Every FAIL is a defect to fix before plan 18 ships — write it down as you go. Items outlined in red are the ones only the running app can answer (plan §4 R-7 and §10).</p>
+
+  <div class="sticky">
+    <div class="bar"><div id="bar"></div></div>
+    <span class="count" id="count">0 / 0</span>
+    <button type="button" id="reset">Reset</button>
+  </div>
+
+  <div class="setup">
+    <strong>Setup.</strong> Close the installed app (<code>C:\Tools\worknotes</code>) first. Run the dev app with an isolated identifier so its <code>catalog.db</code> and drafts folder are its own: write <code>smoke.json</code> containing <code>{"identifier":"io.github.jdhdev.worknotes.smoke"}</code> and run <code>cd notes-app &amp;&amp; npm run tauri dev -- --config smoke.json</code> (AI keys still work — the keyring service name is constant). Load one project with at least 15 notes/tasks (for the overflow steps), a few prompts, and its scratch pad with a paragraph of text. Afterwards delete <code>%APPDATA%\io.github.jdhdev.worknotes.smoke</code> and <code>%LOCALAPPDATA%\io.github.jdhdev.worknotes.smoke</code>. Keep this page on a second monitor. The palette picker is the <em>Color palette</em> select in the top bar.
+  </div>
+
+  <h2>1 · Strip overflow and scrollbar <small>items 2 + 3 · repeat in every palette</small></h2>
+  <ol class="steps" data-section="s1">
+    <li><input type="checkbox" id="s1-1"><label for="s1-1">On Worknotes, open ~15 items from the rail so the tab strip overflows its width.<span class="pass">a thin horizontal scrollbar appears under the tabs; there is <strong>no vertical scrollbar</strong> anywhere in the strip.</span><span class="expected">the bar grows by the scrollbar's thickness the moment overflow starts, and while the scrollbar is showing there is no hairline between it and the editor.</span></label></li>
+    <li><input type="checkbox" id="s1-2"><label for="s1-2">Hover the strip and roll the mouse wheel up and down.<span class="pass">nothing in the strip moves vertically (not even 1px); the tabs stay put.</span></label></li>
+    <li><input type="checkbox" id="s1-3"><label for="s1-3">Look at the join between the <strong>active</strong> tab and the editor below, with the scrollbar showing and again with only 2 tabs open (no scrollbar).<span class="pass">no hairline runs under the active tab (it joins the editor); the other tabs sit 1px above the line; the strip's height did not change from before plan 18 (41px).</span></label></li>
+    <li><input type="checkbox" id="s1-4"><label for="s1-4">With 1–2 tabs open, inspect the strip.<span class="pass">no scrollbar and no reserved gutter; the ‹ › buttons, the tabs, <code>+</code> and <code>Close all</code> sit on one row.</span></label></li>
+    <li><input type="checkbox" id="s1-5"><label for="s1-5">Hover the strip when it overflows, then move the mouse away.<span class="pass">the scrollbar thumb darkens (ink) while hovered and returns to the muted tone after; it is visible against the background in the current palette.</span></label></li>
+    <li><input type="checkbox" id="s1-6"><label for="s1-6">Switch through all six palettes with the strip overflowing.<span class="pass">the thumb re-colours live with each palette and stays visible in every one (including High contrast).</span></label></li>
+    <li><input type="checkbox" id="s1-7"><label for="s1-7">Narrow the window until the strip is a few tabs wide; also try Windows 150 % scaling if available.<span class="pass">the strip still scrolls horizontally only; the controls outside the tablist never scroll away; nothing wraps.</span></label></li>
+    <li><input type="checkbox" id="s1-8"><label for="s1-8">Optional DevTools check (<kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>I</kbd> in the dev build): select the <code>.editor-tabs</code> element and evaluate <code>$0.scrollHeight - $0.clientHeight</code>.<span class="pass">the result is <code>0</code>.</span></label></li>
+    <li><input type="checkbox" id="s1-9"><label for="s1-9">Tab into the strip with the keyboard and look at the focused tab.<span class="pass">the focus ring is drawn fully inside the tab (not clipped along the bottom edge).</span></label></li>
+    <li><input type="checkbox" id="s1-10"><label for="s1-10">Repeat steps 1–3 on the <strong>Prompts</strong> and <strong>Scratch</strong> strips (open several prompts; open pads for two or more projects).<span class="pass">same behaviour on all three strips.</span></label></li>
+  </ol>
+
+  <h2>2 · Close all <small>item 1 · items, prompts, scratch pads</small></h2>
+  <ol class="steps" data-section="s2">
+    <li><input type="checkbox" id="s2-1"><label for="s2-1">Worknotes: open 3 items, edit nothing, click <strong>Close all</strong>.<span class="pass">no dialog; every tab closes; the empty placeholder ("Select something on the left…") has focus; the Worknotes page-tab badge shows nothing; the tab bar (and its Close all button) is gone.</span></label></li>
+    <li><input type="checkbox" id="s2-2"><label for="s2-2">Open 3 clean items plus 2 saved items you then edit (dirty dots). Click <strong>Close all</strong>, read the dialog, press <strong>Cancel</strong>.<span class="pass">the dialog says <code>Close all 5 tabs? 2 have unsaved changes.</code> with buttons <em>Close all</em> / <em>Cancel</em>; after Cancel nothing changed — all 5 tabs open, both still dirty, same active tab.</span></label></li>
+    <li><input type="checkbox" id="s2-3"><label for="s2-3">Same set-up: <strong>Close all</strong> → <em>Close all</em> → answer <strong>Yes</strong> to <code>Save the 2 unsaved tabs before closing? Yes saves and closes; No discards them.</code><span class="pass">exactly two dialogs; both edits are saved (reopen the items: the edits are there, the files' <code>updated_at</code> moved); all 5 tabs closed; no toast.</span></label></li>
+    <li><input type="checkbox" id="s2-4"><label for="s2-4">Provoke a save failure: edit one saved item, make its <code>items/&lt;uuid&gt;.md</code> read-only in Explorer, edit a second saved item, then <strong>Close all</strong> → <em>Close all</em> → <strong>Yes</strong>.<span class="pass">the read-only item's tab stays open and dirty with an error toast; the other tabs close; a notice reads <code>1 tab stayed open: unsaved or save failed.</code> Clear the read-only flag afterwards.</span></label></li>
+    <li><input type="checkbox" id="s2-5"><label for="s2-5">Open one saved item and edit it; click <code>+</code> and type into the new draft (never saved); also open one clean item. <strong>Close all</strong> → <em>Close all</em> → <strong>No</strong> (discard) for the saved one.<span class="pass">the two bulk dialogs come first; then the draft tab is brought to the front and asks <code>Discard this unsaved note?</code>; answer <strong>No</strong>: the draft stays open (its text intact), everything else closed, notice <code>1 tab stayed open: unsaved or save failed.</code></span></label></li>
+    <li><input type="checkbox" id="s2-6"><label for="s2-6">Repeat step 5 but answer <strong>Yes</strong> to the draft's discard. Then look in the dev app's drafts folder (<code>%APPDATA%\io.github.jdhdev.worknotes.smoke\drafts</code>) and restart the app.<span class="pass">no draft backup file remains for that draft; after the restart nothing is restored and no "Restored unsaved edits" toast appears.</span></label></li>
+    <li><input type="checkbox" id="s2-7"><label for="s2-7">Open 4 items, activate the <em>second</em> one, press <strong>Close all</strong> and Cancel; then click Close all again while the first dialog is still open is impossible — instead, click <strong>Close all</strong> twice quickly on a set with dirty tabs.<span class="pass">only one dialog sequence runs (the second click is ignored while the first is in flight).</span></label></li>
+    <li><input type="checkbox" id="s2-8"><label for="s2-8">Prompts page: repeat steps 1, 2, 3 and 5 with prompts (a never-saved prompt draft asks <code>Discard this unsaved prompt?</code>).<span class="pass">identical behaviour; the accessible name of the button (hover tooltip via a screen reader, or DevTools) is <code>Close all open prompts</code>.</span></label></li>
+    <li><input type="checkbox" id="s2-9"><label for="s2-9">Scratch page: open pads for two projects, edit one, <strong>Close all</strong>.<span class="pass">Q1 names 2 tabs / 1 unsaved; Q2 offers Save/Discard; there is never a per-draft dialog (pads are never drafts); the empty placeholder ("Pick a project on the left…") takes focus when the last pad closes.</span></label></li>
+    <li><input type="checkbox" id="s2-10"><label for="s2-10">With tabs open on all three pages, run Close all on <strong>one</strong> page.<span class="pass">only that page's strip closes; the other two pages keep every tab (and their badges).</span></label></li>
+  </ol>
+
+  <h2>3 · Back / Forward <small>item 4 · buttons, keyboard, mouse</small></h2>
+  <ol class="steps" data-section="s3">
+    <li><input type="checkbox" id="s3-1"><label for="s3-1">Worknotes: open items a, b, c in that order (each open activates it). Click <strong>‹</strong> twice, then <strong>›</strong> once.<span class="pass">‹ shows b, then a; › shows b again. With a shown, ‹ is dimmed; with c shown, › is dimmed.</span></label></li>
+    <li><input type="checkbox" id="s3-2"><label for="s3-2">With a shown (‹ dimmed), click <strong>‹</strong> three more times, then press <kbd>Tab</kbd>.<span class="pass">nothing changes on the clicks, and focus is still on the ‹ button (Tab moves to ›) — it never dropped to the page body.</span></label></li>
+    <li><input type="checkbox" id="s3-3"><label for="s3-3">Go back to a, then click item d in the rail.<span class="pass">d opens; › is dimmed (the forward branch b, c is gone, like a browser); ‹ returns to a.</span></label></li>
+    <li><input type="checkbox" id="s3-4"><label for="s3-4">Open a, b, c; close b with its ×; from c press <strong>‹</strong>.<span class="pass">a is shown — the closed tab b is skipped, never re-opened.</span></label></li>
+    <li><input type="checkbox" id="s3-5"><label for="s3-5">Open a, then click <code>+</code>, type a body into the draft and press <kbd>Ctrl</kbd>+<kbd>S</kbd> (it gets an AI title and becomes a real item). Click a in the rail, then press <strong>‹</strong>.<span class="pass">the promoted item is shown (no ghost, no blank tab); › then returns to a.</span></label></li>
+    <li><input type="checkbox" id="s3-6"><label for="s3-6">Open a, b, c; click <strong>Close all</strong>; open a again.<span class="pass">both ‹ and › are dimmed right after the reopen (history restarted).</span></label></li>
+    <li class="r7"><input type="checkbox" id="s3-7"><label for="s3-7"><strong>R-7 keyboard.</strong> Open a, b, c; click into c's <strong>body textarea</strong>, type a word, then press <kbd>Alt</kbd>+<kbd>←</kbd>, then <kbd>Alt</kbd>+<kbd>→</kbd>.<span class="pass">Alt+← shows b (focus lands on b's tab in the strip), Alt+→ shows c again; the word you typed in c is still there with the caret unchanged when you click back in; the page did <strong>not</strong> blank, reload, or lose state.</span><span class="record">write down whether the chord reached the app at all — if it never navigates, note it as the plan §10 residual (WebView2 consumed it), not a defect.</span></label></li>
+    <li class="r7"><input type="checkbox" id="s3-8"><label for="s3-8"><strong>R-7 keyboard, inputs.</strong> Put the caret in the <strong>title</strong> input and press <kbd>Alt</kbd>+<kbd>←</kbd>; then in the <strong>Rework instruction</strong> box with some text, press <kbd>Alt</kbd>+<kbd>→</kbd>.<span class="pass">navigation happens (or nothing, per step 7); no text is lost from either field.</span></label></li>
+    <li class="r7"><input type="checkbox" id="s3-9"><label for="s3-9"><strong>R-7 mouse.</strong> With a 5-button mouse, press the <strong>back thumb button</strong> (XButton1) over the editor, then the <strong>forward</strong> one (XButton2).<span class="pass">the strip navigates back then forward; the app never blanks or reloads.</span><span class="record">note the result even if you have no such mouse (write "no XButton mouse").</span></label></li>
+    <li><input type="checkbox" id="s3-10"><label for="s3-10">Open tabs on all three pages. On <strong>Worknotes</strong>, press <kbd>Alt</kbd>+<kbd>←</kbd> (or the mouse back button); then switch to Prompts and Scratch and look at their strips.<span class="pass">only the Worknotes strip moved; the hidden strips' active tabs are unchanged.</span></label></li>
+    <li><input type="checkbox" id="s3-11"><label for="s3-11">Focus a <strong>tab</strong> in the strip (click it) and press <kbd>Alt</kbd>+<kbd>←</kbd>; then press plain <kbd>←</kbd>.<span class="pass">Alt+← performs Back only (it does not also step to the neighbouring tab); plain ← still walks to the neighbouring tab as before.</span></label></li>
+    <li><input type="checkbox" id="s3-12"><label for="s3-12">Focus a <strong>page tab</strong> (Worknotes/Prompts/Scratch in the top bar) and press <kbd>Alt</kbd>+<kbd>←</kbd>; then plain <kbd>←</kbd>.<span class="pass">Alt+← does not change the page (it is the strip's Back); plain ← still switches pages with wrap.</span></label></li>
+    <li><input type="checkbox" id="s3-13"><label for="s3-13">Open the <strong>About</strong> dialog (or History on a prompt) and press <kbd>Alt</kbd>+<kbd>←</kbd>; close it. Then right-click in a body to open the native context menu and press <kbd>Alt</kbd>+<kbd>←</kbd>.<span class="pass">no navigation while either is open.</span></label></li>
+    <li><input type="checkbox" id="s3-14"><label for="s3-14">Open a, b, c; go back to a; restart the app (session restore reopens the tabs).<span class="pass">the same tabs are back with a active, and <strong>both</strong> ‹ and › are dimmed (history is never persisted).</span></label></li>
+    <li><input type="checkbox" id="s3-15"><label for="s3-15">Overflow the strip (15 tabs), go back several times with ‹.<span class="pass">the strip scrolls so the newly shown tab is visible each time.</span></label></li>
+    <li><input type="checkbox" id="s3-16"><label for="s3-16">Repeat step 1 on the Prompts and Scratch strips.<span class="pass">each strip has its own independent ‹ › history.</span></label></li>
+  </ol>
+
+  <h2>4 · Scratch move-on-send <small>item 5 · supersedes plan 13 "copy, not cut"</small></h2>
+  <ol class="steps" data-section="s4">
+    <li><input type="checkbox" id="s4-1"><label for="s4-1">Scratch page: select a sentence in the pad, right-click → <strong>New note from selection</strong>.<span class="pass">Worknotes opens with a draft whose body is <em>exactly</em> the selection; back on Scratch the sentence is <strong>gone</strong> from the pad, the pad has the unsaved dot, the Scratch page-tab badge shows 1; a notice on the destination page reads <code>Moved the selection out of the scratch pad — it stays unsaved; Ctrl+Z in the pad puts the text back.</code></span></label></li>
+    <li><input type="checkbox" id="s4-2"><label for="s4-2">Open the project's <code>scratch.md</code> in Notepad now.<span class="pass">the sentence is still in the file (nothing is written until the pad's own Save).</span></label></li>
+    <li><input type="checkbox" id="s4-3"><label for="s4-3">Go back to Scratch, click into the pad and press <kbd>Ctrl</kbd>+<kbd>Z</kbd>.<span class="pass">the sentence comes back at its original place (native undo survived the move).</span></label></li>
+    <li><input type="checkbox" id="s4-4"><label for="s4-4">Do step 1 again; this time <strong>type</strong> something in the destination draft first, then return to the pad and press <kbd>Ctrl</kbd>+<kbd>Z</kbd>.<span class="pass">the sentence comes back at its original place and is selected — the pad restores its last move itself (§12 item 19; the window's single native undo stack would otherwise unwind the destination typing first). Then type one character in the pad and press <kbd>Ctrl</kbd>+<kbd>Z</kbd> again: that is the ordinary native undo of the character.</span></label></li>
+    <li><input type="checkbox" id="s4-5"><label for="s4-5">Do step 1 (leave the pad unsaved), then kill the app (Task Manager) and relaunch.<span class="pass">the pad is restored <strong>dirty and without</strong> the moved sentence ("Restored unsaved edits to 1 scratch pad"); the note draft is restored too with the sentence.</span></label></li>
+    <li><input type="checkbox" id="s4-6"><label for="s4-6">Repeat step 1 with <strong>New task from selection</strong> and <strong>New prompt from selection</strong>.<span class="pass">same move semantics for a task draft and a prompt draft; the toast appears on each destination page.</span></label></li>
+    <li><input type="checkbox" id="s4-7"><label for="s4-7">Select only spaces/newlines in the pad and right-click.<span class="pass">the three send-to items are absent (unchanged from plan 16); nothing is removed from the pad.</span></label></li>
+    <li><input type="checkbox" id="s4-8"><label for="s4-8">Select three lines <em>including the trailing newline</em> of the last one, send to a note.<span class="pass">exactly those characters leave the pad (the line after them moves up); the draft body ends with that newline.</span></label></li>
+    <li><input type="checkbox" id="s4-9"><label for="s4-9">Select text, right-click, then press <kbd>Esc</kbd> to dismiss the menu.<span class="pass">nothing moves; the pad and selection are unchanged.</span></label></li>
+    <li><input type="checkbox" id="s4-10"><label for="s4-10">Insert timestamp (right-click → Insert timestamp) still works in the pad, items and prompts.<span class="pass">unchanged from plan 16.</span></label></li>
+  </ol>
+
+  <h2>5 · High contrast (VS Code) palette <small>item 6 · every screen</small></h2>
+  <ol class="steps" data-section="s5">
+    <li><input type="checkbox" id="s5-1"><label for="s5-1">Pick <strong>High contrast (VS Code)</strong> — it is the last entry in the palette picker.<span class="pass">the app turns black with white text and cyan hairlines everywhere; the picker shows the new label; the option order is unchanged for the other five.</span><span class="expected">every border is bright cyan and panels are barely distinguishable by tone — the line is what separates regions (D7).</span></label></li>
+    <li><input type="checkbox" id="s5-2"><label for="s5-2">Rails: read a selected row, a pinned row, a dirty row (unsaved dot) and tag chips.<span class="pass">all text is readable; the active-row mark and the unsaved dot are orange and clearly visible on black.</span></label></li>
+    <li><input type="checkbox" id="s5-3"><label for="s5-3">Top bar: make two pages dirty so the page-tab badges show.<span class="pass">the badge is orange with <strong>black</strong> numerals (never white on orange).</span></label></li>
+    <li><input type="checkbox" id="s5-4"><label for="s5-4">Tab strip: hover a tab's <strong>×</strong>.<span class="pass">at rest the × is a white glyph in a cyan outline; on hover it becomes black on orange.</span></label></li>
+    <li><input type="checkbox" id="s5-5"><label for="s5-5">Editor: title, JIRA field, due date, tag picker, placeholders, the Rework instruction box.<span class="pass">field text and placeholders readable; borders cyan; the focus ring (white) visible on every field via <kbd>Tab</kbd> traversal.</span></label></li>
+    <li><input type="checkbox" id="s5-6"><label for="s5-6">Status dots on a task (todo / doing / testing / done) and the status words as text.<span class="pass">all four dots are visible on black; the constant doing/testing/done colours were NOT changed.</span><span class="expected"><code>done</code> used as text reaches AA (≈5.1:1), not 7:1 — accepted (plan §10 Q4).</span></label></li>
+    <li><input type="checkbox" id="s5-7"><label for="s5-7">Run a rework (whole text and on a selection) and inspect the review card: <em>Proposed rewrite</em> chip, the diff insertions/deletions, the body highlight while pending, Replace text / Discard.<span class="pass">chip text is black on orange; insertions/deletions readable; the body highlight is a dim orange tint with an orange underline.</span></label></li>
+    <li><input type="checkbox" id="s5-8"><label for="s5-8">Buttons: New note (primary), Save (dirty and "Saved" disabled), Delete (danger), quiet buttons, a disabled button.<span class="pass">primary buttons are black with a cyan border and lighten slightly on hover; the Save label is black on orange; danger text is the salmon <code>#F48771</code>; disabled states still legible.</span></label></li>
+    <li><input type="checkbox" id="s5-9"><label for="s5-9">Dialogs: About, Manage projects, a prompt's History, Settings.<span class="pass">each dialog is outlined in cyan and readable.</span><span class="expected">the scrim behind a dialog is nearly invisible on black; native confirm dialogs (Close all, Discard, Delete) follow the OS theme, not the palette.</span></label></li>
+    <li><input type="checkbox" id="s5-10"><label for="s5-10">Toasts: trigger a notice (Close all with a kept draft) and an error (save with an empty title on an empty body).<span class="pass">both readable.</span></label></li>
+    <li><input type="checkbox" id="s5-11"><label for="s5-11">Tab strip scrollbar (overflow the strip) and the rail's scrollbar.<span class="pass">the strip thumb is light gray on black, visible; the rail's scrollbar is unchanged (light OS default — an accepted app-wide follow-up).</span></label></li>
+    <li><input type="checkbox" id="s5-12"><label for="s5-12">Restart the app.<span class="pass">High contrast is still selected and applied before the first paint (no light flash).</span></label></li>
+    <li><input type="checkbox" id="s5-13"><label for="s5-13">In DevTools run <code>localStorage.setItem("palette","hc")</code> and reload (<kbd>F5</kbd> in the dev build).<span class="pass">the app falls back to <em>Original</em> (stale/garbage ids never reach the DOM).</span></label></li>
+    <li><input type="checkbox" id="s5-14"><label for="s5-14">Switch back to each of the other five palettes.<span class="pass">nothing about them changed; the tab strip's new bar, ‹ ›, and Close all look right in each.</span></label></li>
+  </ol>
+
+  <h2>6 · Regression spot checks <small>things the batch touched</small></h2>
+  <ol class="steps" data-section="s6">
+    <li><input type="checkbox" id="s6-1"><label for="s6-1">Close a single dirty tab with its ×.<span class="pass">the existing per-tab Cancel / Discard / Save dialogs are unchanged.</span></label></li>
+    <li><input type="checkbox" id="s6-2"><label for="s6-2">Close the active tab with ×.<span class="pass">the right neighbour (else left) takes over and gets focus, as before.</span></label></li>
+    <li><input type="checkbox" id="s6-3"><label for="s6-3">Press <kbd>Ctrl</kbd>+<kbd>S</kbd> on each page with several tabs open.<span class="pass">exactly one editor saves (the visible page's active tab).</span></label></li>
+    <li><input type="checkbox" id="s6-4"><label for="s6-4">Unload and reload a project with tabs open on all three pages.<span class="pass">the affected tabs close as before; afterwards ‹ › do not offer the closed tabs.</span></label></li>
+    <li><input type="checkbox" id="s6-5"><label for="s6-5">Keyboard-only pass of the tab bar: <kbd>Tab</kbd> from the rail into ‹, ›, a tab, its ×, <code>+</code>, Close all.<span class="pass">every control is reachable in that order, has a visible focus ring, and activates with <kbd>Enter</kbd>/<kbd>Space</kbd>.</span></label></li>
+  </ol>
+
+  <p class="fail-note">Anything that failed: list it with the section/step number and paste it into §12 of <code>plans/plan.18.md</code> (or the follow-up plan) before committing.</p>
+</main>
+
+<script>
+(function () {
+  var KEY = "plan18-smoke-v1";
+  var boxes = Array.prototype.slice.call(document.querySelectorAll('ol.steps input[type="checkbox"]'));
+  var bar = document.getElementById("bar");
+  var count = document.getElementById("count");
+
+  function load() {
+    try {
+      var raw = localStorage.getItem(KEY);
+      if (!raw) return {};
+      var parsed = JSON.parse(raw);
+      return parsed && typeof parsed === "object" ? parsed : {};
+    } catch (e) { return {}; }
+  }
+  function save(state) {
+    try { localStorage.setItem(KEY, JSON.stringify(state)); } catch (e) { /* storage unavailable: progress is per-session only */ }
+  }
+  function render() {
+    var done = 0;
+    boxes.forEach(function (b) {
+      b.parentElement.classList.toggle("done", b.checked);
+      if (b.checked) done += 1;
+    });
+    var pct = boxes.length ? Math.round((done / boxes.length) * 100) : 0;
+    bar.style.width = pct + "%";
+    count.textContent = done + " / " + boxes.length + " (" + pct + "%)";
+  }
+
+  var state = load();
+  boxes.forEach(function (b) {
+    b.checked = state[b.id] === true;
+    b.addEventListener("change", function () {
+      state[b.id] = b.checked;
+      save(state);
+      render();
+    });
+  });
+  document.getElementById("reset").addEventListener("click", function () {
+    if (!window.confirm("Clear all progress on this checklist?")) return;
+    state = {};
+    try { localStorage.removeItem(KEY); } catch (e) { /* ignore */ }
+    boxes.forEach(function (b) { b.checked = false; });
+    render();
+  });
+  render();
+})();
+</script>
+</body>
+</html>

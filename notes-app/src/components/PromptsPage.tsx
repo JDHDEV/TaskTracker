@@ -15,19 +15,25 @@ import {
   activateTab,
   activeTab,
   closeTab,
+  closeTabs,
   dirtyCount,
   dirtyKeys,
   emptyTabs,
   hasTab,
+  navigateTab,
   openTab,
   promoteTab,
+  resetHistory,
   setDirty,
   setTabItem,
   type OpenTabsState,
 } from "../lib/openTabs";
+import { canBack, canForward, type NavDirection } from "../lib/navHistory";
+import { runCloseAll } from "../lib/closeAll";
+import { useBackForwardKeys } from "../hooks/useBackForwardKeys";
 import PromptList from "./PromptList";
 import PromptEditor, { type PromptEditorHandle } from "./PromptEditor";
-import EditorTabs, { type EditorTabDescriptor } from "./EditorTabs";
+import EditorTabs, { focusTabFromShortcut, type EditorTabDescriptor } from "./EditorTabs";
 
 interface Props {
   /** The loaded subset of the shared project catalog — the same value App
@@ -134,6 +140,9 @@ export default function PromptsPage({
     tabsRef.current = tabs;
   }, [tabs]);
   const editorRefs = useRef(new Map<string, PromptEditorHandle>());
+  // Plan 17 (§12 F13): per-tab mount keys that survive the draft→saved
+  // promotion, so the first save never remounts the editor (see App.tsx).
+  const mountKeys = useRef(new Map<string, string>());
 
   // Monotonic request token guarding loadPrompts, matching App's loadItems.
   const loadToken = useRef(0);
@@ -214,6 +223,8 @@ export default function PromptsPage({
       if (!hasTab(tabs, key)) restoredDraftsRef.current.delete(key);
     for (const key of Array.from(supersededRef.current.keys()))
       if (!hasTab(tabs, key)) supersededRef.current.delete(key);
+    for (const key of Array.from(mountKeys.current.keys()))
+      if (!hasTab(tabs, key)) mountKeys.current.delete(key);
     setConflicts((m) => {
       if (![...m.keys()].some((key) => !hasTab(tabs, key))) return m;
       const next = new Map(m);
@@ -322,7 +333,9 @@ export default function PromptsPage({
           if (entry.dirty) next = setDirty(next, entry.key, true);
         }
         if (s?.activeKey && hasTab(next, s.activeKey)) next = activateTab(next, s.activeKey);
-        return next;
+        // Plan 18: the replayed opens are not a walk the user took — start
+        // the Back/Forward history at the restored active tab.
+        return resetHistory(next);
       });
       if (newConflicts.size > 0) {
         setConflicts(newConflicts);
@@ -524,7 +537,9 @@ export default function PromptsPage({
       const created = await api.createPrompt(input);
       await loadPrompts();
       onProjectsChanged(); // a new prompt bumps this project's count
-      setTabs((s) => promoteTab(s, draftKey, promptTabKey(created), created));
+      const newKey = promptTabKey(created);
+      mountKeys.current.set(newKey, mountKeys.current.get(draftKey) ?? draftKey);
+      setTabs((s) => promoteTab(s, draftKey, newKey, created));
       return true;
     } catch (err) {
       onError(String(err));
@@ -536,6 +551,56 @@ export default function PromptsPage({
     setTabs((s) => closeTab(s, key));
     editorRefs.current.delete(key);
   }
+
+  // Plan 18 "Close all" for the prompt strip — App.tsx's flow, prompt-shaped
+  // (D1/D2, R-4/R-5): Q1, Q2 for dirty saved prompts, one Discard confirm per
+  // never-saved draft; re-entry guarded; discards through the mounted handle.
+  const closingAllRef = useRef(false);
+  function requestCloseAll() {
+    if (closingAllRef.current) return;
+    closingAllRef.current = true;
+    void (async () => {
+      try {
+        const open = tabsRef.current.tabs;
+        const { closed, kept } = await runCloseAll({
+          tabs: open.map((t) => ({ key: t.key, isDirty: t.isDirty, isDraft: t.item.id === "" })),
+          confirm: api.confirmDialog,
+          save: async (k) => (await editorRefs.current.get(k)?.save()) ?? false,
+          discard: async (k) => {
+            await editorRefs.current.get(k)?.discardDraft();
+          },
+          activate: (k) => setTabs((s) => activateTab(s, k)),
+          confirmDraft: () => api.confirmDialog("Discard this unsaved prompt?"),
+        });
+        if (closed.length === 0) return; // cancelled, or nothing could close
+        setTabs((s) => closeTabs(s, closed));
+        closed.forEach((k) => editorRefs.current.delete(k));
+        if (kept.length > 0) {
+          onNotice(
+            `${kept.length} tab${kept.length === 1 ? "" : "s"} stayed open: unsaved or save failed.`,
+            { key: "close-all-kept" },
+          );
+        }
+      } finally {
+        closingAllRef.current = false;
+      }
+    })();
+  }
+
+  // Plan 18 Back/Forward over this strip (see App.tsx); the shortcut hook is
+  // enabled only while the Prompts page is visible with tabs open.
+  function navigateHistory(dir: NavDirection, fromShortcut: boolean) {
+    if (closingAllRef.current) return; // R-8
+    const preview = navigateTab(tabsRef.current, dir);
+    if (preview === tabsRef.current) return;
+    setTabs((s) => navigateTab(s, dir));
+    if (fromShortcut && preview.activeKey) focusTabFromShortcut(preview.activeKey);
+  }
+  useBackForwardKeys({
+    enabled: pageActive && tabs.tabs.length > 0,
+    onBack: () => navigateHistory("back", true),
+    onForward: () => navigateHistory("forward", true),
+  });
 
   // Close × / Delete-key. Clean tab closes at once; a dirty draft offers
   // Discard/keep; a dirty saved prompt offers Cancel / Discard / Save (Save via
@@ -642,6 +707,12 @@ export default function PromptsPage({
             onNew={openNewDraft}
             listLabel="Open prompts"
             newLabel="Open another prompt"
+            onCloseAll={requestCloseAll}
+            closeAllLabel="Close all open prompts"
+            onBack={() => navigateHistory("back", false)}
+            onForward={() => navigateHistory("forward", false)}
+            canBack={canBack(tabs.history)}
+            canForward={canForward(tabs.history)}
           />
           {tabs.tabs.map((t) => {
             const isDraft = t.item.id === "";
@@ -650,7 +721,7 @@ export default function PromptsPage({
             const draftId = isDraft ? (draftIdFromTabKey(t.key) ?? "") : t.item.id;
             const conflict = conflicts.get(t.key);
             return (
-              <Fragment key={t.key}>
+              <Fragment key={mountKeys.current.get(t.key) ?? t.key}>
               {conflict && (
                 <DraftConflictBar
                   title={displayTitle(t.item.title, t.item.body)}

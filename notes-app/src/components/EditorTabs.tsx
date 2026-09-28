@@ -26,6 +26,19 @@ interface Props {
   listLabel: string;
   /** aria-label for the "+" new-tab button (with `onNew`). */
   newLabel?: string;
+  /** Plan 18 Back/Forward over previously viewed tabs (both or neither). The
+   *  owner keeps the history (openTabs.ts) and passes whether each direction
+   *  is available; at an end the button is `aria-disabled` and a no-op — never
+   *  `disabled`, so a repeated press never drops focus to <body>. */
+  onBack?: () => void;
+  onForward?: () => void;
+  canBack?: boolean;
+  canForward?: boolean;
+  /** Plan 18 "Close all" for this strip (D1). Optional like `onNew`; the
+   *  owner runs the consent flow (closeAll.ts). */
+  onCloseAll?: () => void;
+  /** Accessible name for the Close all button (e.g. "Close all open items"). */
+  closeAllLabel?: string;
 }
 
 // The tab is a `<div role="tab">`, not a `<button>`, so the close control can be
@@ -33,6 +46,12 @@ interface Props {
 // mock's `role="button"` span) is invalid and unreachable by keyboard. Roving
 // tabindex + arrow/Home/End navigation mirror App's page-tabs; Delete/Backspace
 // closes the focused tab, and focus follows the neighbor that takes over.
+//
+// Plan 18: the tablist is wrapped in `.editor-tabs-bar`, which carries the
+// hairline/background and the strip's controls — ‹ › before the scroller, `+`
+// and `Close all` after it. Controls sit OUTSIDE `role="tablist"` (only tabs
+// belong in one), so they keep their own focus after a partial close: the
+// focus-after-close effect keys on `.editor-tabs` membership.
 function EditorTabs({
   tabs,
   activeKey,
@@ -41,6 +60,12 @@ function EditorTabs({
   onNew,
   listLabel,
   newLabel,
+  onBack,
+  onForward,
+  canBack = false,
+  canForward = false,
+  onCloseAll,
+  closeAllLabel,
 }: Props) {
   const tabEls = useRef(new Map<string, HTMLDivElement>());
   // Keys from the previous render, so we can move focus to the tab that took over
@@ -62,6 +87,15 @@ function EditorTabs({
     if (orphaned || withinStrip) tabEls.current.get(activeKey)?.focus();
   }, [tabs, activeKey]);
 
+  // Plan 18: keep the active tab in view however it was activated — rail
+  // click, Back/Forward, neighbour take-over (before, only the arrow keys
+  // scrolled). `nearest` on both axes never scrolls a tab that is already
+  // visible and never scrolls the page vertically.
+  useEffect(() => {
+    if (!activeKey) return;
+    tabEls.current.get(activeKey)?.scrollIntoView({ inline: "nearest", block: "nearest" });
+  }, [activeKey]);
+
   function focusTab(key: string) {
     const el = tabEls.current.get(key);
     el?.focus();
@@ -69,6 +103,9 @@ function EditorTabs({
   }
 
   function onTabKeyDown(e: KeyboardEvent<HTMLDivElement>, key: string) {
+    // R-6: Alt+Left/Right is the Back/Forward chord (useBackForwardKeys) and
+    // Ctrl/Meta combos belong to the app — never also walk the tabs.
+    if (e.altKey || e.ctrlKey || e.metaKey) return;
     const i = tabs.findIndex((t) => t.key === key);
     if (i === -1) return;
     if (e.key === "ArrowLeft" || e.key === "ArrowRight") {
@@ -94,53 +131,90 @@ function EditorTabs({
     }
   }
 
+  const showNav = onBack !== undefined || onForward !== undefined;
+
   return (
-    <div className="editor-tabs" role="tablist" aria-label={listLabel}>
-      {tabs.map((t) => {
-        const on = t.key === activeKey;
-        return (
-          <div
-            key={t.key}
-            ref={(el) => {
-              if (el) tabEls.current.set(t.key, el);
-              else tabEls.current.delete(t.key);
+    <div className="editor-tabs-bar">
+      {showNav && (
+        <>
+          <button
+            className="etab-nav"
+            aria-label="Back"
+            title="Back (Alt+Left)"
+            aria-keyshortcuts="Alt+ArrowLeft"
+            aria-disabled={!canBack}
+            onClick={() => {
+              if (canBack) onBack?.();
             }}
-            className={on ? "etab etab-on" : "etab"}
-            role="tab"
-            id={tabDomId(t.key)}
-            // Explicit accessible name = the title, so the tab isn't announced
-            // from its subtree (which would fold in the close button's "Close …"
-            // label and the pin/dot/unsaved title= attributes). Because this
-            // overrides the subtree, the unsaved state must be spelled into it
-            // (plan 17): the dot alone was never heard.
-            aria-label={t.dirty ? `${t.title}, unsaved changes` : t.title}
-            aria-selected={on}
-            aria-controls={tabPanelDomId(t.key)}
-            tabIndex={on ? 0 : -1}
-            onClick={() => onActivate(t.key)}
-            onKeyDown={(e) => onTabKeyDown(e, t.key)}
           >
-            {t.pinned && <span className="pin" title="Pinned" />}
-            {t.dotClass && <span className={t.dotClass} title={t.dotTitle} />}
-            <span className="etab-title">{t.title}</span>
-            {t.dirty && <span className="etab-unsaved" title="Unsaved changes" />}
-            <button
-              className="etab-x"
-              aria-label={`Close ${t.title}`}
-              tabIndex={on ? 0 : -1}
-              onClick={(e) => {
-                e.stopPropagation();
-                onClose(t.key);
+            ‹
+          </button>
+          <button
+            className="etab-nav"
+            aria-label="Forward"
+            title="Forward (Alt+Right)"
+            aria-keyshortcuts="Alt+ArrowRight"
+            aria-disabled={!canForward}
+            onClick={() => {
+              if (canForward) onForward?.();
+            }}
+          >
+            ›
+          </button>
+        </>
+      )}
+      <div className="editor-tabs" role="tablist" aria-label={listLabel}>
+        {tabs.map((t) => {
+          const on = t.key === activeKey;
+          return (
+            <div
+              key={t.key}
+              ref={(el) => {
+                if (el) tabEls.current.set(t.key, el);
+                else tabEls.current.delete(t.key);
               }}
+              className={on ? "etab etab-on" : "etab"}
+              role="tab"
+              id={tabDomId(t.key)}
+              // Explicit accessible name = the title, so the tab isn't announced
+              // from its subtree (which would fold in the close button's "Close …"
+              // label and the pin/dot/unsaved title= attributes). Because this
+              // overrides the subtree, the unsaved state must be spelled into it
+              // (plan 17): the dot alone was never heard.
+              aria-label={t.dirty ? `${t.title}, unsaved changes` : t.title}
+              aria-selected={on}
+              aria-controls={tabPanelDomId(t.key)}
+              tabIndex={on ? 0 : -1}
+              onClick={() => onActivate(t.key)}
+              onKeyDown={(e) => onTabKeyDown(e, t.key)}
             >
-              ×
-            </button>
-          </div>
-        );
-      })}
+              {t.pinned && <span className="pin" title="Pinned" />}
+              {t.dotClass && <span className={t.dotClass} title={t.dotTitle} />}
+              <span className="etab-title">{t.title}</span>
+              {t.dirty && <span className="etab-unsaved" title="Unsaved changes" />}
+              <button
+                className="etab-x"
+                aria-label={`Close ${t.title}`}
+                tabIndex={on ? 0 : -1}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onClose(t.key);
+                }}
+              >
+                ×
+              </button>
+            </div>
+          );
+        })}
+      </div>
       {onNew && (
         <button className="etab-new" aria-label={newLabel} onClick={onNew}>
           +
+        </button>
+      )}
+      {onCloseAll && (
+        <button className="etab-closeall" aria-label={closeAllLabel} onClick={onCloseAll}>
+          Close all
         </button>
       )}
     </div>
@@ -148,3 +222,21 @@ function EditorTabs({
 }
 
 export default memo(EditorTabs);
+
+/** Plan 18: after a Back/Forward SHORTCUT (Alt+Left/Right, mouse buttons),
+ *  move focus to the tab that became active so a keyboard user sees where
+ *  they landed — unless focus is on one of the bar's CONTROLS (‹ ›, +, Close
+ *  all keep their own). A focused TAB does move: it is about to lose its
+ *  roving tabIndex=0, so leaving focus there would break the tab order.
+ *  Looked up by id (`tabDomId`), never through a selector: tab keys contain
+ *  `:` (R-9). Shared by the three tab owners. */
+export function focusTabFromShortcut(key: string): void {
+  const ae = document.activeElement;
+  if (
+    ae instanceof HTMLElement &&
+    ae.closest(".editor-tabs-bar") &&
+    !ae.closest(".editor-tabs")
+  )
+    return;
+  document.getElementById(tabDomId(key))?.focus();
+}

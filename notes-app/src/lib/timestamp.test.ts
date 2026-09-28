@@ -122,3 +122,58 @@ describe("insertText", () => {
     });
   });
 });
+
+// Plan 18 (D6, R-2): the scratch-pad "send selection" cut goes through
+// insertText(body, range, "") as its fallback when execCommand("delete")
+// returns false. These cases pin the deletion behaviour specifically.
+describe("insertText — deletion (text === \"\")", () => {
+  it("removes exactly [start, end) mid-body, with caret === start", () => {
+    expect(insertText("hello world", { start: 6, end: 11 }, "")).toEqual({
+      body: "hello ",
+      caret: 6,
+    });
+  });
+
+  it("normalises an inverted range before deleting", () => {
+    expect(insertText("hello world", { start: 11, end: 6 }, "")).toEqual({
+      body: "hello ",
+      caret: 6,
+    });
+  });
+
+  it("returns null for an out-of-bounds range (end past body.length)", () => {
+    expect(insertText("abc", { start: 0, end: 4 }, "")).toBeNull();
+  });
+
+  it("returns null for a negative start", () => {
+    expect(insertText("abc", { start: -1, end: 2 }, "")).toBeNull();
+  });
+
+  it("deletes the whole body: start 0, end body.length -> empty string, caret 0", () => {
+    expect(insertText("hello", { start: 0, end: 5 }, "")).toEqual({
+      body: "",
+      caret: 0,
+    });
+  });
+
+  it("a collapsed range (start === end) deletes nothing and leaves the caret in place", () => {
+    expect(insertText("hello", { start: 2, end: 2 }, "")).toEqual({
+      body: "hello",
+      caret: 2,
+    });
+  });
+
+  it("removes a multi-line span including its trailing newline", () => {
+    expect(insertText("one\ntwo\nthree", { start: 4, end: 8 }, "")).toEqual({
+      body: "one\nthree",
+      caret: 4,
+    });
+  });
+
+  it("removes a span that starts mid-line and ends mid-line, spanning an internal newline", () => {
+    expect(insertText("abc\ndef\nghi", { start: 1, end: 9 }, "")).toEqual({
+      body: "ahi",
+      caret: 1,
+    });
+  });
+});

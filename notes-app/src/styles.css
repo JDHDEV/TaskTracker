@@ -44,8 +44,8 @@
 }
 
 /* Legacy neutral-swap for dark polarity. Superseded by the per-palette blocks
-   below: every dark palette (v2-dark/neon-noir/claude-terminal) redeclares all
-   seven neutrals at higher specificity, and data-theme="dark" is never set
+   below: every dark palette (v2-dark/neon-noir/claude-terminal/hc-dark)
+   redeclares all seven neutrals at higher specificity, and data-theme="dark" is never set
    without one of them, so these values no longer take visible effect. Kept as a
    specificity-losing fallback (and the [data-theme="dark"] hook still drives the
    polarity-only calendar-invert rule further down). */
@@ -146,6 +146,35 @@
   --hl-fill: color-mix(in srgb, var(--mark) 25%, var(--surface));
 }
 
+/* Plan 18 (D7) — "High contrast (VS Code)": a dark palette modeled on VS Code
+   Dark High Contrast. Black bg, near-black surface, white ink (21:1), --muted
+   12.55:1; the bright cyan contrastBorder is --line (10.55:1 vs bg, so every
+   hairline is loud but honest — bg vs surface is only 1.10:1 and regions are
+   told apart by the line); the orange activeContrastBorder is --mark (8.18:1
+   vs bg; the dark groups' literal #000000 ink reads 8.18:1 on it). Status
+   dots stay the constant trio (doing 9.34, testing 5.10, done 5.13 on black —
+   AA, not 7:1, when --done is used as text). HC-INSPIRED, not Windows
+   forced-colors support; the constant --scrim is nearly invisible on black,
+   so dialogs rely on their --line border. */
+:root[data-palette="hc-dark"] {
+  --bg: #000000;
+  --surface: #0f0f0f;
+  --ink: #ffffff;
+  --muted: #c8c8c8;
+  --line: #6fc3df;
+  --surround: #000000;
+  --outer: #6fc3df;
+  --mark: #f38518;
+  --mark-soft: #2e1a05;
+  --mark-ink: #ffc285;
+  --danger: #f48771;
+  --todo: #c8c8c8;
+  --doing: #d9a441;
+  --testing: #4f7ec2;
+  --done: #4c8a64;
+  --hl-fill: color-mix(in srgb, var(--mark) 25%, var(--surface));
+}
+
 /* Per-palette overrides. The dark solid-button hexes and the review-badge text
    colors are literal (they differ per palette, so one shared dark rule can't
    serve them). The dark `.btn` fill targets ONLY the bare solid-primary buttons:
@@ -187,9 +216,20 @@
   background: #3f352b;
   opacity: 1;
 }
+:root[data-palette="hc-dark"]
+  .btn:not(.btn-quiet):not(.btn-danger):not(.btn-save):not(.btn-pinned):not(.btn-reusable-on) {
+  background: #000;
+  border-color: var(--line);
+  color: var(--ink);
+}
+:root[data-palette="hc-dark"]
+  .btn:not(.btn-quiet):not(.btn-danger):not(.btn-save):not(.btn-pinned):not(.btn-reusable-on):hover:not(:disabled) {
+  background: #1a1a1a;
+  opacity: 1;
+}
 
 /* Review "Proposed rewrite" badge: the base uses var(--mark-ink), correct on
-   Original & v2-light; the three dark palettes need literal dark text for
+   Original & v2-light; the dark palettes need literal dark text for
    contrast on their brighter accent fill. */
 :root[data-palette="v2-dark"] .review-mark {
   color: #063a30;
@@ -199,6 +239,9 @@
 }
 :root[data-palette="claude-terminal"] .review-mark {
   color: #3a1c10;
+}
+:root[data-palette="hc-dark"] .review-mark {
+  color: #000000;
 }
 
 /* Tab close-button hover: the base `.etab-x:hover` puts var(--mark-ink) text on a
@@ -213,6 +256,28 @@
 }
 :root[data-palette="claude-terminal"] .etab-x:hover {
   color: #3a1c10;
+}
+:root[data-palette="hc-dark"] .etab-x:hover {
+  background: var(--mark);
+  color: #000000;
+}
+/* hc-dark only: the base × is --ink on a --line fill, which is white on cyan
+   there (1.99:1). Draw it as an outlined glyph instead; the hover above (which
+   must restate the --mark fill, since this rule outranks the base hover)
+   keeps the black-on-orange treatment. */
+:root[data-palette="hc-dark"] .etab-x {
+  background: transparent;
+  border: 1px solid var(--line);
+  color: var(--ink);
+}
+/* hc-dark only: the unsaved dot and the pin marker ring their --mark fill with
+   --mark-ink, which is 1.63:1 on it there; ring them in the same literal black
+   the dark groups use as ink on --mark (8.18:1). The fill itself already reads
+   8.18:1 on --bg/--surface. (These two, like `.etab-x` above, are HC-only
+   groups — stylesGuard.test.ts allowlists them by name.) */
+:root[data-palette="hc-dark"] .pin,
+:root[data-palette="hc-dark"] .etab-unsaved {
+  border-color: #000000;
 }
 
 /* Change 5 — soften the New note/New task/New prompt create buttons on v2-light
@@ -339,6 +404,9 @@ textarea {
 }
 :root[data-palette="claude-terminal"] .page-tab-badge {
   color: #3a1c10;
+}
+:root[data-palette="hc-dark"] .page-tab-badge {
+  color: #000000;
 }
 
 /* Both pages stay mounted (so switching preserves in-progress edits); the
@@ -619,6 +687,11 @@ textarea {
   flex: 1;
   padding: 18px 22px;
   gap: 12px;
+  /* Plan 17 §12 F15: when the wrapped header/meta/AI-bar rows plus an
+     unshrinkable review card and the body's 120px floor exceed the pane, the
+     PANE scrolls — before, the overflow escaped to the document and scrolled
+     the whole app (topbar included), or the card was clipped. */
+  overflow-y: auto;
 }
 
 /* Non-active tabs stay mounted (preserving their edit buffer + in-flight stream)
@@ -640,8 +713,8 @@ textarea {
 /* The two light palettes' --mark fails WCAG 1.4.11 non-text contrast against
    their --bg for a 2px boundary (original #f6e05e ≈ 1.17:1, v2-light #4dddbc
    ≈ 1.48:1 — an invisible frame). Their --mark-ink is the same mark family at
-   readable depth (≈ 5.8:1 / 6.6:1); the three dark palettes keep --mark
-   (5.7–15.4:1). Mirrors the per-palette-override pattern used above. */
+   readable depth (≈ 5.8:1 / 6.6:1); the four dark palettes keep --mark
+   (5.7–15.4:1; hc-dark 8.2:1). Mirrors the per-palette-override pattern used above. */
 :root[data-palette="original"] .editor.is-dirty,
 :root[data-palette="v2-light"] .editor.is-dirty {
   outline-color: var(--mark-ink);
@@ -669,16 +742,69 @@ textarea {
    the mock's `-18px -22px 0`: the strip is a sibling ABOVE the padded .editor
    sections (a direct child of the unpadded .editor-pane), not a child inside a
    padded .editor, so it already spans the pane. If it were ever moved back
-   inside .editor it would need `margin: -18px -22px 0` to negate that padding. */
+   inside .editor it would need `margin: -18px -22px 0` to negate that padding.
+
+   Plan 18 (D9): the strip is a HORIZONTAL-only scroller. `overflow-x: auto`
+   makes `overflow-y` compute to `auto` too, and `.etab-on { margin-bottom:
+   -1px }` ends the active tab 1px below the padding box — 1px of vertical
+   overflow, a vertical scrollbar, and a wheel that nudged the strip. A scroll
+   container clips at its PADDING box and paints its own border outside the
+   clip, so a `border-bottom` hairline could never be covered by the active
+   tab (the join never rendered). The hairline is therefore drawn INSIDE the
+   padding box as an inset shadow, with 1px of bottom padding for the active
+   tab to overlap: non-active tabs sit 1px above the line, the active tab
+   covers it. The `-1px` margin MUST stay — without it every 36px tab would
+   cover the line. Expected, not a defect: while a horizontal scrollbar is
+   showing, Chromium paints the inset shadow beneath it.
+
+   Plan 18 (step 10): the hairline and background live on `.editor-tabs-bar`,
+   the wrapper that also holds the strip's controls (‹ › before the scroller,
+   `+` and `Close all` after it, all outside `role="tablist"`). The tablist
+   itself is a transparent scroller that SHRINKS (`flex: 0 1 auto; min-width:
+   0`) so the controls never scroll away, with 1px of bottom padding for the
+   active tab's overlap onto the bar's hairline. Height stays 41px. */
+.editor-tabs-bar {
+  display: flex;
+  align-items: flex-end;
+  gap: 4px;
+  padding: 4px 12px 0;
+  background: var(--bg);
+  box-shadow: inset 0 -1px 0 var(--line);
+}
 .editor-tabs {
   display: flex;
   align-items: flex-end;
   gap: 4px;
   margin: 0;
-  padding: 4px 12px 0;
-  border-bottom: 1px solid var(--line);
-  background: var(--bg);
+  flex: 0 1 auto;
+  min-width: 0;
+  padding: 0 0 1px;
+  background: transparent;
+  box-shadow: none;
   overflow-x: auto;
+  overflow-y: hidden;
+  /* Plan 18 (D8): a thin, palette-aware scrollbar via the standard properties
+     ONLY — Chromium ≥ 121 (WebView2 runtime 153) ignores `::-webkit-scrollbar*`
+     once these are set. --muted over a transparent track clears 3:1 against
+     --bg in every palette; --line/--outer do not. Scoped to the strip: app-wide
+     scrollbars and `color-scheme` are untouched. */
+  scrollbar-width: thin;
+  scrollbar-color: var(--muted) transparent;
+}
+.editor-tabs:hover {
+  scrollbar-color: var(--ink) transparent;
+}
+/* Forced colors drop box-shadows: fall back to a real border for the hairline. */
+@media (forced-colors: active) {
+  .editor-tabs-bar {
+    box-shadow: none;
+    border-bottom: 1px solid CanvasText;
+  }
+}
+/* The tab's focus ring reaches 3px below the tab, which the scroller clips;
+   draw it inside the tab instead. */
+.etab:focus-visible {
+  outline-offset: -2px;
 }
 .etab {
   display: flex;
@@ -731,6 +857,28 @@ textarea {
   font-size: 17px; line-height: 1; cursor: pointer;
 }
 .etab-new:hover { background: var(--bg); color: var(--ink); }
+/* Plan 18: ‹ › Back/Forward — the .etab-new recipe (30×30, above the 24px
+   target minimum). At an end the button is aria-disabled (never `disabled`,
+   which would drop focus to <body> on the last press): dimmed, no hover change. */
+.etab-nav {
+  align-self: center; width: 30px; height: 30px; margin-bottom: 6px;
+  border: 1px solid var(--line); border-radius: 7px;
+  background: var(--surface); color: var(--muted);
+  font-size: 17px; line-height: 1; cursor: pointer;
+}
+.etab-nav:hover { background: var(--bg); color: var(--ink); }
+.etab-nav[aria-disabled="true"],
+.etab-nav[aria-disabled="true"]:hover {
+  background: var(--surface); color: var(--muted); opacity: .5; cursor: default;
+}
+/* Plan 18: Close all — carries text, so its own width/padding/font. */
+.etab-closeall {
+  align-self: center; height: 30px; width: auto; padding: 0 10px; margin-bottom: 6px;
+  border: 1px solid var(--line); border-radius: 7px;
+  background: var(--surface); color: var(--muted);
+  font: inherit; font-size: 12px; white-space: nowrap; cursor: pointer;
+}
+.etab-closeall:hover { background: var(--bg); color: var(--ink); }
 
 .editor-head {
   display: flex;
@@ -871,7 +1019,8 @@ textarea {
 
 :root[data-palette="v2-dark"] .body-hl-mark,
 :root[data-palette="neon-noir"] .body-hl-mark,
-:root[data-palette="claude-terminal"] .body-hl-mark {
+:root[data-palette="claude-terminal"] .body-hl-mark,
+:root[data-palette="hc-dark"] .body-hl-mark {
   text-decoration-color: var(--mark);
 }
 
@@ -894,6 +1043,13 @@ textarea {
   background: var(--mark-soft);
   overflow: hidden;
   container-type: inline-size;
+  /* Never squeezed (plan 17 §12 F15). The editor column is height-bound and
+     `overflow: hidden` makes this card's flex minimum 0, so when the header
+     and AI-bar rows wrap at a narrow width the card used to absorb the whole
+     deficit — its bottom (the scroll region's scrollbar, the TITLE row) was
+     clipped. The card keeps its natural height; the body keeps its 120px
+     floor; beyond that the editor pane scrolls (`.editor` overflow-y). */
+  flex-shrink: 0;
 }
 
 .review-head {
@@ -1163,11 +1319,13 @@ textarea {
 }
 
 /* Save label contrast (plan 17, folded-in fix): --mark-ink on --mark is 4.98:1
-   on Original but 4.47:1 on Gray + teal (light) and 1.1–1.7:1 in the three
+   on Original but 4.47:1 on Gray + teal (light) and 1.1–1.7:1 in the four
    dark palettes, whose --mark-ink is a LIGHT tone. The Save label is the
    non-colour half of the unsaved signal, so it must reach 4.5:1 everywhere: a
    deeper teal for v2-light (6.7:1) and the literal dark inks the review badge
-   already uses for the dark palettes (7.5:1 / 12.5:1 / 5.0:1). */
+   already uses for the dark palettes (7.5:1 / 12.5:1 / 5.0:1 / 8.2:1). This
+   group deliberately mixes a light id with the dark set (stylesGuard.test.ts
+   allows that; it only demands the dark set be complete). */
 :root[data-palette="v2-light"] .btn-save {
   color: #094238;
 }
@@ -1179,6 +1337,9 @@ textarea {
 }
 :root[data-palette="claude-terminal"] .btn-save {
   color: #3a1c10;
+}
+:root[data-palette="hc-dark"] .btn-save {
+  color: #000000;
 }
 
 .select {

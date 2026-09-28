@@ -13,7 +13,8 @@ export type PaletteId =
   | "v2-light"
   | "v2-dark"
   | "neon-noir"
-  | "claude-terminal";
+  | "claude-terminal"
+  | "hc-dark";
 
 export interface Palette {
   id: PaletteId;
@@ -31,13 +32,15 @@ export const PALETTES: readonly Palette[] = [
   { id: "v2-dark", label: "Gray + teal (dark)", polarity: "dark" },
   { id: "neon-noir", label: "Neon noir", polarity: "dark" },
   { id: "claude-terminal", label: "Claude terminal", polarity: "dark" },
+  // Plan 18 (D7): VS Code-style dark high contrast; last in the picker.
+  { id: "hc-dark", label: "High contrast (VS Code)", polarity: "dark" },
 ];
 
 const KEY = "palette";
 const DEFAULT: PaletteId = "original";
 
-/** Whether `id` is one of the five known palettes — the whitelist gate that
- *  every persisted/attribute-bound value passes through. */
+/** Whether `id` is one of the known palettes — the whitelist gate that every
+ *  persisted/attribute-bound value passes through. */
 export function isPaletteId(id: string | null): id is PaletteId {
   return id !== null && PALETTES.some((p) => p.id === id);
 }

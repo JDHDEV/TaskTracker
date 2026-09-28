@@ -29,14 +29,15 @@ const EXPECTED_POLARITY: Record<PaletteId, Polarity> = {
   "v2-dark": "dark",
   "neon-noir": "dark",
   "claude-terminal": "dark",
+  "hc-dark": "dark",
 };
 
 const KNOWN_IDS = Object.keys(EXPECTED_POLARITY) as PaletteId[];
 
 describe("PALETTES registry", () => {
-  it("has exactly 5 palettes with unique ids", () => {
-    expect(PALETTES).toHaveLength(5);
-    expect(new Set(PALETTES.map((p) => p.id)).size).toBe(5);
+  it("has exactly 6 palettes with unique ids", () => {
+    expect(PALETTES).toHaveLength(6);
+    expect(new Set(PALETTES.map((p) => p.id)).size).toBe(6);
   });
 
   it("has an id set exactly matching the known palette vocabulary", () => {
@@ -63,12 +64,21 @@ describe("isPaletteId", () => {
     expect(isPaletteId(id)).toBe(true);
   });
 
-  it.each([null, "", "gemini", "dark", "Original", "v2light", "  original"])(
-    "is false for %j",
-    (bad) => {
-      expect(isPaletteId(bad)).toBe(false);
-    },
-  );
+  it.each([
+    null,
+    "",
+    "gemini",
+    "dark",
+    "Original",
+    "v2light",
+    "  original",
+    // Plan 18: near-misses of the sixth id must not pass the whitelist.
+    "HC-DARK",
+    "hc-dark ",
+    "hc",
+  ])("is false for %j", (bad) => {
+    expect(isPaletteId(bad)).toBe(false);
+  });
 });
 
 describe("getStoredPalette / setStoredPalette", () => {

@@ -76,9 +76,13 @@ export function useDraftBackup({
 }: Options): DraftBackupHandle {
   const disabled = !isUuid(draftId);
 
-  // One serialized queue per editor instance, lazily created. Never recreated:
-  // draftId is fixed for an instance's lifetime (a draft→saved promotion
-  // changes the tab key, which remounts the editor).
+  // One serialized queue per editor instance, lazily created. Never recreated.
+  // Since plan 17 (§12 F13) a draft→saved promotion keeps the editor MOUNTED
+  // and changes `draftId` on this live instance (draft UUID → entity UUID).
+  // That is safe by construction: every write closes over the id of the
+  // render it was issued from, `clearAfterSave` (called from the save that
+  // caused the promotion) deletes the OLD draft, later ticks flush under the
+  // new id, and the flush registry re-registers on the id change below.
   const queueRef = useRef<DraftQueue | null>(null);
   if (queueRef.current === null) {
     queueRef.current = new DraftQueue(

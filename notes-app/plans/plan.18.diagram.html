@@ -1,0 +1,133 @@
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Plan 18 changes</title>
+<style>
+:root{--bg:#ffffff;--surface:#f5f5f7;--border:#6b7280;--text:#1a1a1a;--muted:#4b5563;--accent:#1d4ed8;--create:#15803d;--modify:#b45309;--lane:#d1d5db}
+@media (prefers-color-scheme: dark){:root{--bg:#121212;--surface:#1e1e22;--border:#9ca3af;--text:#f5f5f5;--muted:#b3b3b8;--accent:#60a5fa;--create:#4ade80;--modify:#fbbf24;--lane:#3f3f46}}
+@media print{:root{--bg:#ffffff;--surface:#f5f5f7;--text:#1a1a1a;--accent:#1d4ed8;--lane:#d1d5db}}
+body{background:var(--bg);color:var(--text);margin:0;padding:16px;font-family:system-ui,sans-serif}
+h1{font-size:18px;margin:0 0 4px}
+p.sub{color:var(--muted);font-size:13px;margin:0 0 12px}
+figure{margin:0}svg{width:100%;height:auto;display:block}
+table{border-collapse:collapse;margin-top:16px;width:100%;table-layout:fixed}th,td{border:1px solid var(--border);padding:4px 8px;text-align:left;overflow-wrap:anywhere;font-size:14px}
+.legend{font-size:13px;color:var(--muted);margin-top:8px}
+</style></head><body>
+<h1>Plan 18 — tab-strip and navigation batch: planned changes</h1>
+<p class="sub">One lane per directory; columns are the landing phases. The plan file <code>plans/plan.18.md</code> is authoritative; this diagram is illustrative.</p>
+<figure>
+<svg viewBox="0 0 1140 1540" role="img" aria-labelledby="dt dd">
+<title id="dt">Plan 18: planned changes</title>
+<desc id="dd">Eight lanes, one per directory, and five columns for the landing phases. Dashed boxes are files to create, solid boxes files to modify. Arrows point from a file to the file it depends on; solid arrows are new dependencies, dashed arrows existing ones. Numbered badges give the implementation step. Phase 2 (pure model) must land before Phases 3 and 4.</desc>
+<defs><marker id="a" markerWidth="8" markerHeight="8" refX="6" refY="4" orient="auto"><path d="M0,0 L8,4 L0,8 z" fill="var(--border)"/></marker></defs>
+
+<!-- column headers -->
+<text x="110" y="18" text-anchor="middle" fill="var(--muted)" font-size="12">Phase 1 · CSS</text>
+<text x="330" y="18" text-anchor="middle" fill="var(--muted)" font-size="12">Phase 2 · pure model</text>
+<text x="550" y="18" text-anchor="middle" fill="var(--muted)" font-size="12">Phase 3 · strip UI + wiring</text>
+<text x="770" y="18" text-anchor="middle" fill="var(--muted)" font-size="12">Phases 4–5 · scratch move + HC</text>
+<text x="990" y="18" text-anchor="middle" fill="var(--muted)" font-size="12">Phase 6 · docs + checklist</text>
+
+<!-- lane separators -->
+<line x1="0" y1="140" x2="1140" y2="140" stroke="var(--lane)" stroke-width="1"/>
+<line x1="0" y1="740" x2="1140" y2="740" stroke="var(--lane)" stroke-width="1"/>
+<line x1="0" y1="840" x2="1140" y2="840" stroke="var(--lane)" stroke-width="1"/>
+<line x1="0" y1="1140" x2="1140" y2="1140" stroke="var(--lane)" stroke-width="1"/>
+<line x1="0" y1="1240" x2="1140" y2="1240" stroke="var(--lane)" stroke-width="1"/>
+<line x1="0" y1="1340" x2="1140" y2="1340" stroke="var(--lane)" stroke-width="1"/>
+<line x1="0" y1="1440" x2="1140" y2="1440" stroke="var(--lane)" stroke-width="1"/>
+
+<!-- lane labels -->
+<text x="20" y="52" fill="var(--muted)" font-size="12">notes-app/src/</text>
+<text x="20" y="152" fill="var(--muted)" font-size="12">notes-app/src/lib/</text>
+<text x="20" y="752" fill="var(--muted)" font-size="12">notes-app/src/hooks/</text>
+<text x="20" y="852" fill="var(--muted)" font-size="12">notes-app/src/components/</text>
+<text x="20" y="1152" fill="var(--muted)" font-size="12">notes-app/docs/</text>
+<text x="20" y="1252" fill="var(--muted)" font-size="12">notes-app/ (project guide)</text>
+<text x="20" y="1352" fill="var(--muted)" font-size="12">repository root</text>
+<text x="20" y="1452" fill="var(--muted)" font-size="12">notes-app/plans/</text>
+
+<!-- arrows: X → Y means X depends on Y; solid = new edge, dashed = existing edge -->
+<!-- openTabs.ts → navHistory.ts (new) -->
+<polyline points="240,390 226,390 226,190 240,190" fill="none" stroke="var(--border)" stroke-width="2" marker-end="url(#a)"/>
+<!-- closeAll.ts → openTabs.ts (new) -->
+<polyline points="240,590 216,590 216,400 240,400" fill="none" stroke="var(--border)" stroke-width="2" marker-end="url(#a)"/>
+<!-- App.tsx → closeAll.ts (new) -->
+<line x1="460" y1="90" x2="422" y2="580" stroke="var(--border)" stroke-width="2" marker-end="url(#a)"/>
+<!-- useBackForwardKeys.ts → navHistory.ts (new) -->
+<line x1="460" y1="790" x2="422" y2="200" stroke="var(--border)" stroke-width="2" marker-end="url(#a)"/>
+<!-- EditorTabs.tsx → openTabs.ts (existing: tabDomId / tabPanelDomId) -->
+<line x1="460" y1="880" x2="422" y2="380" stroke="var(--border)" stroke-width="2" stroke-dasharray="6 4" marker-end="url(#a)"/>
+<!-- PromptsPage.tsx → closeAll.ts (new) -->
+<line x1="460" y1="990" x2="422" y2="595" stroke="var(--border)" stroke-width="2" marker-end="url(#a)"/>
+<!-- ScratchPage.tsx → closeAll.ts (new) -->
+<line x1="460" y1="1090" x2="422" y2="605" stroke="var(--border)" stroke-width="2" marker-end="url(#a)"/>
+<!-- App.tsx → useBackForwardKeys.ts (new) -->
+<polyline points="640,90 650,90 650,782 640,782" fill="none" stroke="var(--border)" stroke-width="2" marker-end="url(#a)"/>
+<!-- PromptsPage.tsx → useBackForwardKeys.ts (new) -->
+<polyline points="640,980 656,980 656,792 640,792" fill="none" stroke="var(--border)" stroke-width="2" marker-end="url(#a)"/>
+<!-- ScratchPage.tsx → useBackForwardKeys.ts (new) -->
+<polyline points="640,1080 662,1080 662,802 640,802" fill="none" stroke="var(--border)" stroke-width="2" marker-end="url(#a)"/>
+<!-- App.tsx → EditorTabs.tsx (existing, props widened) -->
+<polyline points="640,104 668,104 668,884 640,884" fill="none" stroke="var(--border)" stroke-width="2" stroke-dasharray="6 4" marker-end="url(#a)"/>
+<!-- PromptsPage.tsx → EditorTabs.tsx (existing) -->
+<line x1="550" y1="960" x2="550" y2="922" stroke="var(--border)" stroke-width="2" stroke-dasharray="6 4" marker-end="url(#a)"/>
+<!-- ScratchPage.tsx → EditorTabs.tsx (existing) -->
+<polyline points="640,1096 674,1096 674,898 640,898" fill="none" stroke="var(--border)" stroke-width="2" stroke-dasharray="6 4" marker-end="url(#a)"/>
+<!-- stylesGuard.test.ts → styles.css (new) -->
+<polyline points="860,390 872,390 872,40 170,40 170,58" fill="none" stroke="var(--border)" stroke-width="2" marker-end="url(#a)"/>
+<!-- stylesGuard.test.ts → palettes.ts (new) -->
+<polyline points="860,402 884,402 884,190 862,190" fill="none" stroke="var(--border)" stroke-width="2" marker-end="url(#a)"/>
+
+<!-- boxes -->
+<g><title>notes-app/src/styles.css — modify (steps 1, 2, 10, 20)</title><rect x="20" y="60" width="180" height="60" rx="8" fill="var(--surface)" stroke="var(--modify)" stroke-width="2"/><text x="110" y="95" text-anchor="middle" fill="var(--text)" font-size="13">styles.css</text><circle cx="20" cy="60" r="10" fill="var(--accent)"/><text x="20" y="64" text-anchor="middle" fill="var(--bg)" font-size="11">1</text></g>
+<g><title>notes-app/src/App.tsx — modify (steps 12, 17)</title><rect x="460" y="60" width="180" height="60" rx="8" fill="var(--surface)" stroke="var(--modify)" stroke-width="2"/><text x="550" y="95" text-anchor="middle" fill="var(--text)" font-size="13">App.tsx</text><circle cx="460" cy="60" r="10" fill="var(--accent)"/><text x="460" y="64" text-anchor="middle" fill="var(--bg)" font-size="11">12</text></g>
+
+<g><title>notes-app/src/lib/navHistory.ts — create (step 3)</title><rect x="240" y="160" width="180" height="60" rx="8" fill="var(--surface)" stroke="var(--create)" stroke-width="2" stroke-dasharray="4 2"/><text x="330" y="195" text-anchor="middle" fill="var(--text)" font-size="13">navHistory.ts</text><circle cx="240" cy="160" r="10" fill="var(--accent)"/><text x="240" y="164" text-anchor="middle" fill="var(--bg)" font-size="11">3</text></g>
+<g><title>notes-app/src/lib/palettes.ts — modify (step 18)</title><rect x="680" y="160" width="180" height="60" rx="8" fill="var(--surface)" stroke="var(--modify)" stroke-width="2"/><text x="770" y="195" text-anchor="middle" fill="var(--text)" font-size="13">palettes.ts</text><circle cx="680" cy="160" r="10" fill="var(--accent)"/><text x="680" y="164" text-anchor="middle" fill="var(--bg)" font-size="11">18</text></g>
+<g><title>notes-app/src/lib/navHistory.test.ts — create (step 4)</title><rect x="240" y="260" width="180" height="60" rx="8" fill="var(--surface)" stroke="var(--create)" stroke-width="2" stroke-dasharray="4 2"/><text x="330" y="295" text-anchor="middle" fill="var(--text)" font-size="13">navHistory.test.ts</text><circle cx="240" cy="260" r="10" fill="var(--accent)"/><text x="240" y="264" text-anchor="middle" fill="var(--bg)" font-size="11">4</text></g>
+<g><title>notes-app/src/lib/palettes.test.ts — modify (step 19)</title><rect x="680" y="260" width="180" height="60" rx="8" fill="var(--surface)" stroke="var(--modify)" stroke-width="2"/><text x="770" y="295" text-anchor="middle" fill="var(--text)" font-size="13">palettes.test.ts</text><circle cx="680" cy="260" r="10" fill="var(--accent)"/><text x="680" y="264" text-anchor="middle" fill="var(--bg)" font-size="11">19</text></g>
+<g><title>notes-app/src/lib/openTabs.ts — modify (step 5)</title><rect x="240" y="360" width="180" height="60" rx="8" fill="var(--surface)" stroke="var(--modify)" stroke-width="2"/><text x="330" y="395" text-anchor="middle" fill="var(--text)" font-size="13">openTabs.ts</text><circle cx="240" cy="360" r="10" fill="var(--accent)"/><text x="240" y="364" text-anchor="middle" fill="var(--bg)" font-size="11">5</text></g>
+<g><title>notes-app/src/lib/stylesGuard.test.ts — create (step 21)</title><rect x="680" y="360" width="180" height="60" rx="8" fill="var(--surface)" stroke="var(--create)" stroke-width="2" stroke-dasharray="4 2"/><text x="770" y="395" text-anchor="middle" fill="var(--text)" font-size="13">stylesGuard.test.ts</text><circle cx="680" cy="360" r="10" fill="var(--accent)"/><text x="680" y="364" text-anchor="middle" fill="var(--bg)" font-size="11">21</text></g>
+<g><title>notes-app/src/lib/openTabs.test.ts — modify (step 6)</title><rect x="240" y="460" width="180" height="60" rx="8" fill="var(--surface)" stroke="var(--modify)" stroke-width="2"/><text x="330" y="495" text-anchor="middle" fill="var(--text)" font-size="13">openTabs.test.ts</text><circle cx="240" cy="460" r="10" fill="var(--accent)"/><text x="240" y="464" text-anchor="middle" fill="var(--bg)" font-size="11">6</text></g>
+<g><title>notes-app/src/lib/closeAll.ts — create (step 7)</title><rect x="240" y="560" width="180" height="60" rx="8" fill="var(--surface)" stroke="var(--create)" stroke-width="2" stroke-dasharray="4 2"/><text x="330" y="595" text-anchor="middle" fill="var(--text)" font-size="13">closeAll.ts</text><circle cx="240" cy="560" r="10" fill="var(--accent)"/><text x="240" y="564" text-anchor="middle" fill="var(--bg)" font-size="11">7</text></g>
+<g><title>notes-app/src/lib/closeAll.test.ts — create (step 8)</title><rect x="240" y="660" width="180" height="60" rx="8" fill="var(--surface)" stroke="var(--create)" stroke-width="2" stroke-dasharray="4 2"/><text x="330" y="695" text-anchor="middle" fill="var(--text)" font-size="13">closeAll.test.ts</text><circle cx="240" cy="660" r="10" fill="var(--accent)"/><text x="240" y="664" text-anchor="middle" fill="var(--bg)" font-size="11">8</text></g>
+
+<g><title>notes-app/src/hooks/useBackForwardKeys.ts — create (step 11)</title><rect x="460" y="760" width="180" height="60" rx="8" fill="var(--surface)" stroke="var(--create)" stroke-width="2" stroke-dasharray="4 2"/><text x="550" y="795" text-anchor="middle" fill="var(--text)" font-size="13">useBackForwardKeys.ts</text><circle cx="460" cy="760" r="10" fill="var(--accent)"/><text x="460" y="764" text-anchor="middle" fill="var(--bg)" font-size="11">11</text></g>
+
+<g><title>notes-app/src/components/EditorTabs.tsx — modify (step 9)</title><rect x="460" y="860" width="180" height="60" rx="8" fill="var(--surface)" stroke="var(--modify)" stroke-width="2"/><text x="550" y="895" text-anchor="middle" fill="var(--text)" font-size="13">EditorTabs.tsx</text><circle cx="460" cy="860" r="10" fill="var(--accent)"/><text x="460" y="864" text-anchor="middle" fill="var(--bg)" font-size="11">9</text></g>
+<g><title>notes-app/src/components/ScratchEditor.tsx — modify (step 15)</title><rect x="680" y="860" width="180" height="60" rx="8" fill="var(--surface)" stroke="var(--modify)" stroke-width="2"/><text x="770" y="895" text-anchor="middle" fill="var(--text)" font-size="13">ScratchEditor.tsx</text><circle cx="680" cy="860" r="10" fill="var(--accent)"/><text x="680" y="864" text-anchor="middle" fill="var(--bg)" font-size="11">15</text></g>
+<g><title>notes-app/src/components/PromptsPage.tsx — modify (step 13)</title><rect x="460" y="960" width="180" height="60" rx="8" fill="var(--surface)" stroke="var(--modify)" stroke-width="2"/><text x="550" y="995" text-anchor="middle" fill="var(--text)" font-size="13">PromptsPage.tsx</text><circle cx="460" cy="960" r="10" fill="var(--accent)"/><text x="460" y="964" text-anchor="middle" fill="var(--bg)" font-size="11">13</text></g>
+<g><title>notes-app/src/components/ScratchPage.tsx — modify (steps 14, 16)</title><rect x="460" y="1060" width="180" height="60" rx="8" fill="var(--surface)" stroke="var(--modify)" stroke-width="2"/><text x="550" y="1095" text-anchor="middle" fill="var(--text)" font-size="13">ScratchPage.tsx</text><circle cx="460" cy="1060" r="10" fill="var(--accent)"/><text x="460" y="1064" text-anchor="middle" fill="var(--bg)" font-size="11">14</text></g>
+
+<g><title>notes-app/docs/DESIGN.md — modify (step 22)</title><rect x="900" y="1160" width="180" height="60" rx="8" fill="var(--surface)" stroke="var(--modify)" stroke-width="2"/><text x="990" y="1195" text-anchor="middle" fill="var(--text)" font-size="13">docs/DESIGN.md</text><circle cx="900" cy="1160" r="10" fill="var(--accent)"/><text x="900" y="1164" text-anchor="middle" fill="var(--bg)" font-size="11">22</text></g>
+<g><title>notes-app/CLAUDE.md — modify (step 23)</title><rect x="900" y="1260" width="180" height="60" rx="8" fill="var(--surface)" stroke="var(--modify)" stroke-width="2"/><text x="990" y="1295" text-anchor="middle" fill="var(--text)" font-size="13">CLAUDE.md (notes-app)</text><circle cx="900" cy="1260" r="10" fill="var(--accent)"/><text x="900" y="1264" text-anchor="middle" fill="var(--bg)" font-size="11">23</text></g>
+<g><title>CLAUDE.md at the repository root — modify (step 23)</title><rect x="900" y="1360" width="180" height="60" rx="8" fill="var(--surface)" stroke="var(--modify)" stroke-width="2"/><text x="990" y="1395" text-anchor="middle" fill="var(--text)" font-size="13">CLAUDE.md (root)</text><circle cx="900" cy="1360" r="10" fill="var(--accent)"/><text x="900" y="1364" text-anchor="middle" fill="var(--bg)" font-size="11">23</text></g>
+<g><title>notes-app/plans/plan.18.smoke.html — create (step 24)</title><rect x="900" y="1460" width="180" height="60" rx="8" fill="var(--surface)" stroke="var(--create)" stroke-width="2" stroke-dasharray="4 2"/><text x="990" y="1495" text-anchor="middle" fill="var(--text)" font-size="13">plan.18.smoke.html</text><circle cx="900" cy="1460" r="10" fill="var(--accent)"/><text x="900" y="1464" text-anchor="middle" fill="var(--bg)" font-size="11">24</text></g>
+</svg>
+<figcaption class="legend">Dashed border = create · solid border = modify · arrow = dependency, pointing at the file depended on (solid new, dashed existing) · numbered circle = first implementation step touching the file. Column 4 holds two independent phases (4: scratch move, 5: high-contrast palette). Not drawn: <code>ScratchEditor.tsx → timestamp.ts</code> (existing helper, unchanged file).</figcaption>
+</figure>
+<table><caption>Files in this plan</caption><tr><th>Path</th><th>Action</th><th>Step</th></tr>
+<tr><td>notes-app/src/styles.css</td><td>modify</td><td>1, 2, 10, 20</td></tr>
+<tr><td>notes-app/src/lib/navHistory.ts</td><td>create</td><td>3</td></tr>
+<tr><td>notes-app/src/lib/navHistory.test.ts</td><td>create</td><td>4</td></tr>
+<tr><td>notes-app/src/lib/openTabs.ts</td><td>modify</td><td>5</td></tr>
+<tr><td>notes-app/src/lib/openTabs.test.ts</td><td>modify</td><td>6</td></tr>
+<tr><td>notes-app/src/lib/closeAll.ts</td><td>create</td><td>7</td></tr>
+<tr><td>notes-app/src/lib/closeAll.test.ts</td><td>create</td><td>8</td></tr>
+<tr><td>notes-app/src/components/EditorTabs.tsx</td><td>modify</td><td>9</td></tr>
+<tr><td>notes-app/src/hooks/useBackForwardKeys.ts</td><td>create</td><td>11</td></tr>
+<tr><td>notes-app/src/App.tsx</td><td>modify</td><td>12, 17</td></tr>
+<tr><td>notes-app/src/components/PromptsPage.tsx</td><td>modify</td><td>13</td></tr>
+<tr><td>notes-app/src/components/ScratchPage.tsx</td><td>modify</td><td>14, 16</td></tr>
+<tr><td>notes-app/src/components/ScratchEditor.tsx</td><td>modify</td><td>15</td></tr>
+<tr><td>notes-app/src/lib/palettes.ts</td><td>modify</td><td>18</td></tr>
+<tr><td>notes-app/src/lib/palettes.test.ts</td><td>modify</td><td>19</td></tr>
+<tr><td>notes-app/src/lib/stylesGuard.test.ts</td><td>create</td><td>21</td></tr>
+<tr><td>notes-app/docs/DESIGN.md</td><td>modify</td><td>22</td></tr>
+<tr><td>notes-app/CLAUDE.md</td><td>modify</td><td>23</td></tr>
+<tr><td>CLAUDE.md (repository root)</td><td>modify</td><td>23</td></tr>
+<tr><td>notes-app/plans/plan.18.smoke.html</td><td>create</td><td>24</td></tr>
+</table>
+</body></html>

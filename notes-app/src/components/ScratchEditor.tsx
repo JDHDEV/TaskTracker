@@ -14,6 +14,7 @@ import {
   type SendDestination,
 } from "../lib/contextMenu";
 import { formatTimestamp, insertText } from "../lib/timestamp";
+import { isUndoKey, restoreMove, type MoveRecord } from "../lib/moveUndo";
 import { buildScratchDraft, contentHash } from "../lib/drafts";
 import { useDraftBackup } from "../hooks/useDraftBackup";
 import { reportAiError } from "../lib/aiErrors";
@@ -66,8 +67,11 @@ interface Props {
   onDirtyChange: (dirty: boolean) => void;
   onSave: (body: string) => Promise<boolean>;
   /** "Send selection to…": open a pre-filled draft of `dest` in the pad's own
-   *  project. Copy, not cut — the pad text is untouched, and nothing is written
-   *  until the destination's own Save (D5). */
+   *  project. A MOVE (plan 18 D6, superseding plan 13 D5's copy): the editor
+   *  has already removed `text` from the pad and the pad is dirty; Ctrl+Z in
+   *  the pad puts it back (the pad's own move record, see `lastMoveRef`);
+   *  nothing is written until the destination's own Save (and the pad's
+   *  `scratch.md` until the pad's own Save). */
   onSendTo: (dest: SendDestination, text: string) => void;
   onError: (message: string, opts?: { key?: string }) => void;
   onResolve: (key: string) => void;
@@ -130,7 +134,14 @@ const ScratchEditor = forwardRef<ScratchEditorHandle, Props>(function ScratchEdi
   const selRef = useRef<SelectionRange | null>(null);
   const [selectionLength, setSelectionLength] = useState(0);
   const [selectionRework, setSelectionRework] = useState<CapturedSelection | null>(null);
-  const pendingCaretRef = useRef<SelectionRange | null>(null);
+  // `focus: false` (plan 18) places the caret WITHOUT pulling focus back — the
+  // scratch-move fallback sets it while the page is switching away.
+  const pendingCaretRef = useRef<(SelectionRange & { focus?: boolean }) | null>(null);
+  // Plan 18 (§12): the last "send selection to…" move, so Ctrl+Z in the pad
+  // can put the text back even after typing in the destination (the window
+  // shares one native undo stack). Stale — and ignored — once the pad's body
+  // differs from what the move left; cleared on reseed.
+  const lastMoveRef = useRef<MoveRecord | null>(null);
 
   // Plan 17 (D2–D5) — the Editor.tsx wiring: controlled instruction (+ live
   // ref mirror), the request-time capture `reworkRequest`, and the
@@ -177,7 +188,7 @@ const ScratchEditor = forwardRef<ScratchEditorHandle, Props>(function ScratchEdi
     const c = pendingCaretRef.current;
     if (c && bodyRef.current) {
       pendingCaretRef.current = null;
-      bodyRef.current.focus();
+      if (c.focus !== false) bodyRef.current.focus();
       bodyRef.current.setSelectionRange(c.start, c.end);
     }
   }, [body]);
@@ -186,9 +197,17 @@ const ScratchEditor = forwardRef<ScratchEditorHandle, Props>(function ScratchEdi
   // focused textarea (hidden pads stay mounted, so activeElement targets).
   // "Insert timestamp" rides edit() + pendingCaretRef like a line paste. The
   // send-to items re-read the LIVE selection at action time (bounds-checked,
-  // whitespace-only rejected — the same gate as a selection rework) and hand
-  // the text up; copy, not cut, and nothing is written until the destination's
-  // own Save (plan.13 D5).
+  // whitespace-only rejected — the same gate as a selection rework), REMOVE it
+  // from the pad, then hand the text up — a move, not a copy (plan 18 D6,
+  // superseding plan 13 D5). The removal is a native `execCommand("delete")`
+  // on the still-focused textarea: its `input` event runs the ordinary
+  // onChange → edit() + clearSelection() path (dirty flag, draft backup) while
+  // the textarea's own undo stack survives, so Ctrl+Z in the pad puts the text
+  // back (R-2). It runs BEFORE onSendTo because the hand-off hides the pad and
+  // moves focus in the same batch — and the hand-off cannot fail (both
+  // destinations are synchronous state updates, R-1). Nothing on disk changes
+  // until the pad's own Save. If execCommand reports failure the state path
+  // takes over with a caret that does not pull focus back.
   function handleContextMenuAction(action: ContextMenuAction) {
     const ta = bodyRef.current;
     if (!ta || document.activeElement !== ta) return;
@@ -208,6 +227,21 @@ const ScratchEditor = forwardRef<ScratchEditorHandle, Props>(function ScratchEdi
     if (dest === null) return;
     const sel = captureSelection({ start: ta.selectionStart, end: ta.selectionEnd }, ta.value);
     if (!sel) return;
+    // Exactly the captured range (captureSelection read it from ta.value).
+    ta.setSelectionRange(sel.start, sel.end);
+    const removed = document.execCommand("delete");
+    // execCommand is synchronous: on success ta.value is already the cut body.
+    let bodyAfter: string | null = removed ? ta.value : null;
+    if (!removed) {
+      const r = insertText(ta.value, sel, "");
+      if (r) {
+        edit(r.body);
+        clearSelection();
+        pendingCaretRef.current = { start: r.caret, end: r.caret, focus: false };
+        bodyAfter = r.body;
+      }
+    }
+    if (bodyAfter !== null) lastMoveRef.current = { start: sel.start, text: sel.text, bodyAfter };
     onSendTo(dest, sel.text);
   }
   const contextMenuRef = useRef(handleContextMenuAction);
@@ -261,7 +295,9 @@ const ScratchEditor = forwardRef<ScratchEditorHandle, Props>(function ScratchEdi
     selRef.current = null;
     setSelectionLength(0);
     pendingCaretRef.current = null;
-    setInstruction("");
+    lastMoveRef.current = null;
+    // Deliberately NOT `setInstruction("")` — a pad instance never changes
+    // project, so the only pass here is the mount (plan 17 §12 F13).
     setReworkRequest(null);
     setConfirmingSel(null);
     confirmingRef.current = false;
@@ -514,7 +550,25 @@ const ScratchEditor = forwardRef<ScratchEditorHandle, Props>(function ScratchEdi
           // items ("Insert timestamp", the send-to entries) injected from Rust
           // (plan.16); the app draws no menu of its own.
           onKeyDown={(e) => {
-            if (bodyRef.current) handleLineClipboardKeyDown(e, bodyRef.current);
+            const ta = bodyRef.current;
+            if (!ta) return;
+            // Plan 18 (§12): Ctrl+Z after a "send selection to…" move puts the
+            // moved text back from the pad's own record while the pad is
+            // unchanged since — native undo alone would first unwind whatever
+            // was typed in the destination (one undo stack per window). A
+            // stale record yields null and the key falls through to native undo.
+            if (isUndoKey(e)) {
+              const r = restoreMove(ta.value, lastMoveRef.current);
+              if (r) {
+                e.preventDefault();
+                lastMoveRef.current = null;
+                edit(r.body);
+                clearSelection();
+                pendingCaretRef.current = r.caret; // re-select the restored text
+                return;
+              }
+            }
+            handleLineClipboardKeyDown(e, ta);
           }}
           onPaste={(e) => {
             const ta = bodyRef.current;

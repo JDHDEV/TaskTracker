@@ -139,10 +139,12 @@ export default function AiBar({
         aria-describedby={hintId}
         maxLength={INSTRUCTION_MAX_LENGTH}
         value={instruction}
-        // readOnly, not disabled, while busy: `disabled` dumps focus to <body>
-        // the moment Rework is pressed (D2).
-        readOnly={busy}
-        aria-disabled={busy}
+        // Editable while busy (plan 17 §12 F14 — D2's readOnly dropped): the
+        // item editor stays busy through its title phase after the body
+        // stream, and a read-only box silently ate anything typed then.
+        // Enter is ignored while busy (shouldSubmitOnKey) and the Rework
+        // button is disabled, so nothing can submit mid-stream; the request
+        // already captured its own instruction (reworkRequest, D4).
         onChange={(e) => onInstructionChange(e.target.value)}
         onKeyDown={(e) => {
           if (

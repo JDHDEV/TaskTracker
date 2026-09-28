@@ -8,15 +8,21 @@ import {
   activateTab,
   activeTab,
   closeTab,
+  closeTabs,
   dirtyCount,
   dirtyKeys,
   emptyTabs,
+  navigateTab,
   openTab,
+  resetHistory,
   setDirty,
   setTabItem,
   type OpenTabsState,
 } from "../lib/openTabs";
-import EditorTabs, { type EditorTabDescriptor } from "./EditorTabs";
+import { canBack, canForward, type NavDirection } from "../lib/navHistory";
+import { runCloseAll } from "../lib/closeAll";
+import { useBackForwardKeys } from "../hooks/useBackForwardKeys";
+import EditorTabs, { focusTabFromShortcut, type EditorTabDescriptor } from "./EditorTabs";
 import ScratchEditor, { type ScratchDoc, type ScratchEditorHandle } from "./ScratchEditor";
 import type { SendDestination } from "../lib/contextMenu";
 
@@ -211,7 +217,9 @@ export default function ScratchPage({
           const key = scratchTabKey(s.activeProjectId);
           if (next.tabs.some((t) => t.key === key)) next = activateTab(next, key);
         }
-        return next;
+        // Plan 18: the replayed opens are not a walk the user took — start
+        // the Back/Forward history at the restored active pad.
+        return resetHistory(next);
       });
       if (newConflicts.size > 0) {
         setConflicts(newConflicts);
@@ -330,6 +338,57 @@ export default function ScratchPage({
     editorRefs.current.delete(key);
   }
 
+  // Plan 18 "Close all" for the pad strip — App.tsx's flow, pad-shaped (D1/D2,
+  // R-4/R-5): Q1, then Q2 Save/Discard for the dirty pads. A pad is never a
+  // never-saved draft (one pad per project, always backed by scratch.md), so
+  // the per-draft confirm is unreachable and answers "keep" if it ever fires.
+  const closingAllRef = useRef(false);
+  function requestCloseAll() {
+    if (closingAllRef.current) return;
+    closingAllRef.current = true;
+    void (async () => {
+      try {
+        const open = tabsRef.current.tabs;
+        const { closed, kept } = await runCloseAll({
+          tabs: open.map((t) => ({ key: t.key, isDirty: t.isDirty, isDraft: false })),
+          confirm: api.confirmDialog,
+          save: async (k) => (await editorRefs.current.get(k)?.save()) ?? false,
+          discard: async (k) => {
+            await editorRefs.current.get(k)?.discardDraft();
+          },
+          activate: (k) => setTabs((s) => activateTab(s, k)),
+          confirmDraft: () => Promise.resolve(false),
+        });
+        if (closed.length === 0) return; // cancelled, or nothing could close
+        setTabs((s) => closeTabs(s, closed));
+        closed.forEach((k) => editorRefs.current.delete(k));
+        if (kept.length > 0) {
+          onNotice(
+            `${kept.length} tab${kept.length === 1 ? "" : "s"} stayed open: unsaved or save failed.`,
+            { key: "close-all-kept" },
+          );
+        }
+      } finally {
+        closingAllRef.current = false;
+      }
+    })();
+  }
+
+  // Plan 18 Back/Forward over this strip (see App.tsx); the shortcut hook is
+  // enabled only while the Scratch page is visible with pads open.
+  function navigateHistory(dir: NavDirection, fromShortcut: boolean) {
+    if (closingAllRef.current) return; // R-8
+    const preview = navigateTab(tabsRef.current, dir);
+    if (preview === tabsRef.current) return;
+    setTabs((s) => navigateTab(s, dir));
+    if (fromShortcut && preview.activeKey) focusTabFromShortcut(preview.activeKey);
+  }
+  useBackForwardKeys({
+    enabled: pageActive && tabs.tabs.length > 0,
+    onBack: () => navigateHistory("back", true),
+    onForward: () => navigateHistory("forward", true),
+  });
+
   // Close × / Delete-key. A clean tab closes at once; a dirty pad offers
   // Cancel / Discard / Save via two chained Yes/No dialogs (never window.confirm).
   function requestCloseTab(key: string) {
@@ -357,9 +416,16 @@ export default function ScratchPage({
     })();
   }
 
+  // Plan 18 D6 (supersedes plan.13 D5): a MOVE — the pad's own editor removed
+  // the text before calling this. Disclose it (the native menu labels still
+  // read "New … from selection"); the toast shows on the destination page.
   function sendTo(projectId: string, dest: SendDestination, text: string) {
     if (dest === "prompt") onSendToPrompt(projectId, text);
     else onSendToItem(dest, projectId, text);
+    onNotice(
+      "Moved the selection out of the scratch pad — it stays unsaved; Ctrl+Z in the pad puts the text back.",
+      { key: "scratch-moved" },
+    );
   }
 
   return (
@@ -402,6 +468,12 @@ export default function ScratchPage({
             onActivate={(key) => setTabs((s) => activateTab(s, key))}
             onClose={requestCloseTab}
             listLabel="Open scratch pads"
+            onCloseAll={requestCloseAll}
+            closeAllLabel="Close all open scratch pads"
+            onBack={() => navigateHistory("back", false)}
+            onForward={() => navigateHistory("forward", false)}
+            canBack={canBack(tabs.history)}
+            canForward={canForward(tabs.history)}
           />
           {tabs.tabs.map((t) => {
             const conflict = conflicts.get(t.key);
