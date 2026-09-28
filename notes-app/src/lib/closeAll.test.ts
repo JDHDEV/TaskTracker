@@ -1,12 +1,25 @@
 import { describe, it, expect } from "vitest";
 import {
   closeAllQuestion,
+  closeSavedQuestion,
   planCloseAll,
+  planCloseSaved,
   runCloseAll,
+  runCloseSaved,
   saveAllQuestion,
   type CloseAllDeps,
   type CloseAllTab,
+  type CloseSavedDeps,
 } from "./closeAll";
+import {
+  activateTab,
+  activeTab,
+  closeTabs,
+  dirtyCount,
+  dirtyKeys,
+  emptyTabs,
+  openTab,
+} from "./openTabs";
 
 // Builds a CloseAllDeps fake set that also records one ordered call log, so
 // cross-flow ORDER assertions (Q1 -> Q2/save/discard -> per-draft loop) can be
@@ -262,5 +275,253 @@ describe("runCloseAll", () => {
     await runCloseAll(deps);
 
     expect(confirmCalls[0].opts).toEqual({ okLabel: "Close all", cancelLabel: "Cancel" });
+  });
+});
+
+describe("planCloseSaved", () => {
+  it("excludes dirty tabs, keeping tab order", () => {
+    const tabs = [tab("a"), tab("b", { isDirty: true }), tab("c")];
+    expect(planCloseSaved(tabs)).toEqual(["a", "c"]);
+  });
+
+  it("excludes a draft even when its isDirty is false (SEC-1 shape, R-2)", () => {
+    const tabs = [tab("a"), tab("draft-1", { isDraft: true, isDirty: false }), tab("b")];
+    expect(planCloseSaved(tabs)).toEqual(["a", "b"]);
+  });
+
+  it("excludes a dirty draft too", () => {
+    const tabs = [tab("a"), tab("draft-1", { isDraft: true, isDirty: true })];
+    expect(planCloseSaved(tabs)).toEqual(["a"]);
+  });
+
+  it("returns [] for an empty tab list", () => {
+    expect(planCloseSaved([])).toEqual([]);
+  });
+
+  it("returns every key in order when all tabs are clean and saved", () => {
+    const tabs = [tab("a"), tab("b"), tab("c")];
+    expect(planCloseSaved(tabs)).toEqual(["a", "b", "c"]);
+  });
+});
+
+describe("closeSavedQuestion (pinned wording)", () => {
+  it("(3, 2) -> plural saved, plural unsaved", () => {
+    expect(closeSavedQuestion(3, 2)).toBe("Close 3 saved tabs? 2 with unsaved changes stay open.");
+  });
+
+  it("(1, 1) -> singular saved, singular unsaved", () => {
+    expect(closeSavedQuestion(1, 1)).toBe("Close 1 saved tab? 1 with unsaved changes stays open.");
+  });
+
+  it("(3, 0) -> plural saved, no unsaved clause", () => {
+    expect(closeSavedQuestion(3, 0)).toBe("Close 3 saved tabs?");
+  });
+
+  it("(1, 0) -> singular saved, no unsaved clause", () => {
+    expect(closeSavedQuestion(1, 0)).toBe("Close 1 saved tab?");
+  });
+
+  it("(1, 2) -> singular saved, plural unsaved", () => {
+    expect(closeSavedQuestion(1, 2)).toBe("Close 1 saved tab? 2 with unsaved changes stay open.");
+  });
+
+  it("(2, 1) -> plural saved, singular unsaved", () => {
+    expect(closeSavedQuestion(2, 1)).toBe("Close 2 saved tabs? 1 with unsaved changes stays open.");
+  });
+});
+
+describe("runCloseSaved", () => {
+  function fakeConfirm(answers: boolean[]) {
+    const calls: { message: string; opts?: { okLabel?: string; cancelLabel?: string } }[] = [];
+    const queue = answers.slice();
+    const confirm: CloseAllDeps["confirm"] = async (message, opts) => {
+      calls.push({ message, opts });
+      return queue.shift() ?? false;
+    };
+    return { confirm, calls };
+  }
+
+  it("zero saved tabs (all dirty) never calls confirm and returns { closed: [] }", async () => {
+    const tabs = [tab("a", { isDirty: true }), tab("b", { isDirty: true })];
+    const { confirm, calls } = fakeConfirm([]);
+
+    const result = await runCloseSaved({ getTabs: () => tabs, confirm });
+
+    expect(result).toEqual({ closed: [] });
+    expect(calls).toHaveLength(0);
+  });
+
+  it("zero saved tabs (only drafts) never calls confirm", async () => {
+    const tabs = [tab("draft-1", { isDraft: true }), tab("draft-2", { isDraft: true, isDirty: true })];
+    const { confirm, calls } = fakeConfirm([]);
+
+    const result = await runCloseSaved({ getTabs: () => tabs, confirm });
+
+    expect(result).toEqual({ closed: [] });
+    expect(calls).toHaveLength(0);
+  });
+
+  it("zero saved tabs (empty tab list) never calls confirm", async () => {
+    const { confirm, calls } = fakeConfirm([]);
+
+    const result = await runCloseSaved({ getTabs: () => [], confirm });
+
+    expect(result).toEqual({ closed: [] });
+    expect(calls).toHaveLength(0);
+  });
+
+  it("the one confirm names the SAVED and dirty counts (not the total) with the exact opts, called exactly once", async () => {
+    // 5 tabs total, 3 saved (a, c, e), 2 dirty (b, d).
+    const tabs = [tab("a"), tab("b", { isDirty: true }), tab("c"), tab("d", { isDirty: true }), tab("e")];
+    const { confirm, calls } = fakeConfirm([true]);
+
+    await runCloseSaved({ getTabs: () => tabs, confirm });
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0].message).toBe(closeSavedQuestion(3, 2));
+    expect(calls[0].message).toBe("Close 3 saved tabs? 2 with unsaved changes stay open.");
+    expect(calls[0].message).not.toContain("5");
+    expect(calls[0].opts).toEqual({ okLabel: "Close saved", cancelLabel: "Cancel" });
+  });
+
+  it("Cancel (confirm resolves false) closes nothing; confirm is called exactly once", async () => {
+    const tabs = [tab("a"), tab("b", { isDirty: true })];
+    const { confirm, calls } = fakeConfirm([false]);
+
+    const result = await runCloseSaved({ getTabs: () => tabs, confirm });
+
+    expect(result).toEqual({ closed: [] });
+    expect(calls).toHaveLength(1);
+  });
+
+  it("OK on an unchanged tab set closes exactly planCloseSaved(tabs)", async () => {
+    const tabs = [tab("a"), tab("b", { isDirty: true }), tab("c"), tab("draft-1", { isDraft: true })];
+    const { confirm } = fakeConfirm([true]);
+
+    const result = await runCloseSaved({ getTabs: () => tabs, confirm });
+
+    expect(result).toEqual({ closed: planCloseSaved(tabs) });
+    expect(result.closed).toEqual(["a", "c"]);
+  });
+
+  describe("re-validation against a mutated tab set while the dialog is pending (D5)", () => {
+    function deferredConfirm() {
+      let resolve!: (v: boolean) => void;
+      const promise = new Promise<boolean>((r) => {
+        resolve = r;
+      });
+      const confirm: CloseAllDeps["confirm"] = () => promise;
+      return { confirm, resolve };
+    }
+
+    it("a tab that turned dirty while the dialog was pending is excluded", async () => {
+      let tabs: CloseAllTab[] = [tab("a"), tab("b"), tab("c")];
+      let getTabsCalls = 0;
+      const getTabs = () => {
+        getTabsCalls++;
+        return tabs;
+      };
+      const { confirm, resolve } = deferredConfirm();
+
+      const pending = runCloseSaved({ getTabs, confirm });
+      tabs = [tab("a", { isDirty: true }), tab("b"), tab("c")]; // "a" turned dirty mid-dialog
+      resolve(true);
+      const result = await pending;
+
+      expect(result.closed).toEqual(["b", "c"]);
+      expect(result.closed).not.toContain("a");
+      expect(getTabsCalls).toBeGreaterThanOrEqual(2);
+    });
+
+    it("a tab that turned CLEAN while pending is NOT included (never more than the dialog counted)", async () => {
+      let tabs: CloseAllTab[] = [tab("a", { isDirty: true }), tab("b"), tab("c")];
+      const getTabs = () => tabs;
+      const { confirm, resolve } = deferredConfirm();
+
+      const pending = runCloseSaved({ getTabs, confirm });
+      tabs = [tab("a"), tab("b"), tab("c")]; // "a" turned clean mid-dialog
+      resolve(true);
+      const result = await pending;
+
+      expect(result.closed).toEqual(["b", "c"]);
+      expect(result.closed).not.toContain("a");
+    });
+
+    it("a tab that closed (removed from the array) while pending is excluded", async () => {
+      let tabs: CloseAllTab[] = [tab("a"), tab("b"), tab("c")];
+      const getTabs = () => tabs;
+      const { confirm, resolve } = deferredConfirm();
+
+      const pending = runCloseSaved({ getTabs, confirm });
+      tabs = [tab("a"), tab("c")]; // "b" closed mid-dialog
+      resolve(true);
+      const result = await pending;
+
+      expect(result.closed).toEqual(["a", "c"]);
+      expect(result.closed).not.toContain("b");
+    });
+
+    it("getTabs is called at least twice (before and after the dialog)", async () => {
+      const tabs: CloseAllTab[] = [tab("a"), tab("b")];
+      let getTabsCalls = 0;
+      const getTabs = () => {
+        getTabsCalls++;
+        return tabs;
+      };
+      const { confirm, resolve } = deferredConfirm();
+
+      const pending = runCloseSaved({ getTabs, confirm });
+      resolve(true);
+      await pending;
+
+      expect(getTabsCalls).toBeGreaterThanOrEqual(2);
+    });
+  });
+
+  describe("integrated with the real closeTabs reducer", () => {
+    it("folds into closeTabs: survivors are exactly the dirty tabs, active moves to the nearest surviving right neighbour, and dirtyKeys/dirtyCount stay consistent", async () => {
+      let state = openTab(emptyTabs<string>(), "a", "Item A");
+      state = openTab(state, "b", "Item B", true); // dirty
+      state = openTab(state, "c", "Item C");
+      state = openTab(state, "d", "Item D", true); // dirty
+      state = openTab(state, "e", "Item E");
+      state = activateTab(state, "c"); // active tab is among the saved ones
+
+      expect(activeTab(state)?.key).toBe("c");
+
+      const tabsSnapshot: CloseAllTab[] = state.tabs.map((t) => tab(t.key, { isDirty: t.isDirty }));
+
+      const result = await runCloseSaved({
+        getTabs: () => tabsSnapshot,
+        confirm: async () => true,
+      });
+      expect(result.closed).toEqual(["a", "c", "e"]);
+
+      state = closeTabs(state, result.closed);
+
+      expect(state.tabs.map((t) => t.key)).toEqual(["b", "d"]);
+      expect(state.activeKey).toBe("d"); // nearest surviving right neighbour of c's original slot
+      expect(state.tabs.every((t) => t.isDirty)).toBe(true);
+      expect(dirtyKeys(state)).toEqual(new Set(["b", "d"]));
+      expect(dirtyCount(state)).toBe(2);
+    });
+  });
+});
+
+describe("CloseSavedDeps shape (plan 19 D5): getTabs + confirm only, no persistence verbs", () => {
+  it("has exactly the keys getTabs and confirm", () => {
+    type Keys = keyof CloseSavedDeps;
+    const keys: Keys[] = ["getTabs", "confirm"];
+    expect(keys).toHaveLength(2);
+  });
+
+  it("rejects an object carrying a save field (type-level; requires this file in tsc's `include`)", () => {
+    const bad: CloseSavedDeps = {
+      getTabs: () => [],
+      confirm: async () => true,
+      // @ts-expect-error CloseSavedDeps has no save/discard/activate/confirmDraft — plan 19 has no persistence verbs.
+      save: async () => true,
+    };
+    expect(bad).toBeTruthy();
   });
 });

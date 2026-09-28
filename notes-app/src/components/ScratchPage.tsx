@@ -20,7 +20,7 @@ import {
   type OpenTabsState,
 } from "../lib/openTabs";
 import { canBack, canForward, type NavDirection } from "../lib/navHistory";
-import { runCloseAll } from "../lib/closeAll";
+import { runCloseAll, runCloseSaved } from "../lib/closeAll";
 import { useBackForwardKeys } from "../hooks/useBackForwardKeys";
 import EditorTabs, { focusTabFromShortcut, type EditorTabDescriptor } from "./EditorTabs";
 import ScratchEditor, { type ScratchDoc, type ScratchEditorHandle } from "./ScratchEditor";
@@ -289,6 +289,7 @@ export default function ScratchPage({
         key: t.key,
         title: projectName(t.item.projectId),
         dirty: t.isDirty,
+        isDraft: false, // a pad is never a never-saved draft (one per project)
       })),
     // `loaded` is a dep because the tab title is the (renameable) project name.
     [tabs, loaded],
@@ -374,6 +375,28 @@ export default function ScratchPage({
     })();
   }
 
+  // Plan 19 "Close saved" for the pad strip — App.tsx's flow (D4/D5/D8,
+  // R-1/R-6): one confirm, re-validated against the live tabsRef, shared
+  // guard, never saves or discards. Pads are never drafts (`isDraft: false`).
+  function requestCloseSaved() {
+    if (closingAllRef.current) return;
+    closingAllRef.current = true;
+    void (async () => {
+      try {
+        const { closed } = await runCloseSaved({
+          getTabs: () =>
+            tabsRef.current.tabs.map((t) => ({ key: t.key, isDirty: t.isDirty, isDraft: false })),
+          confirm: api.confirmDialog,
+        });
+        if (closed.length === 0) return; // cancelled, or nothing saved
+        setTabs((s) => closeTabs(s, closed));
+        closed.forEach((k) => editorRefs.current.delete(k));
+      } finally {
+        closingAllRef.current = false;
+      }
+    })();
+  }
+
   // Plan 18 Back/Forward over this strip (see App.tsx); the shortcut hook is
   // enabled only while the Scratch page is visible with pads open.
   function navigateHistory(dir: NavDirection, fromShortcut: boolean) {
@@ -405,8 +428,9 @@ export default function ScratchPage({
           )
         ) {
           const saved = await editorRefs.current.get(key)?.save();
+          // Save failed, or an edit landed while it ran (plan 19 D0) → keep
+          // the tab open, edits intact. (A clean save cleared the backup.)
           if (!saved) return;
-          // (a successful save cleared the draft backup itself)
         } else {
           // Plan.15 §4.3: the Discard branch clears the on-disk backup too.
           await editorRefs.current.get(key)?.discardDraft();
@@ -470,6 +494,8 @@ export default function ScratchPage({
             listLabel="Open scratch pads"
             onCloseAll={requestCloseAll}
             closeAllLabel="Close all open scratch pads"
+            onCloseSaved={requestCloseSaved}
+            closeSavedLabel="Close saved open scratch pads"
             onBack={() => navigateHistory("back", false)}
             onForward={() => navigateHistory("forward", false)}
             canBack={canBack(tabs.history)}

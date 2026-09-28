@@ -1,5 +1,11 @@
 import { describe, it, expect } from "vitest";
-import { captureSelection, isSelectionStale, selectionSegments, spliceProposal } from "./selection";
+import {
+  captureSelection,
+  isSelectionStale,
+  pickHighlight,
+  selectionSegments,
+  spliceProposal,
+} from "./selection";
 import type { CapturedSelection } from "./selection";
 
 describe("captureSelection", () => {
@@ -334,6 +340,49 @@ describe("selectionSegments", () => {
 
   it("returns null when sel is null", () => {
     expect(selectionSegments("Hello world", null)).toBeNull();
+  });
+});
+
+describe("pickHighlight", () => {
+  const confirming: CapturedSelection = { start: 0, end: 3, text: "abc" };
+  const pending: CapturedSelection = { start: 5, end: 8, text: "def" };
+  const blurred: CapturedSelection = { start: 10, end: 13, text: "ghi" };
+
+  it("confirming wins over pending and blurred when all three are present", () => {
+    expect(pickHighlight(confirming, pending, blurred)).toBe(confirming);
+  });
+
+  it("pending wins over blurred when confirming is null", () => {
+    expect(pickHighlight(null, pending, blurred)).toBe(pending);
+  });
+
+  it("blurred alone is returned when confirming and pending are both null", () => {
+    expect(pickHighlight(null, null, blurred)).toBe(blurred);
+  });
+
+  it("returns null when all three are null", () => {
+    expect(pickHighlight(null, null, null)).toBeNull();
+  });
+
+  describe("composed with selectionSegments (R-6 parity: draws nothing, never relocates)", () => {
+    it("a stale blurred range (body edited since capture) highlights nothing", () => {
+      const body = "Hello world";
+      const blurredSel = captureSelection({ start: 6, end: 11 }, body) as CapturedSelection; // "world"
+      const edited = "Hi " + body; // shifts "world" out from under [6, 11)
+
+      expect(selectionSegments(edited, pickHighlight(null, null, blurredSel))).toBeNull();
+    });
+
+    it("an unedited body still rejoins exactly through the blurred range", () => {
+      const body = "Hello world";
+      const blurredSel = captureSelection({ start: 6, end: 11 }, body) as CapturedSelection; // "world"
+
+      const seg = selectionSegments(body, pickHighlight(null, null, blurredSel));
+
+      expect(seg).not.toBeNull();
+      expect(seg!.before + seg!.selected + seg!.after).toBe(body);
+      expect(seg!.selected).toBe("world");
+    });
   });
 });
 

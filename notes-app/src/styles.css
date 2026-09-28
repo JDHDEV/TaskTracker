@@ -762,7 +762,11 @@ textarea {
    `+` and `Close all` after it, all outside `role="tablist"`). The tablist
    itself is a transparent scroller that SHRINKS (`flex: 0 1 auto; min-width:
    0`) so the controls never scroll away, with 1px of bottom padding for the
-   active tab's overlap onto the bar's hairline. Height stays 41px. */
+   active tab's overlap onto the bar's hairline. Height stays 41px.
+
+   Plan 19 (D9): the vertical wheel is mapped to `scrollLeft` by EditorTabs
+   through a native non-passive listener; the strip still has no vertical
+   overflow — `overflow-y: hidden` stays. */
 .editor-tabs-bar {
   display: flex;
   align-items: flex-end;
@@ -871,14 +875,22 @@ textarea {
 .etab-nav[aria-disabled="true"]:hover {
   background: var(--surface); color: var(--muted); opacity: .5; cursor: default;
 }
-/* Plan 18: Close all — carries text, so its own width/padding/font. */
-.etab-closeall {
+/* Plan 18: Close all — carries text, so its own width/padding/font. Plan 19:
+   Close saved shares the recipe, plus the .etab-nav aria-disabled dimming
+   while no tab is saved (never `disabled`). */
+.etab-closeall,
+.etab-closesaved {
   align-self: center; height: 30px; width: auto; padding: 0 10px; margin-bottom: 6px;
   border: 1px solid var(--line); border-radius: 7px;
   background: var(--surface); color: var(--muted);
   font: inherit; font-size: 12px; white-space: nowrap; cursor: pointer;
 }
-.etab-closeall:hover { background: var(--bg); color: var(--ink); }
+.etab-closeall:hover,
+.etab-closesaved:hover { background: var(--bg); color: var(--ink); }
+.etab-closesaved[aria-disabled="true"],
+.etab-closesaved[aria-disabled="true"]:hover {
+  background: var(--surface); color: var(--muted); opacity: .5; cursor: default;
+}
 
 .editor-head {
   display: flex;

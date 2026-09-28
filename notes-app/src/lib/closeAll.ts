@@ -13,6 +13,16 @@
 // are never bulk-destroyed and never bulk-saved (a draft save may need a
 // target project and fires an AI title call). A failed save keeps its tab; a
 // kept tab is never discarded.
+//
+// Plan 19 (D4/D5): `runCloseSaved` is the second sequencer over the same tab
+// shape — close only the tabs with no unsaved changes, after exactly ONE
+// confirm (always shown, unlike Close all over an all-clean strip). It has no
+// save/discard/activate verbs at all: it can never persist or destroy
+// anything. The tab set is read through `getTabs` (live, not a snapshot) and
+// re-read after the dialog, so a tab that changed state while the dialog was
+// up is never closed unexpectedly, and never more tabs close than the dialog
+// counted (R-1). Never-saved drafts are excluded whatever their dirty bit
+// says (R-2).
 
 /** What the sequencer needs to know about one open tab. */
 export interface CloseAllTab {
@@ -134,4 +144,49 @@ export async function runCloseAll(deps: CloseAllDeps): Promise<CloseAllResult> {
     closed: all.filter((k) => closed.has(k)),
     kept: all.filter((k) => kept.has(k)),
   };
+}
+
+/** Plan 19: the keys `Close saved` may close — not dirty AND not a never-saved
+ *  draft (R-2: a draft's dirty bit can be wrong, its content exists only as a
+ *  buffer + backup), in tab order. The strip's button enablement uses this
+ *  same predicate, so it is never enabled while this would find nothing. */
+export function planCloseSaved(tabs: readonly CloseAllTab[]): string[] {
+  return tabs.filter((t) => !t.isDirty && !t.isDraft).map((t) => t.key);
+}
+
+/** Plan 19 (D6): the one `Close saved` confirm; counts only, never titles. */
+export function closeSavedQuestion(saved: number, unsaved: number): string {
+  const head = saved === 1 ? "Close 1 saved tab?" : `Close ${saved} saved tabs?`;
+  if (unsaved === 0) return head;
+  return unsaved === 1
+    ? `${head} 1 with unsaved changes stays open.`
+    : `${head} ${unsaved} with unsaved changes stay open.`;
+}
+
+export interface CloseSavedDeps {
+  /** The LIVE tab set (the owner's tabsRef) — read before the dialog and
+   *  again after it (D5). */
+  getTabs: () => readonly CloseAllTab[];
+  confirm: CloseAllDeps["confirm"];
+}
+
+/**
+ * Run the plan 19 `Close saved` flow: nothing saved → return without a dialog
+ * (the button is already `aria-disabled`, R-5); else one confirm naming the
+ * saved count (and the unsaved count when > 0); Cancel → nothing; OK → close
+ * the keys that were counted AND are still open and saved now. A tab that
+ * turned dirty or closed meanwhile is dropped; one that turned clean is NOT
+ * added (the user was not told about it).
+ */
+export async function runCloseSaved(deps: CloseSavedDeps): Promise<{ closed: string[] }> {
+  const tabs = deps.getTabs();
+  const first = planCloseSaved(tabs);
+  if (first.length === 0) return { closed: [] };
+  const ok = await deps.confirm(closeSavedQuestion(first.length, tabs.length - first.length), {
+    okLabel: "Close saved",
+    cancelLabel: "Cancel",
+  });
+  if (!ok) return { closed: [] };
+  const still = new Set(planCloseSaved(deps.getTabs()));
+  return { closed: first.filter((k) => still.has(k)) };
 }

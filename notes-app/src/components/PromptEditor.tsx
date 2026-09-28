@@ -27,6 +27,7 @@ import { tabDomId, tabPanelDomId } from "../lib/openTabs";
 import {
   captureSelection,
   isSelectionStale,
+  pickHighlight,
   spliceProposal,
   type CapturedSelection,
   type SelectionRange,
@@ -41,6 +42,7 @@ import SelectionBackdrop from "./SelectionBackdrop";
  *  tab from the close-dirty "Save" branch (its buffer lives only here).
  *  Plan.15 adds the draft-backup verbs (see EditorHandle in Editor.tsx). */
 export interface PromptEditorHandle {
+  /** True only when persisted AND clean afterwards (plan 19 D0, §12). */
   save: () => Promise<boolean>;
   applyDraft: (snapshot: Draft) => void;
   flushDraft: () => Promise<void>;
@@ -161,6 +163,10 @@ const PromptEditor = forwardRef<PromptEditorHandle, Props>(function PromptEditor
   // a lastEditRef bumped at the edit() chokepoint, a per-render snapshot
   // closure (null when buffer == base), and the shared timing hook.
   const lastEditRef = useRef(0);
+  // Plan 19 (D0): edit sequence — save() marks clean only if it is unchanged
+  // since the save began (see Editor.tsx).
+  const editSeqRef = useRef(0);
+  const lastSaveKeptDirtyRef = useRef(false); // reported by the handle's save() (§12)
   const snapshotRef = useRef<() => Draft | null>(() => null);
   useEffect(() => {
     snapshotRef.current = () => {
@@ -207,6 +213,10 @@ const PromptEditor = forwardRef<PromptEditorHandle, Props>(function PromptEditor
   } | null>(null);
   const [confirmingSel, setConfirmingSel] = useState<CapturedSelection | null>(null);
   const confirmingRef = useRef(false);
+  // Plan 19 (D1): the range held when the body lost focus — the lowest-
+  // precedence highlight source; cleared on focus, by clearSelection and by
+  // the reseed (see Editor.tsx).
+  const [blurSel, setBlurSel] = useState<CapturedSelection | null>(null);
   // The selection-highlight mirror (Phase 4), scroll-synced from the textarea.
   const hlRef = useRef<HTMLDivElement>(null);
 
@@ -227,6 +237,7 @@ const PromptEditor = forwardRef<PromptEditorHandle, Props>(function PromptEditor
   function clearSelection() {
     selRef.current = null;
     setSelectionLength(0);
+    setBlurSel(null);
     const ta = bodyRef.current;
     if (ta) {
       const pos = ta.selectionEnd;
@@ -268,12 +279,15 @@ const PromptEditor = forwardRef<PromptEditorHandle, Props>(function PromptEditor
   // even when it is a background (non-active) tab whose buffer lives only here.
   // applyDraft is the conflict bar's only way into a mounted clean editor (D4).
   useImperativeHandle(ref, () => ({
-    save: () => save(),
+    save: async () => (await save()) && !lastSaveKeptDirtyRef.current,
     applyDraft: (snapshot: Draft) => {
       setTitle(snapshot.title);
       setBody(snapshot.body);
+      // Plan 19 (R-8): a programmatic body change invalidates the tracked offsets
+      clearSelection();
       setDirty(true);
       lastEditRef.current = Date.now();
+      editSeqRef.current += 1; // Plan 19 (D0): a restore is a buffered change too
     },
     flushDraft: () => draftBackup.flushNow(),
     discardDraft: () => draftBackup.discard(),
@@ -322,6 +336,7 @@ const PromptEditor = forwardRef<PromptEditorHandle, Props>(function PromptEditor
     savingRef.current = false;
     setSelectionRework(null);
     selRef.current = null;
+    setBlurSel(null);
     setSelectionLength(0);
     pendingCaretRef.current = null;
     // Deliberately NOT `setInstruction("")`: this instance only ever reseeds
@@ -373,6 +388,7 @@ const PromptEditor = forwardRef<PromptEditorHandle, Props>(function PromptEditor
   }): Promise<boolean> {
     if (savingRef.current) return false; // re-entry guard
     savingRef.current = true;
+    const seqAtSave = editSeqRef.current; // Plan 19 (D0)
     setSaving(true);
     try {
       const effectiveBody = overrides?.body ?? body;
@@ -398,7 +414,10 @@ const PromptEditor = forwardRef<PromptEditorHandle, Props>(function PromptEditor
           instruction: overrides?.instruction,
         };
         const created = await onCreate(input);
-        if (created) {
+        // Plan 19 (D0): an edit landed while the save was running — stay
+        // dirty, keep the backup; the next save persists it.
+        lastSaveKeptDirtyRef.current = created && editSeqRef.current !== seqAtSave;
+        if (created && !lastSaveKeptDirtyRef.current) {
           setDirty(false);
           draftBackup.clearAfterSave(); // the created prompt owns the content now
         }
@@ -410,7 +429,10 @@ const PromptEditor = forwardRef<PromptEditorHandle, Props>(function PromptEditor
         source: overrides?.source,
         instruction: overrides?.instruction,
       });
-      if (saved) {
+      // Plan 19 (D0): an edit landed while the save was running — stay dirty,
+      // keep the backup; the next save persists it.
+      lastSaveKeptDirtyRef.current = saved && editSeqRef.current !== seqAtSave;
+      if (saved && !lastSaveKeptDirtyRef.current) {
         setDirty(false); // a rejected save stays dirty → "Save", not "Saved"
         draftBackup.clearAfterSave();
       }
@@ -539,6 +561,7 @@ const PromptEditor = forwardRef<PromptEditorHandle, Props>(function PromptEditor
       setDirty(true);
       // The buffered-edit chokepoint — the draft backup keys off it (plan.15 D6).
       lastEditRef.current = Date.now();
+      editSeqRef.current += 1;
     };
   }
 
@@ -554,6 +577,8 @@ const PromptEditor = forwardRef<PromptEditorHandle, Props>(function PromptEditor
       if (!ok) return;
       setTitle(prompt.title);
       setBody(prompt.body);
+      // Plan 19 (R-8): a programmatic body change invalidates the tracked offsets
+      clearSelection();
       setDirty(false);
     })();
   }
@@ -562,8 +587,13 @@ const PromptEditor = forwardRef<PromptEditorHandle, Props>(function PromptEditor
   // re-validated on click.
   const stale = selectionRework !== null && isSelectionStale(body, selectionRework);
   // Plan 17 D6 / R-6: the highlight mirror shows only while the range is valid
-  // and a selection rework is confirming or pending (see Editor.tsx).
-  const highlightSel = confirmingSel ?? (proposal !== null ? selectionRework : null);
+  // and a selection rework is confirming or pending — or, plan 19 (D2), while
+  // the body is unfocused with a tracked range (see Editor.tsx).
+  const highlightSel = pickHighlight(
+    confirmingSel,
+    proposal !== null ? selectionRework : null,
+    blurSel,
+  );
   const showHighlight = highlightSel !== null && !isSelectionStale(body, highlightSel);
   useLayoutEffect(() => {
     if (showHighlight) syncHighlightScroll();
@@ -706,6 +736,9 @@ const PromptEditor = forwardRef<PromptEditorHandle, Props>(function PromptEditor
             if (!next.ok) return;
             edit(setBody)(next.body);
             pendingCaretRef.current = next.caret;
+            // Plan 19 (R-8): a programmatic body change invalidates the tracked
+            // offsets (the selection splice re-selects via pendingCaretRef).
+            if (next.caret === null) clearSelection();
             // The persisted instruction is the request-time capture (R-8),
             // never the live box — the user may have retyped it meanwhile.
             const ok = await save({
@@ -758,8 +791,15 @@ const PromptEditor = forwardRef<PromptEditorHandle, Props>(function PromptEditor
           onKeyUp={trackSelection}
           onMouseUp={trackSelection}
           onScroll={syncHighlightScroll}
+          // Plan 19 (D1): focus back → the native selection paints again.
+          onFocus={() => setBlurSel(null)}
           // Plan.15 D6: leaving the field is a natural checkpoint — flush now.
-          onBlur={() => void draftBackup.flushNow()}
+          // Plan 19 (D1): then re-read the live range and keep it marked.
+          onBlur={() => {
+            void draftBackup.flushNow();
+            trackSelection();
+            setBlurSel(captureSelection(selRef.current, body));
+          }}
           // F6 (D9): whole-line Ctrl+X/C/V on a collapsed selection.
           onKeyDown={(e) => {
             if (bodyRef.current) handleLineClipboardKeyDown(e, bodyRef.current);

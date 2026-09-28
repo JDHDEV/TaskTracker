@@ -29,7 +29,7 @@ import {
   type OpenTabsState,
 } from "../lib/openTabs";
 import { canBack, canForward, type NavDirection } from "../lib/navHistory";
-import { runCloseAll } from "../lib/closeAll";
+import { runCloseAll, runCloseSaved } from "../lib/closeAll";
 import { useBackForwardKeys } from "../hooks/useBackForwardKeys";
 import PromptList from "./PromptList";
 import PromptEditor, { type PromptEditorHandle } from "./PromptEditor";
@@ -470,6 +470,7 @@ export default function PromptsPage({
         key: t.key,
         title: displayTitle(t.item.title, t.item.body),
         dirty: t.isDirty,
+        isDraft: t.item.id === "",
       })),
     [tabs],
   );
@@ -587,6 +588,32 @@ export default function PromptsPage({
     })();
   }
 
+  // Plan 19 "Close saved" for the prompt strip — App.tsx's flow (D4/D5/D8,
+  // R-1/R-6): one confirm, re-validated against the live tabsRef, shared
+  // guard, never saves or discards.
+  function requestCloseSaved() {
+    if (closingAllRef.current) return;
+    closingAllRef.current = true;
+    void (async () => {
+      try {
+        const { closed } = await runCloseSaved({
+          getTabs: () =>
+            tabsRef.current.tabs.map((t) => ({
+              key: t.key,
+              isDirty: t.isDirty,
+              isDraft: t.item.id === "",
+            })),
+          confirm: api.confirmDialog,
+        });
+        if (closed.length === 0) return; // cancelled, or nothing saved
+        setTabs((s) => closeTabs(s, closed));
+        closed.forEach((k) => editorRefs.current.delete(k));
+      } finally {
+        closingAllRef.current = false;
+      }
+    })();
+  }
+
   // Plan 18 Back/Forward over this strip (see App.tsx); the shortcut hook is
   // enabled only while the Prompts page is visible with tabs open.
   function navigateHistory(dir: NavDirection, fromShortcut: boolean) {
@@ -627,8 +654,9 @@ export default function PromptsPage({
             )
           ) {
             const saved = await editorRefs.current.get(key)?.save();
+            // Save failed, or an edit landed while it ran (plan 19 D0) → keep
+            // the tab open, edits intact. (A clean save cleared the backup.)
             if (!saved) return;
-            // (a successful save cleared the draft backup itself)
           } else {
             await editorRefs.current.get(key)?.discardDraft(); // the Discard branch
           }
@@ -709,6 +737,8 @@ export default function PromptsPage({
             newLabel="Open another prompt"
             onCloseAll={requestCloseAll}
             closeAllLabel="Close all open prompts"
+            onCloseSaved={requestCloseSaved}
+            closeSavedLabel="Close saved open prompts"
             onBack={() => navigateHistory("back", false)}
             onForward={() => navigateHistory("forward", false)}
             canBack={canBack(tabs.history)}

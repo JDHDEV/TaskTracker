@@ -70,6 +70,27 @@ export function selectionSegments(
 }
 
 /**
+ * Which captured range the body highlight mirrors (plan 19 D2), written once
+ * for the three editors: `confirming` (a selection-rework confirm dialog is
+ * up) beats `pending` (an open proposal card's range — the splice target,
+ * plan 13 H4 / plan 17 F5) beats `blurred` (the range the native selection
+ * held when the textarea lost focus — a mirror of what Rework would act on,
+ * since Chromium does not paint an unfocused textarea's selection). Every
+ * argument is null when its source is inactive; the result may still be
+ * stale against the live body — the caller checks that as before, and
+ * `selectionSegments` draws nothing for a stale range (R-6). Trade-off: with
+ * a card open for range A, a newly blurred range B is not marked until its
+ * own confirm.
+ */
+export function pickHighlight(
+  confirming: CapturedSelection | null,
+  pending: CapturedSelection | null,
+  blurred: CapturedSelection | null,
+): CapturedSelection | null {
+  return confirming ?? pending ?? blurred;
+}
+
+/**
  * Splice `proposal` over the captured range. Refuses (and leaves nothing
  * changed) when the range is stale. On success `caret` covers the inserted
  * text, so the caller can re-select it after the controlled-textarea update.

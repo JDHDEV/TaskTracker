@@ -1,5 +1,6 @@
 import { memo, useEffect, useRef, type KeyboardEvent } from "react";
 import { tabDomId, tabPanelDomId } from "../lib/openTabs";
+import { wheelToScrollLeft } from "../lib/tabWheel";
 
 /** One tab's presentation data. `title` is user-controlled text and is rendered
  *  as a JSX child (never via an HTML attribute or dangerouslySetInnerHTML).
@@ -12,6 +13,10 @@ export interface EditorTabDescriptor {
   dotClass?: string;
   dotTitle?: string;
   dirty: boolean;
+  /** Plan 19: a never-saved entity (id "") — never eligible for `Close
+   *  saved`, whatever `dirty` says, so the button's predicate matches
+   *  `planCloseSaved` (closeAll.ts) exactly. */
+  isDraft: boolean;
 }
 
 interface Props {
@@ -39,6 +44,12 @@ interface Props {
   onCloseAll?: () => void;
   /** Accessible name for the Close all button (e.g. "Close all open items"). */
   closeAllLabel?: string;
+  /** Plan 19 "Close saved" for this strip (D4/D7). Optional like `onCloseAll`;
+   *  the owner runs the one-confirm flow (closeAll.ts `runCloseSaved`). The
+   *  button is `aria-disabled` + a no-op while no tab is saved. */
+  onCloseSaved?: () => void;
+  /** Accessible name for the Close saved button (e.g. "Close saved open items"). */
+  closeSavedLabel?: string;
 }
 
 // The tab is a `<div role="tab">`, not a `<button>`, so the close control can be
@@ -48,10 +59,11 @@ interface Props {
 // closes the focused tab, and focus follows the neighbor that takes over.
 //
 // Plan 18: the tablist is wrapped in `.editor-tabs-bar`, which carries the
-// hairline/background and the strip's controls — ‹ › before the scroller, `+`
-// and `Close all` after it. Controls sit OUTSIDE `role="tablist"` (only tabs
-// belong in one), so they keep their own focus after a partial close: the
-// focus-after-close effect keys on `.editor-tabs` membership.
+// hairline/background and the strip's controls — ‹ › before the scroller, `+`,
+// `Close saved` (plan 19) and `Close all` after it. Controls sit OUTSIDE
+// `role="tablist"` (only tabs belong in one), so they keep their own focus
+// after a partial close: the focus-after-close effect keys on `.editor-tabs`
+// membership.
 function EditorTabs({
   tabs,
   activeKey,
@@ -66,6 +78,8 @@ function EditorTabs({
   canForward = false,
   onCloseAll,
   closeAllLabel,
+  onCloseSaved,
+  closeSavedLabel,
 }: Props) {
   const tabEls = useRef(new Map<string, HTMLDivElement>());
   // Keys from the previous render, so we can move focus to the tab that took over
@@ -95,6 +109,31 @@ function EditorTabs({
     if (!activeKey) return;
     tabEls.current.get(activeKey)?.scrollIntoView({ inline: "nearest", block: "nearest" });
   }, [activeKey]);
+
+  // Plan 19 (D9, R-11): the vertical wheel scrolls the tablist sideways. A
+  // NATIVE non-passive listener on the scroller ref — React registers `wheel`
+  // as a passive root listener (facebook/react#19651), so a React `onWheel`
+  // could never preventDefault. Only vertical-dominant deltas are mapped:
+  // Shift+wheel and trackpad swipes already arrive as `deltaX` in Chromium
+  // and scroll the strip natively. `null` from the helper means "not ours"
+  // (no overflow, Ctrl+wheel, already at that edge …) and default is NOT
+  // prevented, so the event chains to an ancestor as usual. Assigned directly
+  // (no smooth scrollBy: quick notches would stack animations). The tablist
+  // is always rendered while EditorTabs is mounted, so `[]` is sufficient.
+  const listRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    const el = listRef.current;
+    if (!el) return;
+    const onWheel = (e: WheelEvent) => {
+      if (e.defaultPrevented) return;
+      const next = wheelToScrollLeft(e, el);
+      if (next === null) return;
+      e.preventDefault();
+      el.scrollLeft = next;
+    };
+    el.addEventListener("wheel", onWheel, { passive: false });
+    return () => el.removeEventListener("wheel", onWheel);
+  }, []);
 
   function focusTab(key: string) {
     const el = tabEls.current.get(key);
@@ -132,6 +171,9 @@ function EditorTabs({
   }
 
   const showNav = onBack !== undefined || onForward !== undefined;
+  // Plan 19 (R-2/R-5): the same eligibility test as planCloseSaved, so the
+  // button can never look enabled while the sequencer would find nothing.
+  const hasSaved = tabs.some((t) => !t.dirty && !t.isDraft);
 
   return (
     <div className="editor-tabs-bar">
@@ -163,7 +205,7 @@ function EditorTabs({
           </button>
         </>
       )}
-      <div className="editor-tabs" role="tablist" aria-label={listLabel}>
+      <div className="editor-tabs" role="tablist" aria-label={listLabel} ref={listRef}>
         {tabs.map((t) => {
           const on = t.key === activeKey;
           return (
@@ -210,6 +252,20 @@ function EditorTabs({
       {onNew && (
         <button className="etab-new" aria-label={newLabel} onClick={onNew}>
           +
+        </button>
+      )}
+      {onCloseSaved && (
+        <button
+          className="etab-closesaved"
+          aria-label={closeSavedLabel}
+          title="Close tabs with no unsaved changes"
+          // Never `disabled` (R-5): it would drop focus to <body>.
+          aria-disabled={!hasSaved}
+          onClick={() => {
+            if (hasSaved) onCloseSaved();
+          }}
+        >
+          Close saved
         </button>
       )}
       {onCloseAll && (

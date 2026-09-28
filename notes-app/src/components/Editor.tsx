@@ -32,6 +32,7 @@ import { tabDomId, tabPanelDomId } from "../lib/openTabs";
 import {
   captureSelection,
   isSelectionStale,
+  pickHighlight,
   spliceProposal,
   type CapturedSelection,
   type SelectionRange,
@@ -53,6 +54,9 @@ import SelectionBackdrop from "./SelectionBackdrop";
  *  backups and deletes the draft, ordered behind in-flight writes, so the
  *  buffer-discarding paths can never be raced by a straggler snapshot. */
 export interface EditorHandle {
+  /** Resolves true only when the item was persisted AND the buffer is clean
+   *  afterwards (plan 19 D0, §12): a save-and-close must never close a tab
+   *  that kept edits typed while the save ran. */
   save: () => Promise<boolean>;
   applyDraft: (snapshot: Draft) => void;
   flushDraft: () => Promise<void>;
@@ -220,6 +224,14 @@ const Editor = forwardRef<EditorHandle, Props>(function Editor(
   // Bumped at the edit() chokepoint; the hook's schedule reads it. A ref, so a
   // keystroke never adds render work beyond what edit() already does.
   const lastEditRef = useRef(0);
+  // Plan 19 (D0): a monotonic edit sequence, bumped at the same chokepoint.
+  // save() records it before its first await and marks the buffer clean only
+  // if nothing landed meanwhile (SEC-1: an edit typed during a save must not
+  // be marked clean with its backup deleted).
+  const editSeqRef = useRef(0);
+  // Whether the last successful save left the buffer dirty (an edit landed
+  // meanwhile) — the imperative handle's save() reports it (§12).
+  const lastSaveKeptDirtyRef = useRef(false);
   // Snapshot closure, reassigned every render so the hook's ticks always read
   // the live buffer (the titleRef mirror pattern, widened to every buffered
   // field). Returns null when buffer == base — the hook then deletes any
@@ -285,6 +297,11 @@ const Editor = forwardRef<EditorHandle, Props>(function Editor(
   } | null>(null);
   const [confirmingSel, setConfirmingSel] = useState<CapturedSelection | null>(null);
   const confirmingRef = useRef(false);
+  // Plan 19 (D1): the range the native selection held when the body lost
+  // focus — the lowest-precedence highlight source (pickHighlight), so the
+  // range Rework will act on stays visible while the AI bar, title, tags or
+  // rail have focus. Cleared on focus, by clearSelection and by the reseed.
+  const [blurSel, setBlurSel] = useState<CapturedSelection | null>(null);
   // The selection-highlight mirror (Phase 4), scroll-synced from the textarea.
   const hlRef = useRef<HTMLDivElement>(null);
 
@@ -307,6 +324,7 @@ const Editor = forwardRef<EditorHandle, Props>(function Editor(
   function clearSelection() {
     selRef.current = null;
     setSelectionLength(0);
+    setBlurSel(null);
     const ta = bodyRef.current;
     if (ta) {
       const pos = ta.selectionEnd;
@@ -358,10 +376,12 @@ const Editor = forwardRef<EditorHandle, Props>(function Editor(
   // save closure. applyDraft is the conflict bar's only way into a mounted
   // clean editor (D4); flushDraft/discardDraft are the plan.15 backup verbs.
   useImperativeHandle(ref, () => ({
-    save: () => save(),
+    save: async () => (await save()) && !lastSaveKeptDirtyRef.current,
     applyDraft: (snapshot: Draft) => {
       setTitle(snapshot.title);
       setBody(snapshot.body);
+      // Plan 19 (R-8): a programmatic body change invalidates the tracked offsets
+      clearSelection();
       if (item.kind === "task") {
         setStatus(snapshot.status ?? "todo");
         setPriority(snapshot.priority ?? "normal");
@@ -373,6 +393,7 @@ const Editor = forwardRef<EditorHandle, Props>(function Editor(
       // conflict bar exists only for saved items.
       setDirty(true);
       lastEditRef.current = Date.now();
+      editSeqRef.current += 1; // Plan 19 (D0): a restore is a buffered change too
     },
     flushDraft: () => draftBackup.flushNow(),
     discardDraft: () => draftBackup.discard(),
@@ -453,6 +474,7 @@ const Editor = forwardRef<EditorHandle, Props>(function Editor(
     savingRef.current = false;
     setSelectionRework(null);
     selRef.current = null;
+    setBlurSel(null);
     setSelectionLength(0);
     pendingCaretRef.current = null;
     // Deliberately NOT `setInstruction("")`: this instance only ever reseeds
@@ -487,6 +509,9 @@ const Editor = forwardRef<EditorHandle, Props>(function Editor(
     // undefined resolution order against reconcileTabs.
     if (statusPatchPending) return false;
     savingRef.current = true;
+    // Plan 19 (D0): the edit sequence this save is persisting — compared at
+    // the success sites, before anything is marked clean.
+    const seqAtSave = editSeqRef.current;
     setSaving(true);
     try {
       // A new draft must target a project store before it can be created (items
@@ -549,7 +574,10 @@ const Editor = forwardRef<EditorHandle, Props>(function Editor(
           jiraUrl: jiraUrl.trim() || undefined,
         };
         const created = await onCreate(input);
-        if (created) {
+        // Plan 19 (D0): an edit landed while the save was running — stay
+        // dirty, keep the backup; the next save persists it.
+        lastSaveKeptDirtyRef.current = created && editSeqRef.current !== seqAtSave;
+        if (created && !lastSaveKeptDirtyRef.current) {
           setDirty(false);
           // The item now owns the content — the backup is redundant, and
           // keeping it would re-offer stale text on the next boot (§4.3).
@@ -568,7 +596,10 @@ const Editor = forwardRef<EditorHandle, Props>(function Editor(
         // No projectId: items do not move between projects in v1.
         jiraUrl: jiraUrl.trim(), // "" clears
       });
-      if (saved) {
+      // Plan 19 (D0): an edit landed while the save was running — stay dirty,
+      // keep the backup; the next save persists it.
+      lastSaveKeptDirtyRef.current = saved && editSeqRef.current !== seqAtSave;
+      if (saved && !lastSaveKeptDirtyRef.current) {
         setDirty(false); // a rejected save stays dirty → "Save", not "Saved"
         draftBackup.clearAfterSave(); // the saved item owns the content now
       }
@@ -791,6 +822,7 @@ const Editor = forwardRef<EditorHandle, Props>(function Editor(
       // The single chokepoint every buffered edit passes through — the draft
       // backup's schedule keys off this timestamp (plan.15 D6).
       lastEditRef.current = Date.now();
+      editSeqRef.current += 1;
     };
   }
 
@@ -822,9 +854,15 @@ const Editor = forwardRef<EditorHandle, Props>(function Editor(
   const stale = selectionRework !== null && isSelectionStale(body, selectionRework);
   // Plan 17 D6 / R-6: mirror the captured range behind the textarea only while
   // it is still valid and a selection rework is confirming (its own range) or
-  // pending (the open card's range). When the range goes stale the mirror
-  // vanishes (it never relocates); the mount syncs its scroll position.
-  const highlightSel = confirmingSel ?? (proposal !== null ? selectionRework : null);
+  // pending (the open card's range) — or, plan 19 (D2), while the body is
+  // unfocused with a tracked range (`blurSel`, lowest precedence). When the
+  // range goes stale the mirror vanishes (it never relocates); the mount
+  // syncs its scroll position.
+  const highlightSel = pickHighlight(
+    confirmingSel,
+    proposal !== null ? selectionRework : null,
+    blurSel,
+  );
   const showHighlight = highlightSel !== null && !isSelectionStale(body, highlightSel);
   useLayoutEffect(() => {
     if (showHighlight) syncHighlightScroll();
@@ -1043,6 +1081,9 @@ const Editor = forwardRef<EditorHandle, Props>(function Editor(
             if (!next.ok) return;
             edit(setBody)(next.body);
             pendingCaretRef.current = next.caret;
+            // Plan 19 (R-8): a programmatic body change invalidates the tracked
+            // offsets (the selection splice re-selects via pendingCaretRef).
+            if (next.caret === null) clearSelection();
             const ok = await save({ body: next.body });
             if (ok) {
               setProposal(null); // clear only the body half on success
@@ -1121,9 +1162,18 @@ const Editor = forwardRef<EditorHandle, Props>(function Editor(
           onKeyUp={trackSelection}
           onMouseUp={trackSelection}
           onScroll={syncHighlightScroll}
+          // Plan 19 (D1): focus back in the body → the native selection paints
+          // again, so the mirror steps aside (never both at once).
+          onFocus={() => setBlurSel(null)}
           // Plan.15 D6: leaving the body field is a natural checkpoint — flush
           // the pending snapshot rather than wait out the idle window.
-          onBlur={() => void draftBackup.flushNow()}
+          // Plan 19 (D1): then re-read the live range first, so the mark
+          // equals the native selection at the moment focus left.
+          onBlur={() => {
+            void draftBackup.flushNow();
+            trackSelection();
+            setBlurSel(captureSelection(selRef.current, body));
+          }}
           // F6 (D9): whole-line Ctrl+X/C on a collapsed selection ride the
           // native path via selection expansion; line-paste is the one
           // programmatic insert (edit() + pendingCaretRef, not natively undoable).

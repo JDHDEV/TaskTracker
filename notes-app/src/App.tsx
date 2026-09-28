@@ -61,7 +61,7 @@ import {
   type OpenTabsState,
 } from "./lib/openTabs";
 import { canBack, canForward, type NavDirection } from "./lib/navHistory";
-import { runCloseAll } from "./lib/closeAll";
+import { runCloseAll, runCloseSaved } from "./lib/closeAll";
 import ItemList, { KindFilter, StatusFilter } from "./components/ItemList";
 import DraftConflictBar from "./components/DraftConflictBar";
 import Editor, { type EditorHandle } from "./components/Editor";
@@ -588,6 +588,7 @@ export default function App() {
         dotClass: t.item.kind === "task" ? `dot dot-${t.item.status ?? "todo"}` : undefined,
         dotTitle: t.item.kind === "task" ? (t.item.status ?? "todo") : undefined,
         dirty: t.isDirty,
+        isDraft: t.item.id === "",
       })),
     [tabs],
   );
@@ -786,6 +787,35 @@ export default function App() {
     })();
   }
 
+  // Plan 19 "Close saved" (D4/D5/D8, R-1/R-6): one confirm, then close only
+  // the tabs that were counted AND are still open and saved — re-validated
+  // against the live tabsRef after the dialog. Shares closingAllRef with
+  // Close all, so the two bulk flows never overlap and Back/Forward stay
+  // blocked while either is pending. Never saves or discards anything. No
+  // toast: the tabs left open are the visibly dirty ones.
+  function requestCloseSaved() {
+    if (closingAllRef.current) return;
+    closingAllRef.current = true;
+    void (async () => {
+      try {
+        const { closed } = await runCloseSaved({
+          getTabs: () =>
+            tabsRef.current.tabs.map((t) => ({
+              key: t.key,
+              isDirty: t.isDirty,
+              isDraft: t.item.id === "",
+            })),
+          confirm: api.confirmDialog,
+        });
+        if (closed.length === 0) return; // cancelled, or nothing saved
+        setTabs((s) => closeTabs(s, closed));
+        closed.forEach((k) => editorRefs.current.delete(k));
+      } finally {
+        closingAllRef.current = false;
+      }
+    })();
+  }
+
   // Plan 18 Back/Forward (D3/D5): per strip, in memory, closed tabs pruned.
   // The ‹ › buttons and the Alt+Left/Right + mouse-button hook (enabled only
   // while this page is visible with tabs open) both land here; navigation
@@ -856,8 +886,9 @@ export default function App() {
             )
           ) {
             const saved = await editorRefs.current.get(key)?.save();
-            if (!saved) return; // save failed → keep the tab open, edits intact
-            // (a successful save cleared the draft backup itself)
+            // Save failed, or an edit landed while it ran (plan 19 D0) → keep
+            // the tab open, edits intact. (A clean save cleared the backup.)
+            if (!saved) return;
           } else {
             // The Discard branch of the three-way choice (plan.15 §4.3).
             await editorRefs.current.get(key)?.discardDraft();
@@ -1129,6 +1160,8 @@ export default function App() {
               newLabel="Open another item"
               onCloseAll={requestCloseAll}
               closeAllLabel="Close all open items"
+              onCloseSaved={requestCloseSaved}
+              closeSavedLabel="Close saved open items"
               onBack={() => navigateHistory("back", false)}
               onForward={() => navigateHistory("forward", false)}
               canBack={canBack(tabs.history)}
