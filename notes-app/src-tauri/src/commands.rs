@@ -353,15 +353,131 @@ pub fn ack_close(window: tauri::Window) {
     }
 }
 
+/// Windows' "Hide pointer while typing" hides the pointer on keystrokes and
+/// shows it again only when the thread that took the keystrokes handles a
+/// mouse move. Here that thread lives in the WebView2 browser process (it owns
+/// the `Chrome_RenderWidgetHostHWND` child of our window), so once a native
+/// modal (the dialog plugin's `ask`, the folder picker) has disabled the main
+/// window and taken focus on another thread, no real mouse movement over the
+/// app — or over the dialog — reaches it, and the pointer stays hidden for the
+/// dialog's whole life. The state also outlives the pointer leaving the app:
+/// over another program it shows, back over the app it is hidden again. A
+/// WM_MOUSEMOVE sent to that child at the pointer's real position clears the
+/// state synchronously wherever the pointer is (measured: on the page, on the
+/// far monitor; moving the real cursor instead only worked over the page and
+/// raced the dialog). It must run BEFORE the dialog opens and after the
+/// triggering key is up, since a key-up that reaches the open dialog hides the
+/// pointer again (`keyRelease.ts` waits for it). Pure side effect on the OS
+/// cursor state; nothing here touches app state. No-op off Windows.
+#[tauri::command]
+pub async fn restore_pointer(window: tauri::Window) {
+    let main = main_hwnd(&window);
+    let _ = tauri::async_runtime::spawn_blocking(move || restore_pointer_impl(main)).await;
+}
+
+/// The native handle of the given window as an integer, or 0 off Windows.
+#[cfg(windows)]
+fn main_hwnd(window: &tauri::Window) -> isize {
+    window.hwnd().map(|hwnd| hwnd.0 as isize).unwrap_or(0)
+}
+
+#[cfg(not(windows))]
+fn main_hwnd(_window: &tauri::Window) -> isize {
+    0
+}
+
+#[cfg(windows)]
+fn restore_pointer_impl(main: isize) {
+    #[repr(C)]
+    struct Point {
+        x: i32,
+        y: i32,
+    }
+    #[allow(non_snake_case)]
+    #[link(name = "user32")]
+    extern "system" {
+        fn EnumChildWindows(
+            parent: isize,
+            callback: extern "system" fn(isize, isize) -> i32,
+            lparam: isize,
+        ) -> i32;
+        fn GetClassNameW(hwnd: isize, name: *mut u16, len: i32) -> i32;
+        fn GetCursorPos(point: *mut Point) -> i32;
+        fn ScreenToClient(hwnd: isize, point: *mut Point) -> i32;
+        fn SendMessageTimeoutW(
+            hwnd: isize,
+            msg: u32,
+            wparam: usize,
+            lparam: isize,
+            flags: u32,
+            timeout_ms: u32,
+            result: *mut usize,
+        ) -> isize;
+    }
+    const WM_MOUSEMOVE: u32 = 0x0200;
+    const SMTO_ABORTIFHUNG: u32 = 0x0002;
+    /// EnumChildWindows callback: stop at the WebView2 content window.
+    extern "system" fn pick(hwnd: isize, out: isize) -> i32 {
+        let mut name = [0u16; 32];
+        // SAFETY: plain user32 call with a valid buffer of the stated length.
+        let len = unsafe { GetClassNameW(hwnd, name.as_mut_ptr(), name.len() as i32) };
+        let len = len.clamp(0, name.len() as i32) as usize;
+        if String::from_utf16_lossy(&name[..len]) != "Chrome_RenderWidgetHostHWND" {
+            return 1;
+        }
+        // SAFETY: `out` is the `&mut isize` handed to EnumChildWindows below,
+        // which only invokes this callback synchronously during that call.
+        unsafe { *(out as *mut isize) = hwnd };
+        0
+    }
+    // A null parent would enumerate every top-level window on the desktop.
+    if main == 0 {
+        return;
+    }
+    let mut target: isize = 0;
+    let mut point = Point { x: 0, y: 0 };
+    // SAFETY: plain user32 calls; `target` outlives the synchronous
+    // enumeration and `point` is an exclusively borrowed out-parameter.
+    unsafe {
+        EnumChildWindows(main, pick, &mut target as *mut isize as isize);
+        if target == 0 || GetCursorPos(&mut point) == 0 {
+            return;
+        }
+        ScreenToClient(target, &mut point);
+        // MAKELPARAM: client x in the low word, y in the high word, as signed
+        // 16-bit values — outside the client area when the pointer is elsewhere.
+        let lparam = (((point.y as u16 as u32) << 16) | (point.x as u16 as u32)) as isize;
+        let mut result = 0usize;
+        SendMessageTimeoutW(
+            target,
+            WM_MOUSEMOVE,
+            0,
+            lparam,
+            SMTO_ABORTIFHUNG,
+            100,
+            &mut result,
+        );
+    }
+}
+
+#[cfg(not(windows))]
+fn restore_pointer_impl(_main: isize) {}
+
 /// Show the native folder picker and return the chosen directory path (or `None`
 /// if cancelled). Thin by design: the OS picker is UX only — the returned path
 /// is re-validated server-side in `create_project`/`open_project` before any use.
 #[tauri::command]
-pub async fn pick_project_folder(app: tauri::AppHandle) -> Result<Option<String>> {
+pub async fn pick_project_folder(
+    app: tauri::AppHandle,
+    window: tauri::Window,
+) -> Result<Option<String>> {
     use tauri_plugin_dialog::DialogExt;
-    let picked =
-        tauri::async_runtime::spawn_blocking(move || app.dialog().file().blocking_pick_folder())
-            .await
+    let main = main_hwnd(&window);
+    let picked = tauri::async_runtime::spawn_blocking(move || {
+        restore_pointer_impl(main);
+        app.dialog().file().blocking_pick_folder()
+    })
+    .await
             .map_err(|_| AppError::Invalid("the folder picker could not be opened".into()))?;
     Ok(picked.map(|folder| folder.to_string()))
 }

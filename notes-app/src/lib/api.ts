@@ -4,6 +4,7 @@ import { getVersion } from "@tauri-apps/api/app";
 import { openUrl } from "@tauri-apps/plugin-opener";
 import { ask } from "@tauri-apps/plugin-dialog";
 import { isHttpUrl } from "./jira";
+import { trackHeldKeys } from "./keyRelease";
 import { parseContextMenuAction, type ContextMenuAction, type MenuSurface } from "./contextMenu";
 import type {
   Draft,
@@ -28,6 +29,10 @@ import type {
 
 // Every backend capability, in one file. Components import these functions
 // and never call invoke() directly, so the IPC surface stays greppable.
+
+// Keys physically held right now — native modals wait for their release (see
+// keyRelease.ts). Absent outside a window (the node test environment).
+const heldKeys = typeof window === "undefined" ? null : trackHeldKeys(window);
 
 export function listItems(filter?: ListFilter): Promise<Item[]> {
   return invoke("list_items", { filter });
@@ -133,7 +138,8 @@ export function revealProjectFolder(id: string): Promise<void> {
 }
 
 /** Show the native folder picker; resolves to the chosen path or null. */
-export function pickProjectFolder(): Promise<string | null> {
+export async function pickProjectFolder(): Promise<string | null> {
+  await heldKeys?.whenReleased(); // same reason as confirmDialog; the nudge is in the command
   return invoke("pick_project_folder");
 }
 
@@ -435,7 +441,7 @@ export async function copyToClipboard(text: string): Promise<void> {
  * non-destructive use — the selection-rework confirm; every other call site
  * passes only the message and keeps the `worknotes` title + warning kind.
  */
-export function confirmDialog(
+export async function confirmDialog(
   message: string,
   opts: {
     title?: string;
@@ -444,6 +450,13 @@ export function confirmDialog(
     kind?: "info" | "warning" | "error";
   } = {},
 ): Promise<boolean> {
+  // Windows hides the pointer while typing, and a native modal opened from the
+  // keyboard would keep it hidden until it closes: wait for the triggering key
+  // to come up (a key-up landing in the open dialog re-hides it), then clear
+  // the hidden state (`restore_pointer`; a no-op off Windows, and never allowed
+  // to block the dialog). See keyRelease.ts.
+  await heldKeys?.whenReleased();
+  await invoke("restore_pointer").catch(() => {});
   return ask(message, {
     title: opts.title ?? "worknotes",
     kind: opts.kind ?? "warning",

@@ -136,6 +136,7 @@ pub fn run() {
             commands::sweep_project_drafts,
             commands::ack_close,
             commands::set_context_menu_surface,
+            commands::restore_pointer,
             commands::ai_rewrite,
             commands::ai_generate_title,
             commands::ai_rewrite_stream,
