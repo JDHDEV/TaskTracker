@@ -304,6 +304,15 @@ body,
   margin: 0;
 }
 
+/* The shell is a fixed 100%-height layout whose panes scroll internally; the
+   document itself must never scroll. Guards against any absolutely positioned
+   box (an `.sr-only` marker, a popover) escaping its scroller and growing the
+   viewport — the 1.2.2 "whole app scrolls away" bug. */
+html,
+body {
+  overflow: hidden;
+}
+
 body {
   font-family: var(--font-ui);
   font-size: 14px;
@@ -542,6 +551,12 @@ textarea {
 .list {
   flex: 1;
   overflow-y: auto;
+  /* Containing block for the rows' `.sr-only` markers (", unsaved changes"):
+     the recipe is `position: absolute`, and without a positioned ancestor a
+     marker's static position — its row's place in the UNSCROLLED list —
+     escaped the scroller and extended the document, so a dirty row far down
+     the rail gave the whole app a viewport scrollbar (1.2.2 fix). */
+  position: relative;
   margin: 0;
   padding: 0 8px 12px;
   list-style: none;
@@ -692,6 +707,10 @@ textarea {
      PANE scrolls — before, the overflow escaped to the document and scrolled
      the whole app (topbar included), or the card was clipped. */
   overflow-y: auto;
+  /* Containing block for the pane's `.sr-only` status spans (AI-bar hint,
+     review-card and Copied statuses) — same escape as `.list` (1.2.2 fix).
+     The popovers keep their own relative anchors (.editor-tags, .move-popover). */
+  position: relative;
 }
 
 /* Non-active tabs stay mounted (preserving their edit buffer + in-flight stream)
